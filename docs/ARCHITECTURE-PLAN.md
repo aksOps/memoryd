@@ -5311,6 +5311,34 @@ S1/H6 (adaptiveness never breaches caps — spend + wall-clock proven), C3 degra
 
 ### 21.10 M7 — Association graph + one-hop recall expansion
 
+> **Status (2026-06-09): delivered.** A `dream` run now runs an **associate** phase
+> (between consolidate and decay) that builds/reinforces/prunes the weighted
+> `memory_links` graph, and `recall` gains durable-memory + one-hop graph recall:
+> `recall <q> [--hops 0|1]` (default 1). Migration 0005 adds `memories.centrality` and
+> `memories.source_session`; consolidation now stamps `source_session` and populates
+> `memories_fts` so memories are recall-searchable. Links carry two signals:
+> **co-occurrence** (memories sharing a `source_session` — deterministic, works for the
+> no-spend `null` adapter) and **embedding-similarity** (`semantic`, only when the
+> adapter `embeds_semantically()`; exercised by the `ConceptAdapter` test-double).
+> `graph_centrality` (§9.4, degree-weighted, `Σweight/8` capped) is precomputed into a
+> column and folded into both `R_base` (weight 0.12, completing the §9.3 base weights
+> to 1.0) and `R_recall`; recall fuses the canonical §9.3 variables and min-max
+> normalizes centrality + lexical within the candidate set. **Decisions:** links are
+> stored **symmetrically** (both directions) so the recall hop, the per-node fan-out
+> cap (≤32), and centrality are clean `src_memory_id` operations; recall returns
+> durable memories when the corpus matches and **falls back to raw-event recall** (the
+> M2 path) otherwise, so existing behavior is preserved. **Deviations (documented in
+> code):** (1) the `associate` step runs **inline in `dream_once`** (like M6
+> consolidate/decay), not via a `jobs`-queue lease — the queue is reserved for `embed`.
+> (2) embedding-similarity pairing is **O(n²) over a bounded window** (≤64 candidates
+> per run); full-corpus semantic association awaits ANN (M9 HNSW). (3) **link weight
+> temporal-decay is deferred** — graph growth is bounded by the fan-out cap + weak-floor
+> (`<0.10`) prune, which is what "count stays bounded over runs" requires. (4) `R_recall`
+> omits `supersession_penalty`/`provenance_weight` (no such columns until M8/dedup);
+> recency uses `exp(-ln2·age/7d)`. **Deferred:** `causal`/`temporal`/`supersedes`/
+> `contradicts` link types (only `co_occurrence`/`semantic` are produced in M7), the
+> `AccessBump` recall-reinforcement job, and cross-batch ANN linking.
+
 #### Goal
 Strengthen/prune the weighted memory graph during dreaming and use one-hop expansion to improve recall.
 

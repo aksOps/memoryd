@@ -28,10 +28,14 @@ Status legend:
   source-specific importers and distillation into `memories` are deferred (M6).
 - `[x]` M6 — the dream plane (consolidate dedup-cluster + decay lifecycle) is delivered
   and gated under wall-clock + spend caps with `dream_runs` accounting and a `serve`
-  scheduler; the LLM-summary path is test-double-only and §9.7 cleanup/M7/M8 are deferred.
-- `[ ]` M7 and later are not started.
+  scheduler; the LLM-summary path is test-double-only and §9.7 cleanup is deferred.
+- `[x]` M7 — the association graph + one-hop recall is delivered: a `dream` associate
+  phase builds/reinforces/prunes symmetric `memory_links` (co-occurrence + semantic),
+  `recall --hops 0|1` adds graph expansion, and `graph_centrality`/`link_strength` feed
+  scoring; semantic links are test-double-only and link weight-decay is deferred.
+- `[ ]` M8 and later are not started.
 
-Next implementation target: M7 (association graph + one-hop recall).
+Next implementation target: M8 (profile extraction behind the approvals gate, H6).
 
 ## M0 — Store Skeleton, Config, CLI Shell, Security Gate
 
@@ -282,17 +286,22 @@ Evidence: 6 dream unit tests (decay/lifecycle/score) + 8 store integration tests
 
 ## M7 — Association Graph And One-Hop Recall
 
-Status: `[ ]` Not started.
+Status: `[x]` Delivered. Associate runs inline in `dream_once`; semantic links are
+`ConceptAdapter` test-double-only; link weight temporal-decay deferred (growth bounded
+by fan-out cap + weak-floor prune).
 
-- `[ ]` Add associate worker.
-- `[ ]` Populate/update `memory_links` with weighted associations.
-- `[ ]` Enforce per-node fan-out cap.
-- `[ ]` Prune weak links under cap.
-- `[ ]` Add one-hop recall expansion over `memory_links`.
-- `[ ]` Add scoring inputs for graph centrality and link strength.
-- `[ ]` Add fixture where graph recall surfaces a related memory missed by
-  lexical/vector recall.
-- `[ ]` Verify p99 recall remains within `< 100 ms` target.
+- `[x]` Add associate step (inline in `dream_once`, like M6 consolidate/decay).
+- `[x]` Populate/update `memory_links` with weighted associations (co-occurrence by
+  `source_session`; embedding-similarity `semantic` when the adapter is semantic).
+- `[x]` Enforce per-node fan-out cap (≤32) via symmetric storage + ROW_NUMBER prune.
+- `[x]` Prune weak links (`weight < 0.10`) under cap.
+- `[x]` Add one-hop recall expansion over `memory_links` (`recall --hops 0|1`).
+- `[x]` Add scoring inputs for `graph_centrality` (§9.4) and `link_strength` (§9.3),
+  folded into `R_base` (0.12) and `R_recall`.
+- `[x]` Fixture `recall_memories_one_hop_surfaces_missed_neighbor` (+ CLI end-to-end):
+  the linked memory surfaces under `--hops 1`, not under `--hops 0`.
+- `[~]` p99 recall `< 100 ms`: bounded by FTS prefilter (≤256) + fan-out (≤32) brute-force
+  cosine; a `bench` harness lands in M10 (§21.13). Not yet measured against the VM SLO.
 
 ## M8 — Profile Extraction Behind Approvals
 
