@@ -82,7 +82,7 @@ pub fn lifecycle_for(
     half_life: i64,
     archive_grace_ms: i64,
 ) -> &'static str {
-    if score >= 0.50 {
+    if score > 0.50 {
         "active"
     } else if score >= 0.15 {
         "decaying"
@@ -178,6 +178,7 @@ pub fn dream_once<A: ProviderAdapter>(
     let mut tokens = 0_i64;
     let mut budget_hit = false;
     let mut partial = false;
+    let mut jobs_run = 0_i64;
 
     // Consolidate phase: drain pending raw_events in bounded batches.
     loop {
@@ -196,6 +197,9 @@ pub fn dream_once<A: ProviderAdapter>(
         consolidated += batch.memories_created;
         tokens += batch.tokens;
         budget_hit |= batch.budget_hit;
+        if batch.raw_consumed > 0 {
+            jobs_run += 1;
+        }
         // A sub-full batch means we drained the backlog: stop without a spurious extra
         // iteration (which could trip the wall-clock and falsely mark the run partial).
         if batch.raw_consumed < CONSOLIDATE_BATCH {
@@ -217,6 +221,7 @@ pub fn dream_once<A: ProviderAdapter>(
             if batch.touched == 0 {
                 break;
             }
+            jobs_run += 1;
         }
     }
 
@@ -228,7 +233,7 @@ pub fn dream_once<A: ProviderAdapter>(
         "completed"
     };
     let touched = i64::try_from(consolidated + decayed).unwrap_or(i64::MAX);
-    store.finish_dream_run(&run_id, clock(), touched, touched, tokens, status)?;
+    store.finish_dream_run(&run_id, clock(), jobs_run, touched, tokens, status)?;
 
     Ok(DreamOutcome {
         run_id,

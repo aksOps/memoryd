@@ -1,7 +1,7 @@
 use crate::adapters::{AdapterError, ProviderAdapter, prompt_token_estimate};
 use crate::dream::{
-    ARCHIVE_GRACE_MS, DORMANT_HALVINGS, decay_score, half_life_ms, lifecycle_for, memory_kind_for,
-    next_decay_at, normalize, score_base, trust_for_source,
+    ARCHIVE_GRACE_MS, decay_score, half_life_ms, lifecycle_for, memory_kind_for, next_decay_at,
+    normalize, score_base, trust_for_source,
 };
 use crate::import::{ImportError, ImportSummary, ImportUnit, content_hash, parse_jsonl};
 use crate::vectorindex::{Candidate, VectorIndex};
@@ -623,7 +623,7 @@ impl Store {
 
             let mem_kind = memory_kind_for(&cluster.kind);
             let trust = trust_for_source(&cluster.source, &cluster.kind);
-            let decay_at = half_life_ms(mem_kind).map(|hl| now_ms + hl * DORMANT_HALVINGS);
+            let decay_at = half_life_ms(mem_kind).map(|hl| now_ms + hl);
             let base = score_base(1.0, 0, trust, "active");
             let ids_csv = cluster
                 .ids
@@ -3571,6 +3571,8 @@ mod tests {
     fn decay_query_plan_uses_index_no_scan() {
         let path = temp_db_path("dream-explain");
         let store = Store::open(&path).expect("store opens");
+        // Seed a row so the planner reflects the populated plan, not the empty-table fast path.
+        seed_memory(&store, "dummy", "observation", 0, 0, "active");
         let plan: Vec<String> = {
             let mut stmt = store
                 .conn
@@ -3621,16 +3623,32 @@ mod tests {
         )
         .expect("dream runs");
 
-        let (trigger, touched, status, finished): (String, i64, String, Option<i64>) = store
+        let (trigger, jobs_run, touched, status, finished): (
+            String,
+            i64,
+            i64,
+            String,
+            Option<i64>,
+        ) = store
             .conn
             .query_row(
-                "SELECT trigger, memories_touched, status, finished_at FROM dream_runs WHERE id = ?1",
+                "SELECT trigger, jobs_run, memories_touched, status, finished_at \
+                     FROM dream_runs WHERE id = ?1",
                 params![outcome.run_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .unwrap();
         assert_eq!(trigger, "manual");
-        assert_eq!(touched, 2);
+        assert_eq!(
+            touched, 2,
+            "two distinct raw_events consolidate into two memories"
+        );
+        // jobs_run counts batch operations, not rows: one consolidate batch, no decay
+        // batch (fresh memories are not yet due) -> distinct from memories_touched.
+        assert_eq!(
+            jobs_run, 1,
+            "jobs_run is the batch count, not the row count"
+        );
         assert_eq!(status, "completed");
         assert!(finished.is_some(), "finished_at is stamped");
         cleanup_db_files(&path);
