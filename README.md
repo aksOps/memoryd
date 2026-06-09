@@ -55,7 +55,7 @@ See `docs/API.md` for CLI and REST request/response details. See
 - Any non-loopback bind requires a bearer token.
 - Capture redacts common secret shapes before writing metadata, payloads, provenance, and recall index text to SQLite.
 - Capture writes safe `audit_log` rows for capture append and redaction summaries; HTTP auth rejection writes a safe audit row without storing bearer token values.
-- Capture only appends redacted raw events and queues background work; it does not call providers inline.
+- Capture appends redacted raw events and queues background work when below the queue-depth cap; saturated captures return degraded instead of calling providers or failing inline.
 - Recall uses local SQLite FTS over redacted captured raw events; it does not call providers inline.
 - Rust `unsafe` code is forbidden at workspace level.
 - CI runs formatting, build, clippy with `-D warnings`, tests, dependency policy, advisory audit, and SBOM generation.

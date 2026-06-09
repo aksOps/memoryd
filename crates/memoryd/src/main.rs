@@ -85,7 +85,8 @@ fn remember(cli: Cli, args: RememberArgs) -> Result<(), CliError> {
     cfg.validate()?;
 
     let mut store = Store::open(&cfg.db_path)?;
-    let ack = store.capture_event(remember_event(args))?;
+    let ack =
+        store.capture_event_with_queue_limit(remember_event(args), cfg.caps.queue_depth_max)?;
     println!("{}", remember_response_json(&ack)?);
     Ok(())
 }
@@ -480,7 +481,7 @@ fn remember_response_json(ack: &CaptureAck) -> Result<String, CliError> {
         "raw_event_id": ack.raw_event_id,
         "session_id": ack.session_id,
         "enqueued_job_id": ack.enqueued_job_id,
-        "pending_memory": true,
+        "pending_memory": ack.enqueued_job_id.is_some(),
         "degraded": ack.degraded,
     }))?)
 }
@@ -569,19 +570,23 @@ fn handle_http_request(
         Err(_) => return HttpResponse::error(400, "invalid_json", "request body must be JSON"),
     };
     match request.path.as_str() {
-        "/v1/capture" => handle_http_capture(store, body),
+        "/v1/capture" => handle_http_capture(store, body, cfg.caps.queue_depth_max),
         "/v1/recall" => handle_http_recall(store, body),
         _ => HttpResponse::error(404, "not_found", "route not found"),
     }
 }
 
-fn handle_http_capture(store: &mut Store, body: serde_json::Value) -> HttpResponse {
+fn handle_http_capture(
+    store: &mut Store,
+    body: serde_json::Value,
+    max_active_jobs: usize,
+) -> HttpResponse {
     let event = match capture_event_from_json(body) {
         Ok(event) => event,
         Err(message) => return HttpResponse::error(422, "invalid_request", message),
     };
 
-    match store.capture_event(event) {
+    match store.capture_event_with_queue_limit(event, max_active_jobs) {
         Ok(ack) => HttpResponse::json(
             202,
             "Accepted",
@@ -1149,6 +1154,45 @@ mod tests {
         assert_eq!(table_rows(&stats, "raw_events"), 1);
         assert_eq!(table_rows(&stats, "jobs"), 1);
         assert_eq!(table_rows(&stats, "provider_usage"), 0);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn http_capture_degrades_instead_of_failing_when_queue_is_full() {
+        let path = temp_db_path("http-capture-queue-full");
+        let mut cfg = Config::with_db_path(path.clone());
+        cfg.caps.queue_depth_max = 0;
+        let mut store = Store::open(&path).expect("store opens");
+
+        let response = handle_http_request(
+            &mut store,
+            &cfg,
+            Some("127.0.0.1:65000".parse().expect("peer parses")),
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/v1/capture".to_string(),
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: br#"{
+                    "session_id":"session-1",
+                    "agent":"claude",
+                    "source":"tool_result",
+                    "kind":"observation",
+                    "payload":{"text":"WAL timeout fixed"},
+                    "ts_ms":1234
+                }"#
+                .to_vec(),
+            },
+        );
+
+        assert_eq!(response.status, 202);
+        assert_eq!(response.body["raw_event_id"], 1);
+        assert_eq!(response.body["enqueued_job_id"], serde_json::Value::Null);
+        assert_eq!(response.body["degraded"], true);
+        let stats = store.table_stats().expect("table stats");
+        assert_eq!(table_rows(&stats, "raw_events"), 1);
+        assert_eq!(table_rows(&stats, "sessions"), 1);
+        assert_eq!(table_rows(&stats, "jobs"), 0);
 
         cleanup_db_files(&path);
     }

@@ -47,6 +47,8 @@ Implemented now:
 - REST endpoints: `POST /v1/capture` and `POST /v1/recall`.
 - Fast capture writes a redacted raw event, upserts its session, inserts one
   pending `embed` job, and returns without provider calls.
+- When the configured queue-depth cap is reached, capture still writes the raw
+  event but returns degraded without enqueueing an `embed` job.
 - Recall is lexical-only over redacted captured raw events using SQLite FTS.
 - Deterministic best-effort redaction runs before metadata, payload, provenance,
   and recall index persistence.

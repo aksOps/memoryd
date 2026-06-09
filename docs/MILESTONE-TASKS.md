@@ -14,13 +14,13 @@ Status legend:
 ## Current Position
 
 - `[~]` M0 is mostly complete.
-- `[~]` M1 is mostly implemented but missing backpressure and latency evidence.
+- `[~]` M1 is mostly implemented but missing latency evidence.
 - `[~]` M2 has provider-free lexical recall, but not the full durable-memory
   recall path from the plan.
 - `[ ]` M3 and later are not started beyond schema stubs and queued `embed` jobs.
 
-Next implementation target: finish M1 exit criteria, then close the M2 gaps that
-do not require providers.
+Next implementation target: add M1 capture latency evidence, then close the M2
+gaps that do not require providers.
 
 ## M0 — Store Skeleton, Config, CLI Shell, Security Gate
 
@@ -63,10 +63,10 @@ Status: `[~]` Mostly implemented, not complete.
 - `[x]` `redaction.apply` audit rows are written for redacted captures without
   original secret material.
 - `[x]` `auth.reject` audit rows are written without bearer token material.
-- `[ ]` Implement bounded capture admission/backpressure behavior.
-- `[ ]` Return `accepted-degraded` instead of blocking or 5xx when capture is
+- `[x]` Implement bounded capture admission/backpressure behavior.
+- `[x]` Return `accepted-degraded` instead of blocking or 5xx when capture is
   saturated.
-- `[ ]` Add saturation tests for the degraded capture path.
+- `[x]` Add saturation tests for the degraded capture path.
 - `[ ]` Add a capture latency fixture or benchmark for 100 sequential inserts.
 - `[ ]` Record p95 capture latency evidence against the `< 8 ms` M1 target.
 
@@ -237,8 +237,8 @@ Status: `[ ]` Not started.
 
 ## Immediate Next Queue
 
-1. Finish M1 backpressure/degraded capture semantics.
-2. Add capture latency fixture and evidence.
-3. Decide M2 raw-event recall versus planned durable-memory recall.
-4. Close chosen M2 recall gaps with tests and docs.
-5. Start M3 queue leasing and governor caps.
+1. Add capture latency fixture and evidence.
+2. Decide M2 raw-event recall versus planned durable-memory recall.
+3. Close chosen M2 recall gaps with tests and docs.
+4. Start M3 queue leasing and governor caps.
+5. Add provider-free queue/degraded-path regression tests as M3 grows.

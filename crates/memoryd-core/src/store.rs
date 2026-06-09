@@ -53,6 +53,14 @@ impl Store {
     }
 
     pub fn capture_event(&mut self, event: NewRawEvent) -> Result<CaptureAck, StoreError> {
+        self.capture_event_with_queue_limit(event, usize::MAX)
+    }
+
+    pub fn capture_event_with_queue_limit(
+        &mut self,
+        event: NewRawEvent,
+        max_active_jobs: usize,
+    ) -> Result<CaptureAck, StoreError> {
         let NewRawEvent {
             session_id,
             agent,
@@ -134,24 +142,32 @@ impl Store {
             params![raw_event_id, fts_content.as_str()],
         )?;
 
-        let job_payload = serde_json::to_string(&serde_json::json!({
-            "raw_event_id": raw_event_id,
-            "session_id": session_id,
-            "source": source,
-            "kind": kind,
-        }))?;
-        tx.execute(
-            "INSERT INTO jobs (kind, priority, state, payload, scheduled_at)
-             VALUES ('embed', 100, 'pending', ?1, ?2)",
-            params![job_payload.as_str(), scheduled_at],
-        )?;
-        let enqueued_job_id = tx.last_insert_rowid();
+        let active_jobs = active_job_count(&tx)?;
+        let job_limit = i64::try_from(max_active_jobs).unwrap_or(i64::MAX);
+        let enqueued_job_id = if active_jobs < job_limit {
+            let job_payload = serde_json::to_string(&serde_json::json!({
+                "raw_event_id": raw_event_id,
+                "session_id": session_id,
+                "source": source,
+                "kind": kind,
+            }))?;
+            tx.execute(
+                "INSERT INTO jobs (kind, priority, state, payload, scheduled_at)
+                 VALUES ('embed', 100, 'pending', ?1, ?2)",
+                params![job_payload.as_str(), scheduled_at],
+            )?;
+            Some(tx.last_insert_rowid())
+        } else {
+            None
+        };
+        let degraded = enqueued_job_id.is_none();
         let raw_event_ref = raw_event_id.to_string();
         let capture_detail = serde_json::to_string(&serde_json::json!({
             "session_id": session_id,
             "source": source,
             "kind": kind,
             "enqueued_job_id": enqueued_job_id,
+            "degraded": degraded,
         }))?;
         insert_audit_log(
             &tx,
@@ -186,7 +202,7 @@ impl Store {
             raw_event_id,
             session_id,
             enqueued_job_id,
-            degraded: false,
+            degraded,
             processed: false,
         })
     }
@@ -342,7 +358,7 @@ pub struct NewRawEvent {
 pub struct CaptureAck {
     pub raw_event_id: i64,
     pub session_id: String,
-    pub enqueued_job_id: i64,
+    pub enqueued_job_id: Option<i64>,
     pub degraded: bool,
     pub processed: bool,
 }
@@ -468,6 +484,15 @@ fn insert_audit_log(
         params![ts_ms, actor, action, target_type, target_ref, detail],
     )?;
     Ok(())
+}
+
+fn active_job_count(conn: &Connection) -> Result<i64, StoreError> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM jobs WHERE state IN ('pending', 'deferred', 'running')",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(StoreError::from)
 }
 
 fn audit_http_method(method: &str) -> &'static str {
@@ -1214,7 +1239,8 @@ mod tests {
 
         assert!(ack.raw_event_id > 0);
         assert_eq!(ack.session_id, "session-1");
-        assert!(ack.enqueued_job_id > 0);
+        let enqueued_job_id = ack.enqueued_job_id.expect("job queued");
+        assert!(enqueued_job_id > 0);
         assert!(!ack.degraded);
         assert!(!ack.processed);
 
@@ -1244,7 +1270,7 @@ mod tests {
             .conn
             .query_row(
                 "SELECT kind, state, payload FROM jobs WHERE id = ?1",
-                [ack.enqueued_job_id],
+                [enqueued_job_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("job row exists");
@@ -1261,6 +1287,43 @@ mod tests {
             })
             .expect("provider usage count");
         assert_eq!(provider_rows, 0);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn capture_degrades_without_enqueue_when_job_queue_is_at_limit() {
+        let path = temp_db_path("capture-queue-limit");
+        let mut store = Store::open(&path).expect("store opens");
+
+        let ack = store
+            .capture_event_with_queue_limit(test_event("session-1", 1234), 0)
+            .expect("capture succeeds in degraded mode");
+
+        assert!(ack.raw_event_id > 0);
+        assert_eq!(ack.enqueued_job_id, None);
+        assert!(ack.degraded);
+        assert!(!ack.processed);
+
+        let raw_events = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM raw_events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("raw event count");
+        let sessions = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("session count");
+        let jobs = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get::<_, i64>(0))
+            .expect("job count");
+        assert_eq!(raw_events, 1);
+        assert_eq!(sessions, 1);
+        assert_eq!(jobs, 0);
 
         cleanup_db_files(&path);
     }
@@ -1508,7 +1571,7 @@ mod tests {
                  FROM sessions AS s
                  JOIN raw_events AS r ON r.session_id = s.id
                  JOIN jobs AS j ON j.id = ?1",
-                [ack.enqueued_job_id],
+                [ack.enqueued_job_id.expect("job queued")],
                 |row| {
                     Ok((
                         row.get(0)?,
