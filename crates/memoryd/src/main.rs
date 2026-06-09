@@ -2,7 +2,8 @@
 
 use memoryd_core::config::{Config, DEFAULT_BIND};
 use memoryd_core::store::{
-    CaptureAck, MemoryRecallResult, NewRawEvent, RecallResult, Store, StoreError,
+    ApprovalDecision, ApprovalRow, CaptureAck, MemoryRecallResult, NewRawEvent, RecallResult,
+    Store, StoreError,
 };
 use std::env;
 use std::ffi::OsString;
@@ -39,6 +40,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
         Command::Recall(args) => recall(cli, args),
         Command::Import(args) => import(cli, args),
         Command::Dream(args) => dream(cli, args),
+        Command::Approve(args) => approve(cli, args),
         Command::Help => {
             print_help();
             Ok(())
@@ -153,6 +155,70 @@ fn dream(cli: Cli, args: DreamArgs) -> Result<(), CliError> {
         memoryd_core::dream::dream_once(&mut store, &adapter, &cfg.caps, &opts, &|| unix_ms_now())?;
     println!("{}", dream_response_json(&outcome)?);
     Ok(())
+}
+
+/// Human-in-the-loop approvals gate (H6). `--list` (the default) shows pending
+/// approvals; `--id <id> --accept|--reject` decides one. Accepting a `profile_fact`
+/// commits it to `profile_facts`; rejecting writes no fact.
+fn approve(cli: Cli, args: ApproveArgs) -> Result<(), CliError> {
+    let cfg = cli.config()?;
+    cfg.validate()?;
+    if args.accept && args.reject {
+        return Err(CliError::UnexpectedArgument(
+            "--reject (use only one of --accept/--reject)".to_string(),
+        ));
+    }
+    let mut store = Store::open(&cfg.db_path)?;
+    match &args.id {
+        Some(id) => {
+            if !args.accept && !args.reject {
+                return Err(CliError::MissingArgument(
+                    "--accept or --reject (required with --id)",
+                ));
+            }
+            let decision = store.decide_approval(id, args.accept, unix_ms_now())?;
+            println!("{}", approve_decision_json(id, &decision)?);
+        }
+        None => {
+            if args.accept || args.reject {
+                return Err(CliError::MissingArgument(
+                    "--id (required with --accept/--reject)",
+                ));
+            }
+            let pending = store.list_pending_approvals(100)?;
+            println!("{}", approve_list_json(&pending)?);
+        }
+    }
+    Ok(())
+}
+
+fn approve_list_json(pending: &[ApprovalRow]) -> Result<String, CliError> {
+    let items: Vec<serde_json::Value> = pending
+        .iter()
+        .map(|a| {
+            let change: serde_json::Value =
+                serde_json::from_str(&a.proposed_change).unwrap_or(serde_json::Value::Null);
+            serde_json::json!({
+                "id": a.id,
+                "target_type": a.target_type,
+                "target_ref": a.target_ref,
+                "proposed_change": change,
+                "requested_at": a.requested_at,
+            })
+        })
+        .collect();
+    Ok(serde_json::to_string(
+        &serde_json::json!({ "pending": items }),
+    )?)
+}
+
+fn approve_decision_json(id: &str, decision: &ApprovalDecision) -> Result<String, CliError> {
+    Ok(serde_json::to_string(&serde_json::json!({
+        "id": id,
+        "state": decision.state,
+        "committed_fact": decision.committed_fact,
+        "already_decided": decision.already_decided,
+    }))?)
 }
 
 /// Run semantic recall when requested, else lexical. Only the no-spend `null`
@@ -283,6 +349,7 @@ enum Command {
     Recall(RecallArgs),
     Import(ImportArgs),
     Dream(DreamArgs),
+    Approve(ApproveArgs),
     Help,
 }
 
@@ -348,6 +415,14 @@ struct DreamArgs {
     max_seconds: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ApproveArgs {
+    list: bool,
+    id: Option<String>,
+    accept: bool,
+    reject: bool,
+}
+
 #[derive(Debug, Clone)]
 struct Cli {
     command: Command,
@@ -370,6 +445,7 @@ impl Cli {
                 "recall" => Command::Recall(RecallArgs::default()),
                 "import" => Command::Import(ImportArgs::default()),
                 "dream" => Command::Dream(DreamArgs::default()),
+                "approve" => Command::Approve(ApproveArgs::default()),
                 "--help" | "-h" | "help" => Command::Help,
                 other => return Err(CliError::UnknownCommand(other.to_string())),
             },
@@ -446,6 +522,30 @@ impl Cli {
                     if !matches!(command, Command::Dream(_)) {
                         return Err(CliError::UnknownFlag(token));
                     }
+                }
+                "--list" => {
+                    let Command::Approve(approve) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    approve.list = true;
+                }
+                "--id" => {
+                    let Command::Approve(approve) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    approve.id = Some(next_string(&mut args, "--id")?);
+                }
+                "--accept" => {
+                    let Command::Approve(approve) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    approve.accept = true;
+                }
+                "--reject" => {
+                    let Command::Approve(approve) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    approve.reject = true;
                 }
                 "--tags" => {
                     let Command::Remember(remember) = &mut command else {
@@ -615,6 +715,7 @@ fn print_help() {
             memoryd recall <query> [--k <limit>] [--semantic] [--hops <0|1>] [--db <path>]\n\
             memoryd import --source jsonl --path <file> [--db <path>]\n\
             memoryd dream [--now] [--budget-usd <n>] [--max-seconds <n>] [--db <path>]\n\
+            memoryd approve [--list] [--id <id> --accept|--reject] [--db <path>]\n\
             memoryd serve [--db <path>] [--bind <addr:port>] [--token <token>]\n\n\
           Defaults:\n\
             bind: {DEFAULT_BIND}\n\
@@ -716,6 +817,7 @@ fn dream_response_json(outcome: &memoryd_core::dream::DreamOutcome) -> Result<St
         "run_id": outcome.run_id,
         "consolidated": outcome.consolidated,
         "associated": outcome.associated,
+        "proposed": outcome.proposed,
         "decayed": outcome.decayed,
         "tokens_used": outcome.tokens_used,
         "status": outcome.status,
@@ -2213,5 +2315,117 @@ mod tests {
             recall_request_from_json(serde_json::json!({"query": "wal", "hops": 5})).is_err(),
             "hops must be 0 or 1"
         );
+    }
+
+    #[test]
+    fn parses_approve_flags() {
+        let cli = Cli::parse(["memoryd", "approve", "--list"].map(OsString::from)).expect("parses");
+        let Command::Approve(args) = cli.command else {
+            panic!("expected approve")
+        };
+        assert!(args.list && args.id.is_none() && !args.accept && !args.reject);
+
+        let cli =
+            Cli::parse(["memoryd", "approve", "--id", "abc123", "--accept"].map(OsString::from))
+                .expect("parses");
+        let Command::Approve(args) = cli.command else {
+            panic!("expected approve")
+        };
+        assert_eq!(args.id.as_deref(), Some("abc123"));
+        assert!(args.accept && !args.reject);
+    }
+
+    #[test]
+    fn approve_rejects_accept_and_reject_together() {
+        let path = temp_db_path("m8-cli-conflict");
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "approve",
+                "--id",
+                "x",
+                "--accept",
+                "--reject",
+                "--db",
+                path.to_str().unwrap(),
+            ]
+            .map(OsString::from),
+        )
+        .expect("parses");
+        let Command::Approve(args) = cli.command.clone() else {
+            panic!("expected approve")
+        };
+        assert!(
+            approve(cli, args).is_err(),
+            "--accept and --reject are mutually exclusive"
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn approve_command_end_to_end_commits_an_approved_fact() {
+        let path = temp_db_path("m8-cli-e2e");
+        {
+            let mut store = Store::open(&path).expect("store opens");
+            store
+                .capture_event(NewRawEvent {
+                    session_id: "s1".to_string(),
+                    agent: "claude".to_string(),
+                    source: "tool_result".to_string(),
+                    kind: "preference".to_string(),
+                    payload: serde_json::json!({"text": "prefers conventional commits"}),
+                    provenance: serde_json::json!({}),
+                    ts_ms: 1000,
+                })
+                .expect("capture");
+        }
+        // dream: consolidate -> ... -> extract proposes a pending approval.
+        let cli = Cli::parse(
+            ["memoryd", "dream", "--now", "--db", path.to_str().unwrap()].map(OsString::from),
+        )
+        .expect("parses");
+        let Command::Dream(dargs) = cli.command.clone() else {
+            panic!("expected dream")
+        };
+        dream(cli, dargs).expect("dream");
+
+        let id = {
+            let store = Store::open(&path).expect("store opens");
+            let pending = store.list_pending_approvals(10).expect("list");
+            assert_eq!(pending.len(), 1, "one pending profile-fact approval");
+            pending[0].id.clone()
+        };
+
+        // approve --id <id> --accept commits the fact.
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "approve",
+                "--id",
+                &id,
+                "--accept",
+                "--db",
+                path.to_str().unwrap(),
+            ]
+            .map(OsString::from),
+        )
+        .expect("parses");
+        let Command::Approve(aargs) = cli.command.clone() else {
+            panic!("expected approve")
+        };
+        approve(cli, aargs).expect("approve");
+
+        let store = Store::open(&path).expect("store opens");
+        let stats = store.table_stats().expect("stats");
+        assert_eq!(
+            table_rows(&stats, "profile_facts"),
+            1,
+            "fact committed after approval"
+        );
+        assert!(
+            store.list_pending_approvals(10).expect("list").is_empty(),
+            "the approval is no longer pending after the decision"
+        );
+        cleanup_db_files(&path);
     }
 }

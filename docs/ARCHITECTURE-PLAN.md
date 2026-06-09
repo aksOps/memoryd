@@ -5368,6 +5368,30 @@ Graph growth bounded (no unbounded fan-out), graph contribution to recall valida
 
 ### 21.11 M8 — Profile extraction behind the approvals gate (H6)
 
+> **Status (2026-06-09): delivered.** A `dream` run now runs an **extract-profile**
+> phase (consolidate → associate → extract → decay) that proposes profile facts from
+> durable, profile-relevant memories (`kind ∈ {identity, preference, fact, decision}`)
+> into `approvals(pending)` — it **never** writes `profile_facts` directly (H6,
+> structurally enforced by the `profile_facts.approval_id` NOT NULL FK). `approve
+> [--list] [--id <id> --accept|--reject]` is the human gate: accepting a `profile_fact`
+> commits it to `profile_facts` (superseding any active fact for the same key, citing
+> the approval id); rejecting writes no fact. Extraction is **propose-once-per-key**
+> (`fact_key = {kind}:{slug}`, target_ref-indexed via migration 0006's partial index):
+> a candidate is skipped when any approval already exists for the key (any state — so
+> rejected/approved keys are not re-proposed) or an active fact holds it. The fact
+> *value* is optionally refined by the gated LLM `summarize` path (metered test-double;
+> the `null` adapter uses verbatim content — no spend, no network), sharing the dream
+> run's spend window so total provider spend stays under the cap. **Deviations
+> (documented in code):** (1) extract runs **inline in `dream_once`** (like M6/M7), not
+> via a `jobs`-queue lease. (2) extraction is **deterministic kind-based**; the
+> LLM-powered structured extraction is stubbed (fact value optionally refined via
+> `summarize`, fact key derived mechanically). (3) `remember` produces `observation`
+> memories (not profile kinds), so profile extraction targets typed captured/imported
+> memories (e.g. an HTTP capture with `kind:"preference"`); `remember`-d content is not
+> auto-proposed. **Deferred:** the `expired` approval transition, the
+> `memory_cleanup`/`memory_purge` approval flows (only `profile_fact` is produced/
+> committed in M8), and confidence-threshold gating of proposals.
+
 #### Goal
 Propose long-term profile/preference facts from memories — and **never** write them silently. Every profile mutation passes a human approval gate.
 
