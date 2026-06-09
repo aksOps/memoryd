@@ -881,9 +881,11 @@ impl Store {
                 for b in (a + 1)..capped.len() {
                     let ia = capped[a];
                     let ib = capped[b];
-                    let created = upsert_cooccur(&tx, &cands[ia].id, &cands[ib].id, now_ms)?;
-                    upsert_cooccur(&tx, &cands[ib].id, &cands[ia].id, now_ms)?;
-                    if created {
+                    // Count the logical pair once. A pair can be asymmetric on disk
+                    // (fan-out can prune one direction), so consult both inserts.
+                    let fwd = upsert_cooccur(&tx, &cands[ia].id, &cands[ib].id, now_ms)?;
+                    let rev = upsert_cooccur(&tx, &cands[ib].id, &cands[ia].id, now_ms)?;
+                    if fwd || rev {
                         batch.links_created += 1;
                     } else {
                         batch.links_reinforced += 1;
@@ -900,10 +902,11 @@ impl Store {
                         let cos = f64::from(cosine(vi, vj));
                         if cos >= SEM_LINK_THRESHOLD {
                             let weight = ((cos + 1.0) / 2.0).clamp(0.0, 1.0);
-                            let created =
+                            let fwd =
                                 upsert_semantic(&tx, &cands[i].id, &cands[j].id, weight, now_ms)?;
-                            upsert_semantic(&tx, &cands[j].id, &cands[i].id, weight, now_ms)?;
-                            if created {
+                            let rev =
+                                upsert_semantic(&tx, &cands[j].id, &cands[i].id, weight, now_ms)?;
+                            if fwd || rev {
                                 batch.links_created += 1;
                             } else {
                                 batch.links_reinforced += 1;
@@ -919,6 +922,11 @@ impl Store {
             "DELETE FROM memory_links WHERE weight < ?1",
             params![WEAK_LINK_FLOOR],
         )?;
+        // Fan-out cap is per *node* (across all link types), not per type: partitioning
+        // by link_type would let a node hold CAP co-occurrence + CAP semantic edges,
+        // violating the §21.10 "<= ASSOCIATE_FANOUT_CAP per node" bound. Strongest edges
+        // survive regardless of type (under `null` there are no semantic links, so no
+        // cross-type competition occurs).
         batch.links_pruned += tx.execute(
             "DELETE FROM memory_links WHERE id IN (
                  SELECT id FROM (
@@ -1291,18 +1299,25 @@ impl Store {
                 .enumerate()
                 .map(|(i, c)| (c.id.clone(), i))
                 .collect();
+            // Prepared once and reused across all direct hits (recall is on the hot path):
+            // one statement for the adjacency lookup, one for fetching a neighbor's row.
+            let mut neighbor_stmt = self.conn.prepare(
+                "SELECT dst_memory_id, weight FROM memory_links
+                 WHERE src_memory_id = ?1 ORDER BY weight DESC, dst_memory_id LIMIT ?2",
+            )?;
+            let mut neighbor_row_stmt = self.conn.prepare(
+                "SELECT kind, content, centrality, source_trust,
+                        COALESCE(last_accessed_at, created_at), access_count, lifecycle_state
+                 FROM memories
+                 WHERE id = ?1
+                   AND lifecycle_state IN ('active', 'associated', 'decaying', 'dormant')",
+            )?;
             for src in &direct_ids {
-                let neighbors: Vec<(String, f64)> = {
-                    let mut stmt = self.conn.prepare(
-                        "SELECT dst_memory_id, weight FROM memory_links
-                         WHERE src_memory_id = ?1 ORDER BY weight DESC, dst_memory_id LIMIT ?2",
-                    )?;
-                    let mapped = stmt
-                        .query_map(params![src, ASSOCIATE_FANOUT_CAP as i64], |row| {
-                            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-                        })?;
-                    mapped.collect::<Result<Vec<_>, _>>()?
-                };
+                let neighbors: Vec<(String, f64)> = neighbor_stmt
+                    .query_map(params![src, ASSOCIATE_FANOUT_CAP as i64], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
                 for (dst, weight) in neighbors {
                     if let Some(&idx) = seen.get(&dst) {
                         // Already a candidate: it also earns the strongest reaching link.
@@ -1311,18 +1326,9 @@ impl Store {
                         }
                         continue;
                     }
-                    let row: Option<(String, String, f64, f64, i64, i64, String)> = self
-                        .conn
-                        .query_row(
-                            "SELECT kind, content, centrality, source_trust,
-                                    COALESCE(last_accessed_at, created_at), access_count,
-                                    lifecycle_state
-                             FROM memories
-                             WHERE id = ?1
-                               AND lifecycle_state IN
-                                   ('active', 'associated', 'decaying', 'dormant')",
-                            params![dst],
-                            |r| {
+                    let row: Option<(String, String, f64, f64, i64, i64, String)> =
+                        neighbor_row_stmt
+                            .query_row(params![dst], |r| {
                                 Ok((
                                     r.get(0)?,
                                     r.get(1)?,
@@ -1332,9 +1338,8 @@ impl Store {
                                     r.get(5)?,
                                     r.get(6)?,
                                 ))
-                            },
-                        )
-                        .optional()?;
+                            })
+                            .optional()?;
                     if let Some((
                         kind,
                         content,

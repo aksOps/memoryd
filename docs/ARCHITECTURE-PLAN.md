@@ -5335,9 +5335,11 @@ S1/H6 (adaptiveness never breaches caps — spend + wall-clock proven), C3 degra
 > temporal-decay is deferred** — graph growth is bounded by the fan-out cap + weak-floor
 > (`<0.10`) prune, which is what "count stays bounded over runs" requires. (4) `R_recall`
 > omits `supersession_penalty`/`provenance_weight` (no such columns until M8/dedup);
-> recency uses `exp(-ln2·age/7d)`. **Deferred:** `causal`/`temporal`/`supersedes`/
-> `contradicts` link types (only `co_occurrence`/`semantic` are produced in M7), the
-> `AccessBump` recall-reinforcement job, and cross-batch ANN linking.
+> recency uses `exp(-ln2·age/7d)`. (5) the §9.3 recall/base weights are compile-time
+> `const`s in `dream.rs`; the `[scoring]` config-override hook (§9.3) is deferred to a
+> later milestone (M8/M10). **Deferred:** `causal`/`temporal`/`supersedes`/`contradicts`
+> link types (only `co_occurrence`/`semantic` are produced in M7), the `AccessBump`
+> recall-reinforcement job, and cross-batch ANN linking.
 
 #### Goal
 Strengthen/prune the weighted memory graph during dreaming and use one-hop expansion to improve recall.
