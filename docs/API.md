@@ -28,9 +28,12 @@ memoryd remember <content> [--kind <kind>] [--session <id>] [--source <source>] 
 ```
 
 Writes a memory capture through the same append-only path as HTTP capture. It
-redacts common secret shapes before persistence, returns after the raw event and
-one embed job are persisted, writes capture/redaction audit rows, and does not
-call a provider inline.
+redacts common secret shapes before persistence, normally returns after the raw
+event and one embed job are persisted, writes capture/redaction audit rows, and
+does not call a provider inline.
+
+If the configured queue-depth cap is reached, capture still persists the raw
+event and returns a degraded response with no queued embed job.
 
 Output JSON:
 
@@ -89,8 +92,12 @@ Base URL: `http://127.0.0.1:7077` by default.
 ### `POST /v1/capture`
 
 Redacts common secret shapes, appends the redacted raw event, upserts its
-session, enqueues one `embed` job, writes capture/redaction audit rows, and
-returns immediately. The handler performs no provider calls.
+session, normally enqueues one `embed` job, writes capture/redaction audit rows,
+and returns immediately. The handler performs no provider calls.
+
+When the configured queue-depth cap is reached, the handler still returns `202`
+after appending the raw event, but `degraded` is `true` and `enqueued_job_id` is
+`null` because no embed job was queued.
 
 Request headers:
 
@@ -124,6 +131,18 @@ Response `202 Accepted`:
   "session_id": "session-1",
   "enqueued_job_id": 1,
   "degraded": false,
+  "processed": false
+}
+```
+
+Degraded `202 Accepted` response when the queue-depth cap is reached:
+
+```json
+{
+  "raw_event_id": 2,
+  "session_id": "session-1",
+  "enqueued_job_id": null,
+  "degraded": true,
   "processed": false
 }
 ```

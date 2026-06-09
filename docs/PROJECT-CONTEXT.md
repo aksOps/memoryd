@@ -48,6 +48,9 @@ Implemented now:
   recall index persistence.
 - Safe `audit_log` rows for capture appends, redaction summaries, and HTTP auth
   rejections.
+- Bounded capture admission using the configured queue-depth cap; saturated
+  captures persist the raw event and return degraded without enqueueing an embed
+  job.
 - CI/security gates for format, build, clippy, tests, dependency policy,
   advisory audit, and SBOM generation.
 - OpenSSF Best Practices passing evidence.
