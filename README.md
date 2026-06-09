@@ -45,7 +45,8 @@ curl -sS -X POST http://127.0.0.1:7077/v1/recall \
   -d '{"query":"WAL timeout","k":5}'
 ```
 
-See `docs/API.md` for CLI and REST request/response details.
+See `docs/API.md` for CLI and REST request/response details. See
+`docs/MILESTONE-TASKS.md` for the current roadmap task checklist.
 
 ## Security Defaults
 

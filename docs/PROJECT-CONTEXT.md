@@ -34,6 +34,8 @@ Borrow concepts, not code:
 
 ## Current Implementation Status
 
+Operational roadmap checklist: `docs/MILESTONE-TASKS.md`.
+
 Implemented now:
 
 - Rust workspace with `memoryd` binary and `memoryd-core` library.
