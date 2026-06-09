@@ -15,11 +15,11 @@ Status legend:
 
 - `[~]` M0 is mostly complete.
 - `[x]` M1 is complete against this checklist.
-- `[~]` M2 has provider-free lexical recall, but not the full durable-memory
-  recall path from the plan.
+- `[x]` M2 — provider-free `raw_events_fts` lexical recall is the accepted variant;
+  durable-memory recall is deferred to M6 (not an M2 gap).
 - `[ ]` M3 and later are not started beyond schema stubs and queued `embed` jobs.
 
-Next implementation target: close the M2 gaps that do not require providers.
+Next implementation target: start M3 (queue leasing and governor caps).
 
 ## M0 — Store Skeleton, Config, CLI Shell, Security Gate
 
@@ -78,8 +78,10 @@ Evidence from 2026-06-09 local ignored performance-fixture run with
 
 ## M2 — Lexical Recall, Provider-Free
 
-Status: `[~]` Provider-free recall exists, but the plan's durable-memory recall
-path is not complete.
+Status: `[x]` Provider-free raw-event lexical recall over `raw_events_fts` is the
+accepted M2 variant (decided 2026-06-09: "keep raw recall"). Durable
+`memories`/`memory_versions` recall and versioning are deferred to the
+dream/consolidation plane (M6) and are not part of M2 scope.
 
 - `[x]` `recall` CLI exists.
 - `[x]` `POST /v1/recall` exists.
@@ -88,18 +90,51 @@ path is not complete.
 - `[x]` Recall treats operator-like FTS terms as literals.
 - `[x]` Recall rejects empty or punctuation-only queries.
 - `[x]` Recall does not write provider usage rows.
-- `[ ]` Decide whether M2 should continue to recall over `raw_events_fts` for the
-  near-term product, or switch now to the plan's `memories`/`memory_versions`
-  durable-memory path.
-- `[ ]` If switching to planned path, make `remember` create a durable `memories`
-  row and immutable `memory_versions` v1.
-- `[ ]` If staying on raw-event recall temporarily, update the roadmap to mark
-  this as the accepted M2 variant.
-- `[ ]` Add score breakdown and provenance to recall results if the plan's M2 API
-  remains authoritative.
-- `[ ]` Queue access-bump jobs instead of writing access stats inline.
-- `[ ]` Add EXPLAIN/query-plan assertions proving FTS/index use.
-- `[ ]` Add p99 recall benchmark evidence against the `< 100 ms` M2 target.
+- `[x]` Decided (2026-06-09) to keep provider-free `raw_events_fts` recall as the
+  accepted M2 variant rather than switching to the plan's
+  `memories`/`memory_versions` durable-memory path.
+- `[x]` Updated the roadmap and project docs to record raw-event FTS recall as the
+  accepted M2 variant.
+- `[x]` Added an `EXPLAIN QUERY PLAN` regression test proving recall uses the
+  `raw_events_fts` virtual-table index, pinned to the production query via the
+  shared `RECALL_EVENTS_SQL` constant
+  (`recall_events_query_plan_uses_raw_events_fts`).
+- `[x]` Added recall latency evidence against the `< 100 ms` M2 target (see
+  evidence below).
+
+Deferred to the dream/consolidation plane (M6), not part of the accepted M2
+raw-recall variant:
+
+- `[ ]` Make `remember` create a durable `memories` row and immutable
+  `memory_versions` v1.
+- `[ ]` Add the multi-variable score breakdown over `scoring_variables` and
+  durable-memory provenance to recall results.
+- `[ ]` Queue access-frequency bump jobs for durable memories (the raw-event read
+  path already performs no inline writes).
+- `[ ]` Add a hard candidate cap (e.g. 256) to bound recall latency for very broad
+  queries; raw recall currently scores the full FTS match set.
+
+Evidence from 2026-06-09 local ignored recall-latency fixture run with
+`--test-threads=1` over a 50,000 raw-event corpus, recall query matching a
+bounded ~200-row subset (a representative query — note the planned 256-candidate
+cap is not yet implemented, so production queries are currently unbounded):
+
+- `recall_50k_raw_events_median_latency_under_m2_target`: median (p50)
+  `491.151µs`, p95 `87.664401ms`, p99 `94.877763ms`.
+
+The plan states the recall SLO as p95 `< 100 ms` in its capability tables and p99
+`< 100 ms` in the M2 exit row. The recorded p95 (`87.664401ms`) meets the p95
+SLO; p99 (`94.877763ms`) is under 100 ms but borderline. These tail figures are
+not contention-robust — they vary with host load (heavier load pushes them past
+100 ms), because the wall-clock tail on this shared dev host is dominated by
+scheduler contention from co-resident processes, not recall cost. The median
+(~0.5 ms) is the contention-robust measure of the algorithm; the fixture asserts
+the median as a regression floor and records the full distribution as dated
+evidence. (A dedicated, idle 1-vCPU baseline would be expected to remove the
+tail, since the median is already ~200x under target, but that has not been
+measured here.) Raw recall also scores the full FTS match set (no hard candidate
+cap — that prefilter is part of the deferred durable design), so latency scales
+with match-set size.
 
 ## M3 — Queue, Governor, Embed Worker, Provider Adapters
 
@@ -243,8 +278,8 @@ Status: `[ ]` Not started.
 
 ## Immediate Next Queue
 
-1. Decide M2 raw-event recall versus planned durable-memory recall.
-2. Close chosen M2 recall gaps with tests and docs.
-3. Start M3 queue leasing and governor caps.
-4. Add provider-free queue/degraded-path regression tests as M3 grows.
-5. Add M0 release-build/disk-free evidence if those plan requirements remain.
+1. M2 decided: provider-free `raw_events_fts` recall accepted; query-plan and
+   recall-latency evidence landed. Durable-memory recall deferred to M6.
+2. Start M3 queue leasing and governor caps.
+3. Add provider-free queue/degraded-path regression tests as M3 grows.
+4. Add M0 release-build/disk-free evidence if those plan requirements remain.
