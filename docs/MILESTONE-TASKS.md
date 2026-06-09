@@ -17,9 +17,12 @@ Status legend:
 - `[x]` M1 is complete against this checklist.
 - `[x]` M2 — provider-free `raw_events_fts` lexical recall is the accepted variant;
   durable-memory recall is deferred to M6 (not an M2 gap).
-- `[ ]` M3 and later are not started beyond schema stubs and queued `embed` jobs.
+- `[~]` M3 — queue leasing, governor caps, the embed worker, and the `null` adapter
+  are delivered and gated; paid/remote adapters and `setup` are deferred to a later
+  M3 increment.
+- `[ ]` M4 and later are not started.
 
-Next implementation target: start M3 (queue leasing and governor caps).
+Next implementation target: M4 (vector rerank over the embeddings M3 produces).
 
 ## M0 — Store Skeleton, Config, CLI Shell, Security Gate
 
@@ -138,24 +141,57 @@ with match-set size.
 
 ## M3 — Queue, Governor, Embed Worker, Provider Adapters
 
-Status: `[ ]` Not started beyond `jobs` schema and capture enqueue.
+Status: `[~]` Core plane delivered (exactly-once leasing, caps, embed worker, `null`
+adapter); paid/remote adapters and the `setup` command are deferred to a later M3
+increment behind the in-place `ProviderAdapter` seam.
 
-- `[ ]` Add queue leasing from `jobs` with atomic `pending -> running` transition.
-- `[ ]` Add visibility timeout and attempt accounting.
-- `[ ]` Add exactly-once concurrency tests for job leasing.
-- `[ ]` Add governor caps for queue depth, concurrency, per-worker memory, CPU
-  share, dream wall-clock, and spend window.
-- `[ ]` Add over-cap enqueue/admission tests proving backpressure without OOM.
-- `[ ]` Add fixed worker enum with `Embed` active first.
-- `[ ]` Add `null` provider adapter for offline CI and default no-spend mode.
-- `[ ]` Add `openai_compat` provider adapter behind explicit config.
-- `[ ]` Add `ollama` provider adapter behind explicit config.
-- `[ ]` Add provider reachability probe and failover order.
-- `[ ]` Write `embeddings` rows from `Embed` worker.
-- `[ ]` Write `provider_usage` rows for every embed provider call.
-- `[ ]` Enforce default `spend_window_usd = 0` so paid calls are blocked unless
-  opted in.
-- `[ ]` Add `setup` or equivalent provider config/reachability command.
+- `[x]` Add queue leasing from `jobs` with atomic `pending -> running` transition
+  (one `UPDATE ... RETURNING`; SQLite writer serialization makes it exactly-once).
+- `[x]` Add visibility timeout and attempt accounting (expired `running` leases are
+  reclaimable; `attempts` increments per lease).
+- `[x]` Add exactly-once concurrency tests for job leasing (4 workers, 200 jobs, no
+  double-claim).
+- `[~]` Governor caps: `queue_depth_max` (admission) and `worker_concurrency`
+  (per-tick lease bound) are enforced now; `worker_mem_mb`, CPU share,
+  `dream_wallclock_secs`, and the spend window are config-present and bind once the
+  planes that consume them land.
+- `[x]` Over-cap admission backpressure without OOM (capture degrades without
+  enqueue at the cap; covered by existing regression tests).
+- `[x]` Add fixed worker with `Embed` active first (the only active worker this slice).
+- `[x]` Add `null` provider adapter for offline CI and default no-spend mode.
+- `[ ]` Add `openai_compat` provider adapter behind explicit config. (Deferred.)
+- `[ ]` Add `ollama` provider adapter behind explicit config. (Deferred.)
+- `[ ]` Add provider reachability probe and failover order. (Deferred — single
+  adapter this slice.)
+- `[x]` Write `embeddings` rows from the `Embed` worker.
+- `[x]` Write `provider_usage` rows for every embed provider call.
+- `[x]` Enforce default `spend_window_usd = 0` so paid calls are blocked unless
+  opted in (config validation rejects a non-`null` default adapter at zero budget;
+  the `null` adapter records `est_cost = 0`).
+- `[ ]` Add `setup` or equivalent provider config/reachability command. (Deferred
+  with the remote adapters.)
+
+### M3 evidence (2026-06-09)
+
+- `embed_lease_is_exactly_once_under_concurrent_workers`: 4 worker connections drain
+  200 seeded jobs; every job is claimed exactly once (200 unique ids) and all reach
+  `done`.
+- `lease_then_complete_writes_embedding_and_provider_usage`: a leased job writes a
+  32-dim `embeddings` row (128-byte little-endian vector) plus a `provider_usage`
+  row (`adapter='null'`, `op='embed'`, `est_cost=0`), and the job reaches `done`.
+- `failed_embed_job_defers_with_backoff_then_dead_letters`: deferral offsets are
+  500/1000/2000/4000 ms; the job dead-letters once `attempts` reaches
+  `job_max_attempts` (5).
+- `expired_lease_is_reclaimed_after_visibility_timeout`: a `running` job past its
+  visibility window is re-leased with an incremented attempt count.
+- `worker::tick_embed` processes up to `worker_concurrency` jobs per tick; `serve`
+  runs one such worker thread over a second WAL connection.
+
+#### Deferred to a later M3 increment
+
+`openai_compat`/`ollama`/`opencode` adapters, the reachability probe + failover
+order, and the `setup` CLI. The `ProviderAdapter` seam is already in place so these
+land without touching the queue/worker/ledger code.
 
 ## M4 — Vector Rerank In Recall
 
@@ -278,8 +314,11 @@ Status: `[ ]` Not started.
 
 ## Immediate Next Queue
 
-1. M2 decided: provider-free `raw_events_fts` recall accepted; query-plan and
-   recall-latency evidence landed. Durable-memory recall deferred to M6.
-2. Start M3 queue leasing and governor caps.
-3. Add provider-free queue/degraded-path regression tests as M3 grows.
-4. Add M0 release-build/disk-free evidence if those plan requirements remain.
+1. M2 decided: provider-free `raw_events_fts` recall accepted. Durable-memory recall
+   deferred to M6.
+2. M3 core plane landed: exactly-once leasing, governor caps, embed worker, and the
+   `null` adapter (writes `embeddings` + `provider_usage`).
+3. Start M4 (vector rerank in recall) over the embeddings the embed worker produces.
+4. Land the deferred M3 increment: `openai_compat`/`ollama` adapters, reachability
+   probe + failover, and the `setup` command.
+5. Add M0 release-build/disk-free evidence if those plan requirements remain.
