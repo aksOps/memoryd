@@ -5434,7 +5434,8 @@ fn commit_fact(&self, approval: &Approval) -> Result<FactId>; // requires approv
 > **Status (2026-06-09): delivered.** A second `VectorIndex` implementation — an
 > in-process **HNSW** graph — lands behind the existing trait with **no** change to the
 > trait or any recall call-site signature. It is **dependency-free** (no `rand`:
-> deterministic level assignment via a std-hash-seeded geometric distribution),
+> deterministic level assignment via an FNV-1a-seeded geometric distribution — a
+> specified, toolchain-stable hash, not std's `DefaultHasher`),
 > **`unsafe`-free**, and **deterministic** (total-ordered heaps + id tie-breaks).
 > `BruteForce` remains the **default and the correctness oracle**. Selection: a
 > validated `Caps.vector_index_kind` ("brute-force" | "hnsw") feeds
@@ -5452,7 +5453,9 @@ fn commit_fact(&self, approval: &Approval) -> Result<FactId>; // requires approv
 > for recall@10 parity at personal scale. (3) Selection is config-validated but there is
 > still no config-file/env parser (deferred, as in M8); the `recall --index` flag is the
 > runtime-reachable selector, and the index applies to the raw-event semantic recall
-> path (`recall_semantic`).
+> path (`recall_semantic`). The HTTP `/v1/recall` endpoint always uses `brute-force`
+> (the `--index` override is CLI-only); since HNSW is not yet a latency win, the HTTP
+> path intentionally pins the oracle until the persistent index lands.
 
 #### Goal
 Scale semantic recall beyond brute-force shortlist sizes with **no** API change and **no** external vector DB (H3).
@@ -5471,7 +5474,7 @@ Second `VectorIndex` impl (in-process HNSW over the same `embeddings`), selected
 | Entry | Exit (evidence) |
 |------|------|
 | M4 live | HNSW recall@10 within ε of BruteForce on fixture (correctness gate); BruteForce stays selectable |
-| — | At 200k embeddings, semantic recall p99 improves vs BruteForce while staying < 100 ms; memory within `per_worker_mem_mb` |
+| — | **Deferred — not met this milestone.** The "200k embeddings, p99 < 100 ms vs BruteForce" target needs a *persistent full-corpus* HNSW index. With the current stateless per-call build over the ≤256 FTS shortlist, HNSW is *slower* than BruteForce (see Status callout). M9 delivers the algorithm, the config seam, and recall@10 oracle parity; the latency win lands with the persistent index. |
 | — | No public API change (M4 callers untouched); still no external service (H3 reaffirmed) |
 
 #### Risks retired
