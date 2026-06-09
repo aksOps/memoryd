@@ -42,6 +42,8 @@ pub const SEM_LINK_THRESHOLD: f64 = 0.20;
 /// Cap on co-occurrence group size before pairing (bounds the O(n²) pairing per run).
 pub const CO_OCCUR_GROUP_CAP: usize = 64;
 pub(crate) const ASSOCIATE_BATCH: usize = 500;
+/// Per-run cap on memories scanned by the extract-profile phase.
+pub(crate) const EXTRACT_BATCH: usize = 500;
 /// Recall recency half-life: a hit accessed this long ago scores 0.5 on the recency term.
 const RECENCY_HALFLIFE_MS: i64 = 7 * DAY_MS;
 /// Recall-time fusion weights (ARCHITECTURE-PLAN §9.3 `[scoring.recall]`). These sum to
@@ -264,6 +266,7 @@ pub struct DreamOutcome {
     pub run_id: String,
     pub consolidated: usize,
     pub associated: usize,
+    pub proposed: usize,
     pub decayed: usize,
     pub tokens_used: i64,
     pub status: &'static str,
@@ -289,6 +292,7 @@ pub fn dream_once<A: ProviderAdapter>(
     let mut window_spend = 0.0_f64;
     let mut consolidated = 0_usize;
     let mut associated = 0_usize;
+    let mut proposed = 0_usize;
     let mut decayed = 0_usize;
     let mut tokens = 0_i64;
     let mut budget_hit = false;
@@ -338,6 +342,25 @@ pub fn dream_once<A: ProviderAdapter>(
         }
     }
 
+    // Extract-profile phase: propose profile facts into approvals(pending) — never
+    // writing `profile_facts` directly (H6). Shares the run's spend window so total
+    // provider spend across consolidate + extract stays under the cap.
+    if !partial && clock() - start < max_ms {
+        let extract = store.extract_profile_pending(
+            adapter,
+            opts.budget_usd,
+            &mut window_spend,
+            EXTRACT_BATCH,
+            clock(),
+        )?;
+        proposed += extract.proposed;
+        tokens += extract.tokens;
+        budget_hit |= extract.budget_hit;
+        if extract.proposed + extract.skipped > 0 {
+            jobs_run += 1;
+        }
+    }
+
     // Decay phase: a fixed `now` for the whole phase so a row recomputed this run is
     // not re-selected (its decay_at advances past `now`).
     if !partial {
@@ -370,6 +393,7 @@ pub fn dream_once<A: ProviderAdapter>(
         run_id,
         consolidated,
         associated,
+        proposed,
         decayed,
         tokens_used: tokens,
         status,

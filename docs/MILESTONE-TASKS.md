@@ -33,9 +33,14 @@ Status legend:
   phase builds/reinforces/prunes symmetric `memory_links` (co-occurrence + semantic),
   `recall --hops 0|1` adds graph expansion, and `graph_centrality`/`link_strength` feed
   scoring; semantic links are test-double-only and link weight-decay is deferred.
-- `[ ]` M8 and later are not started.
+- `[x]` M8 — profile extraction behind the approvals gate (H6) is delivered: a `dream`
+  extract-profile phase proposes facts into `approvals(pending)` (never writing
+  `profile_facts` directly — enforced by the NOT NULL approval_id FK), and
+  `approve [--list] [--id N --accept|--reject]` commits/rejects them; LLM extraction is
+  stubbed (deterministic kind-based, optional gated `summarize` refinement).
+- `[ ]` M9 and later are not started.
 
-Next implementation target: M8 (profile extraction behind the approvals gate, H6).
+Next implementation target: M9 (in-process HNSW behind the VectorIndex trait, perf only).
 
 ## M0 — Store Skeleton, Config, CLI Shell, Security Gate
 
@@ -305,17 +310,19 @@ by fan-out cap + weak-floor prune).
 
 ## M8 — Profile Extraction Behind Approvals
 
-Status: `[ ]` Not started.
+Status: `[x]` Delivered. ExtractProfile runs inline in `dream_once`; LLM extraction
+is stubbed (deterministic kind-based, optional gated `summarize` refinement).
 
-- `[ ]` Add `profile` module as the only writer of `profile_facts`.
-- `[ ]` Add `approvals` module and approval decision workflow.
-- `[ ]` Add `ExtractProfile` worker that creates pending approvals only.
-- `[ ]` Add `approve --list` CLI.
-- `[ ]` Add `approve --id <id> --accept` CLI.
-- `[ ]` Add `approve --id <id> --reject` CLI.
-- `[ ]` Enforce no `profile_facts` write without approved `approval_id`.
-- `[ ]` Audit approve/reject decisions.
-- `[ ]` Add idempotency for duplicate pending proposals.
+- `[x]` `decide_approval` commits `profile_facts` only on accept (the sole writer path).
+- `[x]` Approval decision workflow: `list_pending_approvals` + `decide_approval`.
+- `[x]` `extract_profile_pending` creates pending approvals only (never facts).
+- `[x]` `approve --list` CLI (lists pending approvals as JSON).
+- `[x]` `approve --id <id> --accept` CLI (commits the fact).
+- `[x]` `approve --id <id> --reject` CLI (writes no fact).
+- `[x]` No `profile_facts` write without an `approval_id` — structurally enforced by the
+  NOT NULL FK (test `h6_profile_fact_requires_an_approval_id`).
+- `[x]` Audit propose/approve/reject decisions (`insert_audit_log`).
+- `[x]` Idempotent: propose-once-per-`fact_key` (test `extract_is_idempotent_no_duplicate_pending`).
 
 ## M9 — In-Process HNSW Behind VectorIndex
 

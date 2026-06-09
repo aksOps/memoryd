@@ -94,7 +94,16 @@ Implemented now:
   `memories_fts` + one-hop graph expansion, falling back to raw-event recall when no memory
   matches. `graph_centrality` (§9.4) is precomputed and folded into `R_base` (0.12) and
   `R_recall`. Migration 0005 adds `memories.centrality`/`source_session`. Link weight
-  temporal-decay and profile/approvals (M8) are deferred.
+  temporal-decay is deferred.
+- M8 profile extraction behind the approvals gate (H6): a `dream` extract-profile phase
+  proposes facts from durable memories (`kind ∈ {identity,preference,fact,decision}`)
+  into `approvals(pending)` — never writing `profile_facts` directly (enforced by the
+  `profile_facts.approval_id` NOT NULL FK). `approve [--list] [--id N --accept|--reject]`
+  is the human gate: accept commits the fact (superseding any active fact for the key,
+  citing the approval); reject writes nothing. Propose-once-per-`fact_key`; LLM
+  extraction stubbed (deterministic kind-based, optional gated `summarize`). Migration
+  0006 adds a pending-approvals target index. `remember` yields observations, so profile
+  extraction targets typed captures (e.g. HTTP capture with `kind:"preference"`).
 - CI/security gates for format, build, clippy, tests, dependency policy,
   advisory audit, and SBOM generation.
 - OpenSSF Best Practices passing evidence.

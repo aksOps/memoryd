@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 pub const CANONICAL_TABLES: [&str; 13] = [
     "sessions",
@@ -993,6 +993,266 @@ impl Store {
         Ok(batch)
     }
 
+    /// Propose profile facts from durable, profile-relevant memories into
+    /// `approvals(pending)` — **never** writing `profile_facts` directly (H6: the
+    /// `profile_facts.approval_id` NOT NULL FK structurally forbids an un-approved fact).
+    /// Deterministic, propose-once-per-`fact_key`: a candidate is skipped when any
+    /// approval already exists for its key (any state — respects prior accept/reject) or
+    /// an active fact already holds that key. The fact *value* is optionally refined by
+    /// the gated LLM `summarize` path (exercised by a metered test-double; the `null`
+    /// adapter uses the memory content verbatim — no spend, no network). One IMMEDIATE tx.
+    pub(crate) fn extract_profile_pending<A: ProviderAdapter>(
+        &mut self,
+        adapter: &A,
+        budget_usd: f64,
+        window_spend: &mut f64,
+        limit: usize,
+        now_ms: i64,
+    ) -> Result<ExtractBatch, StoreError> {
+        let limit_i = i64::try_from(limit).unwrap_or(i64::MAX);
+        // Profile-relevant kinds: durable owner knowledge (§9.6 long half-lives). Episodic
+        // kinds (observation/ephemeral/task) are excluded so approvals are not flooded.
+        let cands: Vec<(String, String, String, f64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, kind, content, source_trust FROM memories
+                 WHERE kind IN ('identity', 'preference', 'fact', 'decision')
+                   AND lifecycle_state IN ('active', 'associated', 'decaying', 'dormant')
+                 ORDER BY id LIMIT ?1",
+            )?;
+            let mapped = stmt.query_map(params![limit_i], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, f64>(3)?,
+                ))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        if cands.is_empty() {
+            return Ok(ExtractBatch::default());
+        }
+
+        let mut batch = ExtractBatch::default();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (mem_id, kind, content, trust) in &cands {
+            let fact_key = profile_fact_key(kind, content);
+            let already_proposed: bool = tx
+                .query_row(
+                    "SELECT 1 FROM approvals
+                     WHERE target_type = 'profile_fact' AND target_ref = ?1 LIMIT 1",
+                    params![fact_key],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            let already_active: bool = tx
+                .query_row(
+                    "SELECT 1 FROM profile_facts WHERE fact_key = ?1 AND state = 'active' LIMIT 1",
+                    params![fact_key],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if already_proposed || already_active {
+                batch.skipped += 1;
+                continue;
+            }
+
+            // Optional gated LLM refinement of the fact value (mirrors consolidation).
+            let price = adapter.usd_per_1k_prompt_tokens();
+            let tokens_est = prompt_token_estimate(content);
+            let fact_value = if price > 0.0 {
+                let est_cost = tokens_est as f64 / 1000.0 * price;
+                if *window_spend + est_cost <= budget_usd {
+                    match adapter.summarize(std::slice::from_ref(content))? {
+                        Some(summary) => {
+                            tx.execute(
+                                "INSERT INTO provider_usage
+                                    (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
+                                 VALUES (?1, ?2, ?3, 'complete', ?4, 0, ?5, NULL)",
+                                params![now_ms, adapter.id(), adapter.model_id(), tokens_est, est_cost],
+                            )?;
+                            *window_spend += est_cost;
+                            batch.tokens += tokens_est;
+                            summary
+                        }
+                        None => content.clone(),
+                    }
+                } else {
+                    batch.budget_hit = true;
+                    content.clone()
+                }
+            } else {
+                adapter
+                    .summarize(std::slice::from_ref(content))?
+                    .unwrap_or_else(|| content.clone())
+            };
+
+            let proposed_change = serde_json::to_string(&serde_json::json!({
+                "fact_key": fact_key,
+                "fact_value": fact_value,
+                "confidence": trust,
+                "source_memory_id": mem_id,
+            }))?;
+            let approval_id: String =
+                tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+            tx.execute(
+                "INSERT INTO approvals
+                    (id, target_type, target_ref, proposed_change, state, requested_at)
+                 VALUES (?1, 'profile_fact', ?2, ?3, 'pending', ?4)",
+                params![approval_id, fact_key, proposed_change, now_ms],
+            )?;
+            insert_audit_log(
+                &tx,
+                AUDIT_ACTOR,
+                "propose_profile_fact",
+                "approval",
+                Some(approval_id.as_str()),
+                Some(proposed_change.as_str()),
+                now_ms,
+            )?;
+            batch.proposed += 1;
+        }
+        tx.commit()?;
+        Ok(batch)
+    }
+
+    /// List pending approvals oldest-first (uses the `approvals_pending` index, no scan).
+    pub fn list_pending_approvals(&self, limit: usize) -> Result<Vec<ApprovalRow>, StoreError> {
+        let limit_i = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, target_type, target_ref, proposed_change, requested_at
+             FROM approvals WHERE state = 'pending'
+             ORDER BY requested_at ASC, id ASC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit_i], |row| {
+                Ok(ApprovalRow {
+                    id: row.get(0)?,
+                    target_type: row.get(1)?,
+                    target_ref: row.get(2)?,
+                    proposed_change: row.get(3)?,
+                    requested_at: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Decide a pending approval. `accept=true` on a `profile_fact` commits it to
+    /// `profile_facts` (superseding any active fact for the same key, preserving the
+    /// UNIQUE-active invariant + lineage) citing this approval's id (H6). `accept=false`
+    /// writes **no** fact. Deciding a non-pending approval is an idempotent no-op.
+    /// Unknown id is an error. One IMMEDIATE tx.
+    pub fn decide_approval(
+        &mut self,
+        approval_id: &str,
+        accept: bool,
+        now_ms: i64,
+    ) -> Result<ApprovalDecision, StoreError> {
+        let row: Option<(String, String, String)> = self
+            .conn
+            .query_row(
+                "SELECT target_type, proposed_change, state FROM approvals WHERE id = ?1",
+                params![approval_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((target_type, proposed_change, state)) = row else {
+            return Err(StoreError::ApprovalNotFound(approval_id.to_string()));
+        };
+        if state != "pending" {
+            return Ok(ApprovalDecision {
+                state,
+                committed_fact: false,
+                already_decided: true,
+            });
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (new_state, committed_fact) = if accept {
+            tx.execute(
+                "UPDATE approvals SET state = 'approved', decided_at = ?1 WHERE id = ?2",
+                params![now_ms, approval_id],
+            )?;
+            let committed = if target_type == "profile_fact" {
+                let change: serde_json::Value = serde_json::from_str(&proposed_change)?;
+                let fact_key = change
+                    .get("fact_key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let fact_value = change
+                    .get("fact_value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let confidence = change
+                    .get("confidence")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0);
+                let source_memory_id = change.get("source_memory_id").and_then(|v| v.as_str());
+                tx.execute(
+                    "UPDATE profile_facts SET state = 'superseded'
+                     WHERE fact_key = ?1 AND state = 'active'",
+                    params![fact_key],
+                )?;
+                let fact_id: String =
+                    tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+                tx.execute(
+                    "INSERT INTO profile_facts
+                        (id, fact_key, fact_value, confidence, source_memory_id, approval_id,
+                         state, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
+                    params![
+                        fact_id,
+                        fact_key,
+                        fact_value,
+                        confidence,
+                        source_memory_id,
+                        approval_id,
+                        now_ms
+                    ],
+                )?;
+                true
+            } else {
+                false
+            };
+            ("approved", committed)
+        } else {
+            tx.execute(
+                "UPDATE approvals SET state = 'rejected', decided_at = ?1 WHERE id = ?2",
+                params![now_ms, approval_id],
+            )?;
+            ("rejected", false)
+        };
+        let action = if !accept {
+            "reject_approval"
+        } else if committed_fact {
+            "approve_profile_fact"
+        } else {
+            "approve"
+        };
+        insert_audit_log(
+            &tx,
+            AUDIT_ACTOR,
+            action,
+            "approval",
+            Some(approval_id),
+            None,
+            now_ms,
+        )?;
+        tx.commit()?;
+        Ok(ApprovalDecision {
+            state: new_state.to_string(),
+            committed_fact,
+            already_decided: false,
+        })
+    }
+
     pub fn doctor_report(&self) -> Result<DoctorReport, StoreError> {
         let schema_version = self.schema_version()?;
         let journal_mode = self
@@ -1849,6 +2109,7 @@ pub enum StoreError {
     InvalidRecallQuery,
     Import(String),
     Adapter(String),
+    ApprovalNotFound(String),
 }
 
 impl fmt::Display for StoreError {
@@ -1863,6 +2124,7 @@ impl fmt::Display for StoreError {
             Self::InvalidRecallQuery => write!(f, "recall query must contain searchable text"),
             Self::Import(msg) => write!(f, "import error: {msg}"),
             Self::Adapter(msg) => write!(f, "provider adapter error: {msg}"),
+            Self::ApprovalNotFound(id) => write!(f, "approval not found: {id}"),
         }
     }
 }
@@ -2428,6 +2690,24 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
         )?;
     }
 
+    let applied_0006 = tx
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [6],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+
+    if !applied_0006 {
+        tx.execute_batch(MIGRATION_0006)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (?1, ?2, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
+            (6, "0006_approvals_target_index"),
+        )?;
+    }
+
     tx.commit()?;
     Ok(())
 }
@@ -2683,6 +2963,40 @@ pub struct AssociateBatch {
     pub nodes_associated: usize,
 }
 
+/// Outcome of one [`Store::extract_profile_pending`] pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExtractBatch {
+    /// Profile-fact approvals newly proposed (pending) this run.
+    pub proposed: usize,
+    /// Candidates skipped because an approval/active fact already covers the key.
+    pub skipped: usize,
+    /// Prompt tokens consumed by the gated LLM fact-value refinement.
+    pub tokens: i64,
+    /// True if the spend cap forced a candidate to fall back to verbatim content.
+    pub budget_hit: bool,
+}
+
+/// One pending approval, as surfaced by `approve --list`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApprovalRow {
+    pub id: String,
+    pub target_type: String,
+    pub target_ref: Option<String>,
+    pub proposed_change: String,
+    pub requested_at: i64,
+}
+
+/// Result of deciding an approval ([`Store::decide_approval`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApprovalDecision {
+    /// Resulting approval state (`approved`/`rejected`, or the existing state if already decided).
+    pub state: String,
+    /// Whether a `profile_facts` row was committed (accept of a `profile_fact`).
+    pub committed_fact: bool,
+    /// True if the approval had already been decided (no-op).
+    pub already_decided: bool,
+}
+
 /// A dedup-cluster of raw_events sharing the same normalized text.
 struct Cluster {
     text: String,
@@ -2704,6 +3018,21 @@ fn raw_event_text(payload: &str) -> String {
                 .map(str::to_string)
         })
         .unwrap_or_else(|| payload.to_string())
+}
+
+/// Deterministic profile-fact key: `{kind}:{slug}`, slug = lowercased,
+/// whitespace-collapsed content joined by `-`, truncated to 48 chars. Stable across
+/// runs so the propose-once-per-key idempotency check is exact.
+fn profile_fact_key(kind: &str, content: &str) -> String {
+    let slug: String = normalize(content)
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-")
+        .chars()
+        .take(48)
+        .collect();
+    format!("{kind}:{slug}")
 }
 
 /// Cosine similarity of two vectors; 0 for a zero-norm vector. Compares the shared
@@ -2818,6 +3147,11 @@ const MIGRATION_0005: &str = r#"
 ALTER TABLE memories ADD COLUMN centrality REAL NOT NULL DEFAULT 0.0;
 ALTER TABLE memories ADD COLUMN source_session TEXT;
 CREATE INDEX memories_session ON memories(source_session) WHERE source_session IS NOT NULL;
+"#;
+
+const MIGRATION_0006: &str = r#"
+CREATE INDEX approvals_pending_target ON approvals(target_type, target_ref)
+    WHERE state = 'pending';
 "#;
 
 #[cfg(test)]
@@ -5258,6 +5592,415 @@ mod tests {
         assert_eq!(outcome.consolidated, 2);
         assert_eq!(outcome.associated, 2, "both memories gain a link");
         assert_eq!(link_count(&store), 2, "one symmetric co-occurrence pair");
+        cleanup_db_files(&path);
+    }
+
+    // ---- M8: profile extraction behind the approvals gate (H6) ----
+
+    fn count(store: &Store, sql: &str) -> i64 {
+        store.conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn extract_proposes_pending_approval_not_a_fact() {
+        let path = temp_db_path("m8-propose");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_mem(
+            &store,
+            "p1",
+            "preference",
+            "prefers flyway for migrations",
+            None,
+            "active",
+            now,
+        );
+
+        let mut spend = 0.0;
+        let batch = store
+            .extract_profile_pending(&NullAdapter::new(), 0.0, &mut spend, 500, now)
+            .expect("extract runs");
+
+        assert_eq!(batch.proposed, 1);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM approvals WHERE state='pending'"
+            ),
+            1
+        );
+        // H6: no profile_fact is written by extraction — only a proposal.
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM profile_facts"), 0);
+        let (tt, tr): (String, String) = store
+            .conn
+            .query_row(
+                "SELECT target_type, target_ref FROM approvals LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tt, "profile_fact");
+        assert_eq!(tr, "preference:prefers-flyway-for-migrations");
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn extract_is_idempotent_no_duplicate_pending() {
+        let path = temp_db_path("m8-idem");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_mem(
+            &store,
+            "p1",
+            "preference",
+            "uses rust edition 2024",
+            None,
+            "active",
+            now,
+        );
+        let mut spend = 0.0;
+        store
+            .extract_profile_pending(&NullAdapter::new(), 0.0, &mut spend, 500, now)
+            .unwrap();
+        let second = store
+            .extract_profile_pending(&NullAdapter::new(), 0.0, &mut spend, 500, now)
+            .expect("extract runs again");
+        assert_eq!(second.proposed, 0, "no new proposal");
+        assert_eq!(second.skipped, 1, "candidate skipped (already proposed)");
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM approvals"), 1);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn approve_accept_commits_fact_citing_the_approval() {
+        let path = temp_db_path("m8-accept");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_mem(
+            &store,
+            "p1",
+            "preference",
+            "prefers tabs over spaces",
+            None,
+            "active",
+            now,
+        );
+        let mut spend = 0.0;
+        store
+            .extract_profile_pending(&NullAdapter::new(), 0.0, &mut spend, 500, now)
+            .unwrap();
+        let approval_id: String = store
+            .conn
+            .query_row("SELECT id FROM approvals WHERE state='pending'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let decision = store
+            .decide_approval(&approval_id, true, now + 100)
+            .expect("decide");
+        assert_eq!(decision.state, "approved");
+        assert!(decision.committed_fact);
+        assert!(!decision.already_decided);
+
+        let (fk, fv, appr, fstate): (String, String, String, String) = store
+            .conn
+            .query_row(
+                "SELECT fact_key, fact_value, approval_id, state FROM profile_facts",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(fk, "preference:prefers-tabs-over-spaces");
+        assert_eq!(fv, "prefers tabs over spaces");
+        assert_eq!(
+            appr, approval_id,
+            "fact cites the approval that authorized it (H6)"
+        );
+        assert_eq!(fstate, "active");
+        let astate: String = store
+            .conn
+            .query_row(
+                "SELECT state FROM approvals WHERE id=?1",
+                params![approval_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(astate, "approved");
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn approve_reject_writes_no_fact() {
+        let path = temp_db_path("m8-reject");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_mem(
+            &store,
+            "p1",
+            "preference",
+            "dislikes yaml",
+            None,
+            "active",
+            now,
+        );
+        let mut spend = 0.0;
+        store
+            .extract_profile_pending(&NullAdapter::new(), 0.0, &mut spend, 500, now)
+            .unwrap();
+        let id: String = store
+            .conn
+            .query_row("SELECT id FROM approvals", [], |r| r.get(0))
+            .unwrap();
+
+        let decision = store
+            .decide_approval(&id, false, now + 100)
+            .expect("decide");
+        assert_eq!(decision.state, "rejected");
+        assert!(!decision.committed_fact);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM profile_facts"),
+            0,
+            "H6: reject writes no fact"
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn approve_accept_supersedes_prior_active_fact() {
+        let path = temp_db_path("m8-supersede");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        // Two memories with the SAME normalized key but different consolidation paths is
+        // hard to force; instead drive two approvals for the same fact_key directly.
+        let key = "preference:editor-vim";
+        for (n, val) in [(1, "vim"), (2, "neovim")] {
+            let aid: String = store
+                .conn
+                .query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))
+                .unwrap();
+            let change = serde_json::json!({
+                "fact_key": key, "fact_value": val, "confidence": 0.7, "source_memory_id": null
+            })
+            .to_string();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO approvals (id, target_type, target_ref, proposed_change, state, requested_at)
+                     VALUES (?1, 'profile_fact', ?2, ?3, 'pending', ?4)",
+                    params![aid, key, change, now + n],
+                )
+                .unwrap();
+            store.decide_approval(&aid, true, now + 10 * n).unwrap();
+        }
+        // Exactly one active fact for the key (UNIQUE-active holds), value = latest.
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM profile_facts WHERE fact_key='preference:editor-vim' AND state='active'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM profile_facts WHERE state='superseded'"
+            ),
+            1
+        );
+        let active_val: String = store
+            .conn
+            .query_row(
+                "SELECT fact_value FROM profile_facts WHERE fact_key='preference:editor-vim' AND state='active'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_val, "neovim");
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn h6_profile_fact_requires_an_approval_id() {
+        let path = temp_db_path("m8-h6");
+        let store = Store::open(&path).expect("store opens");
+        // The NOT NULL approval_id FK structurally forbids an un-approved profile fact.
+        let res = store.conn.execute(
+            "INSERT INTO profile_facts (id, fact_key, fact_value, confidence, approval_id, state, created_at)
+             VALUES (lower(hex(randomblob(16))), 'k', 'v', 0.5, NULL, 'active', 0)",
+            [],
+        );
+        assert!(
+            res.is_err(),
+            "profile_fact without approval_id must be rejected (H6)"
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn extract_llm_stub_records_usage_and_respects_spend_cap() {
+        let path = temp_db_path("m8-llm");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_mem(
+            &store,
+            "p1",
+            "preference",
+            "prefers structured logging",
+            None,
+            "active",
+            now,
+        );
+        // Generous budget: the metered test-double refines the fact value and records usage.
+        let mut spend = 0.0;
+        let batch = store
+            .extract_profile_pending(&SummarizingAdapter, 100.0, &mut spend, 500, now)
+            .expect("extract runs");
+        assert_eq!(batch.proposed, 1);
+        assert!(batch.tokens > 0, "LLM path consumed tokens");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM provider_usage WHERE op='complete'"
+            ),
+            1
+        );
+        let change: String = store
+            .conn
+            .query_row("SELECT proposed_change FROM approvals", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            change.contains("summary:"),
+            "fact value refined by the stub LLM"
+        );
+        assert!(spend > 0.0, "window spend advanced");
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn extract_spend_cap_degrades_to_verbatim_content() {
+        let path = temp_db_path("m8-cap");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_mem(
+            &store,
+            "p1",
+            "preference",
+            "a long enough preference body to cost tokens",
+            None,
+            "active",
+            now,
+        );
+        // Zero budget: the metered adapter cannot be used; fall back to verbatim content.
+        let mut spend = 0.0;
+        let batch = store
+            .extract_profile_pending(&SummarizingAdapter, 0.0, &mut spend, 500, now)
+            .expect("extract runs");
+        assert!(batch.budget_hit, "spend cap binds");
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM provider_usage"),
+            0,
+            "no spend under cap=0"
+        );
+        let change: String = store
+            .conn
+            .query_row("SELECT proposed_change FROM approvals", [], |r| r.get(0))
+            .unwrap();
+        assert!(!change.contains("summary:"), "degraded to verbatim content");
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn decide_approval_unknown_id_errors_and_noop_when_decided() {
+        let path = temp_db_path("m8-decide-edge");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        assert!(matches!(
+            store.decide_approval("does-not-exist", true, now),
+            Err(StoreError::ApprovalNotFound(_))
+        ));
+        seed_mem(
+            &store,
+            "p1",
+            "preference",
+            "likes ci gates",
+            None,
+            "active",
+            now,
+        );
+        let mut spend = 0.0;
+        store
+            .extract_profile_pending(&NullAdapter::new(), 0.0, &mut spend, 500, now)
+            .unwrap();
+        let id: String = store
+            .conn
+            .query_row("SELECT id FROM approvals", [], |r| r.get(0))
+            .unwrap();
+        store.decide_approval(&id, true, now + 1).unwrap();
+        let again = store
+            .decide_approval(&id, false, now + 2)
+            .expect("idempotent");
+        assert!(again.already_decided, "second decision is a no-op");
+        assert_eq!(
+            again.state, "approved",
+            "state unchanged from first decision"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM profile_facts WHERE state='active'"
+            ),
+            1
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn dream_once_runs_extract_profile_phase() {
+        use crate::dream::{DreamOptions, dream_once};
+        let path = temp_db_path("m8-dream-extract");
+        let mut store = Store::open(&path).expect("store opens");
+        // A captured 'preference' raw_event consolidates to a preference memory, which
+        // the extract phase then proposes as a pending approval.
+        store
+            .capture_event(NewRawEvent {
+                session_id: "s1".to_string(),
+                agent: "claude".to_string(),
+                source: "tool_result".to_string(),
+                kind: "preference".to_string(),
+                payload: serde_json::json!({"text": "prefers immediate transactions"}),
+                provenance: serde_json::json!({}),
+                ts_ms: 1000,
+            })
+            .expect("capture");
+        let now = 2_000_000_000_000i64;
+        let opts = DreamOptions {
+            trigger: "manual",
+            budget_usd: 0.0,
+            max_seconds: 60,
+        };
+        let outcome = dream_once(
+            &mut store,
+            &NullAdapter::new(),
+            &crate::config::Caps::small(),
+            &opts,
+            &|| now,
+        )
+        .expect("dream runs");
+        assert_eq!(outcome.consolidated, 1);
+        assert_eq!(outcome.proposed, 1, "extract phase proposed the preference");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM approvals WHERE state='pending'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM profile_facts"),
+            0,
+            "H6: nothing committed without approval"
+        );
         cleanup_db_files(&path);
     }
 }
