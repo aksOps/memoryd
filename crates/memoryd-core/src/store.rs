@@ -284,6 +284,139 @@ impl Store {
         })
     }
 
+    /// Atomically claim up to `limit` ready embed jobs.
+    ///
+    /// "Ready" = `pending`/`deferred` whose `scheduled_at` has arrived, OR `running`
+    /// jobs whose lease expired (`started_at <= now - visibility_ms`). SQLite serializes
+    /// writers, so two workers can never claim the same row.
+    pub fn lease_embed_jobs(
+        &mut self,
+        limit: usize,
+        now_ms: i64,
+        visibility_ms: i64,
+    ) -> Result<Vec<LeasedJob>, StoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let tx = self.conn.transaction()?;
+        let claimed: Vec<(i64, String, i64)> = {
+            let mut stmt = tx.prepare(
+                "UPDATE jobs SET state = 'running', started_at = ?1, attempts = attempts + 1
+                 WHERE id IN (
+                     SELECT id FROM jobs
+                     WHERE kind = 'embed' AND (
+                         (state IN ('pending', 'deferred') AND scheduled_at <= ?1)
+                      OR (state = 'running' AND started_at IS NOT NULL
+                          AND started_at <= ?1 - ?2))
+                     ORDER BY priority, scheduled_at, id
+                     LIMIT ?3)
+                 RETURNING id, payload, attempts",
+            )?;
+            stmt.query_map(params![now_ms, visibility_ms, limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut leased = Vec::with_capacity(claimed.len());
+        for (job_id, payload, attempts) in claimed {
+            let payload: serde_json::Value = serde_json::from_str(&payload)?;
+            let raw_event_id = payload
+                .get("raw_event_id")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let content: String = tx
+                .query_row(
+                    "SELECT content FROM raw_events_fts WHERE raw_event_id = ?1",
+                    params![raw_event_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or_default();
+            leased.push(LeasedJob {
+                job_id,
+                raw_event_id,
+                content,
+                attempts,
+            });
+        }
+        tx.commit()?;
+        Ok(leased)
+    }
+
+    /// Persist an embedding, its `provider_usage` ledger row, and mark the job done —
+    /// all in one transaction so a crash never leaves a done job without its embedding.
+    pub fn complete_embed_job(
+        &mut self,
+        job_id: i64,
+        raw_event_id: i64,
+        model_id: &str,
+        vector: &[f32],
+        prompt_tokens: i64,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let dim = i64::try_from(vector.len()).unwrap_or(0);
+        let mut bytes = Vec::with_capacity(vector.len() * 4);
+        for value in vector {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let owner_id = raw_event_id.to_string();
+
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO embeddings (id, owner_type, owner_id, model_id, dim, vector, created_at)
+             VALUES (lower(hex(randomblob(16))), 'raw_event', ?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(owner_type, owner_id, model_id)
+             DO UPDATE SET dim = excluded.dim, vector = excluded.vector,
+                           created_at = excluded.created_at",
+            params![owner_id, model_id, dim, bytes, now_ms],
+        )?;
+        tx.execute(
+            "INSERT INTO provider_usage
+                (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
+             VALUES (?1, 'null', ?2, 'embed', ?3, 0, 0.0, ?4)",
+            params![now_ms, model_id, prompt_tokens, job_id],
+        )?;
+        tx.execute(
+            "UPDATE jobs SET state = 'done', finished_at = ?2 WHERE id = ?1",
+            params![job_id, now_ms],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Defer a failed job with exponential backoff, or dead-letter it once it has
+    /// reached `max_attempts`. `attempts` is the job's post-lease attempt count.
+    pub fn fail_job(
+        &mut self,
+        job_id: i64,
+        attempts: i64,
+        error: &str,
+        now_ms: i64,
+        max_attempts: u32,
+        backoff_base_ms: u64,
+    ) -> Result<JobOutcome, StoreError> {
+        if attempts >= i64::from(max_attempts) {
+            self.conn.execute(
+                "UPDATE jobs SET state = 'dead', finished_at = ?2, last_error = ?3 WHERE id = ?1",
+                params![job_id, now_ms, error],
+            )?;
+            Ok(JobOutcome::Dead)
+        } else {
+            let exponent = attempts.saturating_sub(1).clamp(0, 16) as u32;
+            let backoff = (backoff_base_ms as i64).saturating_mul(1i64 << exponent);
+            let scheduled_at = now_ms.saturating_add(backoff);
+            self.conn.execute(
+                "UPDATE jobs SET state = 'deferred', scheduled_at = ?2, last_error = ?3
+                 WHERE id = ?1",
+                params![job_id, scheduled_at, error],
+            )?;
+            Ok(JobOutcome::Deferred { scheduled_at })
+        }
+    }
+
     pub fn record_auth_rejection(
         &self,
         method: &str,
@@ -371,6 +504,22 @@ pub struct RecallHit {
     pub kind: String,
     pub content: String,
     pub score: f64,
+}
+
+/// A claimed embed job — the unit a worker processes for one lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeasedJob {
+    pub job_id: i64,
+    pub raw_event_id: i64,
+    pub content: String,
+    pub attempts: i64,
+}
+
+/// Outcome of failing a job: deferred with backoff, or dead-lettered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobOutcome {
+    Deferred { scheduled_at: i64 },
+    Dead,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1803,6 +1952,307 @@ mod tests {
             p50 < Duration::from_millis(100),
             "median recall latency {p50:?} exceeded the 100ms M2 target"
         );
+
+        cleanup_db_files(&path);
+    }
+
+    fn seed_embed_job(store: &mut Store, scheduled_at: i64, ts: i64, text: &str) -> (i64, i64) {
+        let tx = store.conn.transaction().expect("seed tx begins");
+        tx.execute(
+            "INSERT INTO sessions (id, agent, started_at, event_count, status)
+             VALUES ('seed', 'claude', ?1, 1, 'open')
+             ON CONFLICT(id) DO UPDATE SET event_count = sessions.event_count + 1",
+            params![ts],
+        )
+        .expect("seed session");
+        tx.execute(
+            "INSERT INTO raw_events (session_id, ts, source, kind, payload, provenance)
+             VALUES ('seed', ?1, 'tool_result', 'observation', ?2, '{}')",
+            params![ts, format!("{{\"text\":\"{text}\"}}")],
+        )
+        .expect("seed raw_event");
+        let raw_event_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO raw_events_fts (raw_event_id, content) VALUES (?1, ?2)",
+            params![raw_event_id, text],
+        )
+        .expect("seed fts");
+        tx.execute(
+            "INSERT INTO jobs (kind, priority, state, payload, scheduled_at)
+             VALUES ('embed', 100, 'pending', ?1, ?2)",
+            params![format!("{{\"raw_event_id\":{raw_event_id}}}"), scheduled_at],
+        )
+        .expect("seed job");
+        let job_id = tx.last_insert_rowid();
+        tx.commit().expect("seed commits");
+        (job_id, raw_event_id)
+    }
+
+    #[test]
+    fn lease_then_complete_writes_embedding_and_provider_usage() {
+        use crate::adapters::{NullAdapter, ProviderAdapter, prompt_token_estimate};
+        let path = temp_db_path("embed-complete");
+        let mut store = Store::open(&path).expect("store opens");
+        let (job_id, raw_event_id) = seed_embed_job(&mut store, 100, 1000, "embed me");
+
+        let leased = store
+            .lease_embed_jobs(10, 5000, 60_000)
+            .expect("lease succeeds");
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].job_id, job_id);
+        assert_eq!(leased[0].raw_event_id, raw_event_id);
+        assert_eq!(leased[0].attempts, 1);
+        assert_eq!(leased[0].content, "embed me");
+
+        let adapter = NullAdapter::new();
+        let vectors = adapter
+            .embed(std::slice::from_ref(&leased[0].content))
+            .expect("embed succeeds");
+        store
+            .complete_embed_job(
+                leased[0].job_id,
+                leased[0].raw_event_id,
+                adapter.model_id(),
+                &vectors[0],
+                prompt_token_estimate(&leased[0].content),
+                5000,
+            )
+            .expect("complete succeeds");
+
+        let (owner_type, owner_id, dim, vector_len): (String, String, i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT owner_type, owner_id, dim, length(vector) FROM embeddings
+                 WHERE owner_id = ?1",
+                params![raw_event_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("embedding row exists");
+        assert_eq!(owner_type, "raw_event");
+        assert_eq!(owner_id, raw_event_id.to_string());
+        assert_eq!(dim, 32);
+        assert_eq!(vector_len, 128);
+
+        let (adapter_name, op, est_cost, usage_job): (String, String, f64, i64) = store
+            .conn
+            .query_row(
+                "SELECT adapter, op, est_cost, job_id FROM provider_usage WHERE job_id = ?1",
+                params![job_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("provider usage row exists");
+        assert_eq!(adapter_name, "null");
+        assert_eq!(op, "embed");
+        assert_eq!(est_cost, 0.0);
+        assert_eq!(usage_job, job_id);
+
+        let state: String = store
+            .conn
+            .query_row(
+                "SELECT state FROM jobs WHERE id = ?1",
+                params![job_id],
+                |row| row.get(0),
+            )
+            .expect("job row exists");
+        assert_eq!(state, "done");
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn embed_lease_is_exactly_once_under_concurrent_workers() {
+        use crate::adapters::{NullAdapter, ProviderAdapter, prompt_token_estimate};
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let path = temp_db_path("lease-exactly-once");
+        let total: i64 = 200;
+        {
+            let mut store = Store::open(&path).expect("store opens");
+            let tx = store.conn.transaction().expect("seed tx");
+            tx.execute(
+                "INSERT INTO sessions (id, agent, started_at, event_count, status)
+                 VALUES ('seed', 'claude', 1000, ?1, 'open')",
+                params![total],
+            )
+            .expect("seed session");
+            for i in 0..total {
+                tx.execute(
+                    "INSERT INTO raw_events (session_id, ts, source, kind, payload, provenance)
+                     VALUES ('seed', ?1, 'tool_result', 'observation', ?2, '{}')",
+                    params![1000 + i, format!("{{\"text\":\"job {i}\"}}")],
+                )
+                .expect("seed raw_event");
+                let raw_event_id = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO raw_events_fts (raw_event_id, content) VALUES (?1, ?2)",
+                    params![raw_event_id, format!("job {i} content")],
+                )
+                .expect("seed fts");
+                tx.execute(
+                    "INSERT INTO jobs (kind, priority, state, payload, scheduled_at)
+                     VALUES ('embed', 100, 'pending', ?1, 100)",
+                    params![format!("{{\"raw_event_id\":{raw_event_id}}}")],
+                )
+                .expect("seed job");
+            }
+            tx.commit().expect("seed commits");
+        }
+
+        let path = Arc::new(path);
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let path = Arc::clone(&path);
+            handles.push(std::thread::spawn(move || {
+                let mut store = Store::open(path.as_path()).expect("worker store opens");
+                let adapter = NullAdapter::new();
+                let mut claimed: Vec<i64> = Vec::new();
+                loop {
+                    let leased = store
+                        .lease_embed_jobs(8, 10_000, 60_000)
+                        .expect("lease succeeds");
+                    if leased.is_empty() {
+                        break;
+                    }
+                    for job in leased {
+                        claimed.push(job.job_id);
+                        let vectors = adapter
+                            .embed(std::slice::from_ref(&job.content))
+                            .expect("embed succeeds");
+                        store
+                            .complete_embed_job(
+                                job.job_id,
+                                job.raw_event_id,
+                                adapter.model_id(),
+                                &vectors[0],
+                                prompt_token_estimate(&job.content),
+                                10_000,
+                            )
+                            .expect("complete succeeds");
+                    }
+                }
+                claimed
+            }));
+        }
+
+        let mut all_claimed: Vec<i64> = Vec::new();
+        for handle in handles {
+            all_claimed.extend(handle.join().expect("worker thread joins"));
+        }
+
+        assert_eq!(
+            all_claimed.len() as i64,
+            total,
+            "every job claimed exactly once"
+        );
+        let unique: HashSet<i64> = all_claimed.iter().copied().collect();
+        assert_eq!(unique.len() as i64, total, "no job double-claimed");
+
+        let store = Store::open(path.as_path()).expect("verify store opens");
+        let done: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE state = 'done'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("done count");
+        assert_eq!(done, total);
+
+        cleanup_db_files(path.as_path());
+    }
+
+    #[test]
+    fn failed_embed_job_defers_with_backoff_then_dead_letters() {
+        let path = temp_db_path("embed-fail");
+        let mut store = Store::open(&path).expect("store opens");
+        let (job_id, _raw_event_id) = seed_embed_job(&mut store, 100, 1000, "doomed");
+
+        assert_eq!(
+            store
+                .fail_job(job_id, 1, "boom", 10_000, 5, 500)
+                .expect("fail"),
+            JobOutcome::Deferred {
+                scheduled_at: 10_500
+            }
+        );
+        assert_eq!(
+            store
+                .fail_job(job_id, 2, "boom", 10_000, 5, 500)
+                .expect("fail"),
+            JobOutcome::Deferred {
+                scheduled_at: 11_000
+            }
+        );
+        assert_eq!(
+            store
+                .fail_job(job_id, 3, "boom", 10_000, 5, 500)
+                .expect("fail"),
+            JobOutcome::Deferred {
+                scheduled_at: 12_000
+            }
+        );
+        assert_eq!(
+            store
+                .fail_job(job_id, 4, "boom", 10_000, 5, 500)
+                .expect("fail"),
+            JobOutcome::Deferred {
+                scheduled_at: 14_000
+            }
+        );
+        assert_eq!(
+            store
+                .fail_job(job_id, 5, "boom", 10_000, 5, 500)
+                .expect("fail"),
+            JobOutcome::Dead
+        );
+
+        let state: String = store
+            .conn
+            .query_row(
+                "SELECT state FROM jobs WHERE id = ?1",
+                params![job_id],
+                |row| row.get(0),
+            )
+            .expect("job row exists");
+        assert_eq!(state, "dead");
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn expired_lease_is_reclaimed_after_visibility_timeout() {
+        let path = temp_db_path("lease-expired");
+        let mut store = Store::open(&path).expect("store opens");
+        let (job_id, _raw_event_id) = seed_embed_job(&mut store, 100, 1000, "expiry candidate");
+
+        let first = store.lease_embed_jobs(10, 1000, 1000).expect("lease");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].job_id, job_id);
+        assert_eq!(first[0].attempts, 1);
+
+        let not_expired = store.lease_embed_jobs(10, 1500, 1000).expect("lease");
+        assert!(not_expired.is_empty(), "lease still valid at now=1500");
+
+        let reclaimed = store.lease_embed_jobs(10, 3000, 1000).expect("lease");
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].job_id, job_id);
+        assert_eq!(reclaimed[0].attempts, 2);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn lease_respects_limit_and_priority_order() {
+        let path = temp_db_path("lease-order");
+        let mut store = Store::open(&path).expect("store opens");
+        let (job1, _) = seed_embed_job(&mut store, 100, 1000, "first");
+        let (job2, _) = seed_embed_job(&mut store, 200, 1001, "second");
+        let (_job3, _) = seed_embed_job(&mut store, 300, 1002, "third");
+
+        let leased = store.lease_embed_jobs(2, 10_000, 60_000).expect("lease");
+        let ids: Vec<i64> = leased.iter().map(|job| job.job_id).collect();
+        assert_eq!(ids, vec![job1, job2]);
 
         cleanup_db_files(&path);
     }

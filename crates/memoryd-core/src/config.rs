@@ -48,6 +48,9 @@ pub struct Caps {
     pub worker_mem_mb: usize,
     pub dream_wallclock_secs: u64,
     pub paid_spend_cap_usd: f64,
+    pub lease_visibility_secs: u64,
+    pub job_max_attempts: u32,
+    pub job_backoff_base_ms: u64,
 }
 
 impl Caps {
@@ -58,6 +61,9 @@ impl Caps {
             worker_mem_mb: 128,
             dream_wallclock_secs: 180,
             paid_spend_cap_usd: 0.0,
+            lease_visibility_secs: 30,
+            job_max_attempts: 5,
+            job_backoff_base_ms: 500,
         }
     }
 }
@@ -118,6 +124,9 @@ mod tests {
         assert_eq!(cfg.providers.default_adapter, "null");
         assert_eq!(cfg.caps.worker_concurrency, 1);
         assert_eq!(cfg.caps.paid_spend_cap_usd, 0.0);
+        assert_eq!(cfg.caps.lease_visibility_secs, 30);
+        assert_eq!(cfg.caps.job_max_attempts, 5);
+        assert_eq!(cfg.caps.job_backoff_base_ms, 500);
         assert!(cfg.validate().is_ok());
     }
 
