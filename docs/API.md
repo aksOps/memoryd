@@ -43,6 +43,35 @@ Output JSON:
 }
 ```
 
+### `recall`
+
+```bash
+memoryd recall <query> [--k <limit>] [--db <path>]
+```
+
+Runs local lexical recall over captured raw events using SQLite FTS. It does not
+call a provider inline.
+
+Output JSON:
+
+```json
+{
+  "results": [
+    {
+      "raw_event_id": 1,
+      "session_id": "session-1",
+      "ts_ms": 1234,
+      "source": "tool_result",
+      "kind": "observation",
+      "content": "WAL timeout fixed",
+      "score": -0.000001
+    }
+  ],
+  "degraded": false,
+  "mode": "lexical"
+}
+```
+
 ### `serve`
 
 ```bash
@@ -110,3 +139,39 @@ Error envelope:
 
 Current status codes: `400`, `401`, `404`, `405`, `413`, `415`, `422`, `431`,
 and `500`.
+
+### `POST /v1/recall`
+
+Runs local lexical recall over captured raw events. The handler performs no
+provider calls and writes no provider usage rows.
+
+Request body:
+
+```json
+{
+  "query": "WAL timeout",
+  "k": 5
+}
+```
+
+Response `200 OK`:
+
+```json
+{
+  "results": [
+    {
+      "raw_event_id": 1,
+      "session_id": "session-1",
+      "ts_ms": 1234,
+      "source": "tool_result",
+      "kind": "observation",
+      "content": "WAL timeout fixed",
+      "score": -0.000001
+    }
+  ],
+  "degraded": false,
+  "mode": "lexical"
+}
+```
+
+Empty or punctuation-only queries return `422` with the standard error envelope.

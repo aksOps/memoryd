@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 pub const CANONICAL_TABLES: [&str; 13] = [
     "sessions",
@@ -57,6 +57,7 @@ impl Store {
         let agent = event.agent;
         let source = event.source;
         let kind = event.kind;
+        let fts_content = capture_fts_content(&event.payload);
         let payload = serde_json::to_string(&event.payload)?;
         let provenance = serde_json::to_string(&event.provenance)?;
         let scheduled_at = unix_ms_now();
@@ -86,6 +87,11 @@ impl Store {
             ],
         )?;
         let raw_event_id = tx.last_insert_rowid();
+
+        tx.execute(
+            "INSERT INTO raw_events_fts (raw_event_id, content) VALUES (?1, ?2)",
+            params![raw_event_id, fts_content.as_str()],
+        )?;
 
         let job_payload = serde_json::to_string(&serde_json::json!({
             "raw_event_id": raw_event_id,
@@ -132,6 +138,9 @@ impl Store {
         if !self.table_exists("memories_fts")? {
             missing_tables.push("memories_fts".to_string());
         }
+        if !self.table_exists("raw_events_fts")? {
+            missing_tables.push("raw_events_fts".to_string());
+        }
         if !self.table_exists("schema_migrations")? {
             missing_tables.push("schema_migrations".to_string());
         }
@@ -157,6 +166,39 @@ impl Store {
             });
         }
         Ok(stats)
+    }
+
+    pub fn recall_events(&self, query: &str, limit: usize) -> Result<RecallResult, StoreError> {
+        let fts_query = lexical_query(query).ok_or(StoreError::InvalidRecallQuery)?;
+        let limit = i64::try_from(limit.clamp(1, 50)).unwrap_or(50);
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.session_id, r.ts, r.source, r.kind, f.content,
+                    bm25(raw_events_fts) AS score
+             FROM raw_events_fts AS f
+             JOIN raw_events AS r ON r.id = f.raw_event_id
+             WHERE raw_events_fts MATCH ?1
+             ORDER BY score, r.ts DESC
+             LIMIT ?2",
+        )?;
+        let hits = stmt
+            .query_map(params![fts_query, limit], |row| {
+                Ok(RecallHit {
+                    raw_event_id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    ts_ms: row.get(2)?,
+                    source: row.get(3)?,
+                    kind: row.get(4)?,
+                    content: row.get(5)?,
+                    score: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(RecallResult {
+            hits,
+            degraded: false,
+            mode: "lexical",
+        })
     }
 
     pub fn schema_version(&self) -> Result<i64, StoreError> {
@@ -203,6 +245,24 @@ pub struct CaptureAck {
     pub processed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecallResult {
+    pub hits: Vec<RecallHit>,
+    pub degraded: bool,
+    pub mode: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecallHit {
+    pub raw_event_id: i64,
+    pub session_id: String,
+    pub ts_ms: i64,
+    pub source: String,
+    pub kind: String,
+    pub content: String,
+    pub score: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DoctorReport {
     pub db_path: PathBuf,
@@ -235,6 +295,7 @@ pub enum StoreError {
     Sql(rusqlite::Error),
     Json(serde_json::Error),
     InvalidCaptureField(&'static str),
+    InvalidRecallQuery,
 }
 
 impl fmt::Display for StoreError {
@@ -246,6 +307,7 @@ impl fmt::Display for StoreError {
             Self::InvalidCaptureField(field) => {
                 write!(f, "capture field {field} must not be empty")
             }
+            Self::InvalidRecallQuery => write!(f, "recall query must contain searchable text"),
         }
     }
 }
@@ -277,6 +339,28 @@ fn validate_capture_field(field: &'static str, value: &str) -> Result<(), StoreE
     Ok(())
 }
 
+fn capture_fts_content(payload: &serde_json::Value) -> String {
+    payload
+        .as_object()
+        .and_then(|object| object.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| payload.to_string())
+}
+
+fn lexical_query(query: &str) -> Option<String> {
+    let tokens = query
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .filter(|token| !token.is_empty())
+        .map(|token| format!("\"{token}\""))
+        .take(20)
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return None;
+    }
+    Some(tokens.join(" OR "))
+}
+
 fn unix_ms_now() -> i64 {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -305,21 +389,54 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
         ) STRICT;",
     )?;
 
-    let applied = tx
+    let applied_0001 = tx
         .query_row(
             "SELECT 1 FROM schema_migrations WHERE version = ?1",
-            [SCHEMA_VERSION],
+            [1],
             |row| row.get::<_, i64>(0),
         )
         .optional()?
         .is_some();
 
-    if !applied {
+    if !applied_0001 {
         tx.execute_batch(MIGRATION_0001)?;
         tx.execute(
             "INSERT INTO schema_migrations (version, name, applied_at)
              VALUES (?1, ?2, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
-            (SCHEMA_VERSION, "0001_foundation"),
+            (1, "0001_foundation"),
+        )?;
+    }
+
+    let applied_0002 = tx
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [2],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+
+    if !applied_0002 {
+        tx.execute_batch(MIGRATION_0002)?;
+        let existing_events = {
+            let mut stmt = tx.prepare("SELECT id, payload FROM raw_events ORDER BY id")?;
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        for (raw_event_id, payload) in existing_events {
+            let payload = serde_json::from_str::<serde_json::Value>(&payload)?;
+            let fts_content = capture_fts_content(&payload);
+            tx.execute(
+                "INSERT INTO raw_events_fts (raw_event_id, content) VALUES (?1, ?2)",
+                params![raw_event_id, fts_content],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (?1, ?2, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
+            (2, "0002_raw_event_fts"),
         )?;
     }
 
@@ -533,6 +650,14 @@ CREATE TABLE provider_usage (
 CREATE INDEX provider_usage_ts_adapter ON provider_usage(ts, adapter);
 "#;
 
+const MIGRATION_0002: &str = r#"
+CREATE VIRTUAL TABLE raw_events_fts USING fts5(
+    raw_event_id UNINDEXED,
+    content,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,6 +686,62 @@ mod tests {
             store.schema_version().expect("schema version"),
             SCHEMA_VERSION
         );
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn migration_0002_backfills_existing_raw_events_for_recall() {
+        let path = temp_db_path("migration-backfill");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("connection opens");
+            apply_pragmas(&conn).expect("pragmas apply");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    applied_at INTEGER NOT NULL
+                ) STRICT;",
+            )
+            .expect("schema migration table exists");
+            conn.execute_batch(MIGRATION_0001)
+                .expect("v1 schema applies");
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+                params![1, "0001_foundation", 1000_i64],
+            )
+            .expect("v1 migration recorded");
+            conn.execute(
+                "INSERT INTO sessions (id, agent, started_at) VALUES (?1, ?2, ?3)",
+                params!["session-1", "claude", 1000_i64],
+            )
+            .expect("session inserted");
+            conn.execute(
+                "INSERT INTO raw_events (session_id, ts, source, kind, payload, provenance)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    "session-1",
+                    1000_i64,
+                    "tool_result",
+                    "observation",
+                    r#"{"text":"Legacy WAL backfilled"}"#,
+                    "{}"
+                ],
+            )
+            .expect("raw event inserted");
+        }
+
+        let store = Store::open(&path).expect("store migrates");
+        assert_eq!(
+            store.schema_version().expect("schema version"),
+            SCHEMA_VERSION
+        );
+        let result = store
+            .recall_events("legacy wal", 5)
+            .expect("recall succeeds");
+
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].content, "Legacy WAL backfilled");
 
         cleanup_db_files(&path);
     }
@@ -687,13 +868,85 @@ mod tests {
         cleanup_db_files(&path);
     }
 
+    #[test]
+    fn recall_events_returns_lexical_matches_without_provider_usage() {
+        let path = temp_db_path("recall-events");
+        let mut store = Store::open(&path).expect("store opens");
+
+        store
+            .capture_event(test_event_with_text(
+                "session-1",
+                1000,
+                "WAL timeout fixed by busy_timeout",
+            ))
+            .expect("first capture succeeds");
+        store
+            .capture_event(test_event_with_text(
+                "session-1",
+                2000,
+                "Release checklist updated",
+            ))
+            .expect("second capture succeeds");
+
+        let result = store.recall_events("wal busy", 5).expect("recall succeeds");
+
+        assert_eq!(result.mode, "lexical");
+        assert!(!result.degraded);
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].raw_event_id, 1);
+        assert_eq!(result.hits[0].session_id, "session-1");
+        assert_eq!(result.hits[0].content, "WAL timeout fixed by busy_timeout");
+
+        let provider_rows = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM provider_usage", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("provider usage count");
+        assert_eq!(provider_rows, 0);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn recall_events_rejects_empty_queries() {
+        let path = temp_db_path("recall-empty-query");
+        let store = Store::open(&path).expect("store opens");
+
+        let err = store.recall_events("?!", 5).expect_err("recall fails");
+
+        assert!(matches!(err, StoreError::InvalidRecallQuery));
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn recall_events_treats_operator_like_terms_as_literals() {
+        let path = temp_db_path("recall-operator-like-terms");
+        let mut store = Store::open(&path).expect("store opens");
+        store
+            .capture_event(test_event_with_text("session-1", 1000, "AND OR NOT"))
+            .expect("capture succeeds");
+
+        let result = store.recall_events("AND", 5).expect("recall succeeds");
+
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].content, "AND OR NOT");
+
+        cleanup_db_files(&path);
+    }
+
     fn test_event(session_id: &str, ts_ms: i64) -> NewRawEvent {
+        test_event_with_text(session_id, ts_ms, "busy_timeout fixed WAL contention")
+    }
+
+    fn test_event_with_text(session_id: &str, ts_ms: i64, text: &str) -> NewRawEvent {
         NewRawEvent {
             session_id: session_id.to_string(),
             agent: "claude".to_string(),
             source: "tool_result".to_string(),
             kind: "observation".to_string(),
-            payload: serde_json::json!({"text": "busy_timeout fixed WAL contention"}),
+            payload: serde_json::json!({"text": text}),
             provenance: serde_json::json!({}),
             ts_ms,
         }

@@ -6,7 +6,7 @@ Clean-room Rust memory daemon for AI coding agents and personal long-term memory
 
 memoryd is a local-first helper daemon that captures useful context from coding-agent sessions into SQLite, defers expensive work to background jobs, and keeps runtime defaults conservative: localhost bind, no public-internet calls, `null` provider mode, and zero paid-provider spend.
 
-This project is pre-release. The current binary provides SQLite bootstrap, diagnostics, stats, a fast `remember` command, and a narrow local HTTP `POST /v1/capture` endpoint.
+This project is pre-release. The current binary provides SQLite bootstrap, diagnostics, stats, fast `remember`, lexical `recall`, and narrow local HTTP `POST /v1/capture` and `POST /v1/recall` endpoints.
 
 ## Obtain And Build
 
@@ -25,6 +25,7 @@ The pinned Rust toolchain is declared in `rust-toolchain.toml`.
 cargo run -p memoryd -- doctor --db /tmp/memoryd.db
 cargo run -p memoryd -- stats --db /tmp/memoryd.db
 cargo run -p memoryd -- remember "Prod migrations use flyway" --kind rule --tags ops,db --db /tmp/memoryd.db
+cargo run -p memoryd -- recall "flyway migrations" --k 5 --db /tmp/memoryd.db
 cargo run -p memoryd -- serve --db /tmp/memoryd.db --bind 127.0.0.1:7077
 ```
 
@@ -36,6 +37,14 @@ curl -sS -X POST http://127.0.0.1:7077/v1/capture \
   -d '{"session_id":"session-1","agent":"claude","source":"tool_result","kind":"observation","payload":{"text":"WAL timeout fixed"}}'
 ```
 
+HTTP recall example:
+
+```bash
+curl -sS -X POST http://127.0.0.1:7077/v1/recall \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"WAL timeout","k":5}'
+```
+
 See `docs/API.md` for CLI and REST request/response details.
 
 ## Security Defaults
@@ -44,8 +53,10 @@ See `docs/API.md` for CLI and REST request/response details.
 - The default bind is `127.0.0.1:7077`.
 - Any non-loopback bind requires a bearer token.
 - Capture only appends minimal raw events and queues background work; it does not call providers inline.
+- Recall uses local SQLite FTS over captured raw events; it does not call providers inline.
 - Rust `unsafe` code is forbidden at workspace level.
 - CI runs formatting, build, clippy with `-D warnings`, tests, dependency policy, advisory audit, and SBOM generation.
+- `main` is protected with required CI, up-to-date checks, linear history, no force pushes, no deletions, and conversation resolution.
 
 ## Package Manager Rule
 

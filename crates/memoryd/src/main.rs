@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use memoryd_core::config::{Config, DEFAULT_BIND};
-use memoryd_core::store::{CaptureAck, NewRawEvent, Store, StoreError};
+use memoryd_core::store::{CaptureAck, NewRawEvent, RecallResult, Store, StoreError};
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
@@ -32,6 +32,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
         Command::Stats => stats(cli),
         Command::Serve => serve(cli),
         Command::Remember(args) => remember(cli, args),
+        Command::Recall(args) => recall(cli, args),
         Command::Help => {
             print_help();
             Ok(())
@@ -89,6 +90,16 @@ fn remember(cli: Cli, args: RememberArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+fn recall(cli: Cli, args: RecallArgs) -> Result<(), CliError> {
+    let cfg = cli.config()?;
+    cfg.validate()?;
+
+    let store = Store::open(&cfg.db_path)?;
+    let result = store.recall_events(&args.query, args.limit)?;
+    println!("{}", recall_response_json(&result)?);
+    Ok(())
+}
+
 fn serve(cli: Cli) -> Result<(), CliError> {
     let cfg = cli.config()?;
     cfg.validate()?;
@@ -119,6 +130,7 @@ enum Command {
     Stats,
     Serve,
     Remember(RememberArgs),
+    Recall(RecallArgs),
     Help,
 }
 
@@ -143,6 +155,21 @@ impl Default for RememberArgs {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecallArgs {
+    query: String,
+    limit: usize,
+}
+
+impl Default for RecallArgs {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            limit: 5,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Cli {
     command: Command,
@@ -162,6 +189,7 @@ impl Cli {
                 "stats" => Command::Stats,
                 "serve" => Command::Serve,
                 "remember" => Command::Remember(RememberArgs::default()),
+                "recall" => Command::Recall(RecallArgs::default()),
                 "--help" | "-h" | "help" => Command::Help,
                 other => return Err(CliError::UnknownCommand(other.to_string())),
             },
@@ -213,6 +241,13 @@ impl Cli {
                     };
                     remember.tags = parse_tags(&next_string(&mut args, "--tags")?);
                 }
+                "--k" => {
+                    let Command::Recall(recall) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    let value = next_string(&mut args, "--k")?;
+                    recall.limit = parse_limit("--k", &value)?;
+                }
                 "--no-wait" => {
                     if !matches!(command, Command::Remember(_)) {
                         return Err(CliError::UnknownFlag(token));
@@ -226,17 +261,28 @@ impl Cli {
                         bearer_token,
                     });
                 }
-                other if matches!(command, Command::Remember(_)) && !other.starts_with("--") => {
+                other
+                    if matches!(command, Command::Remember(_) | Command::Recall(_))
+                        && !other.starts_with("--") =>
+                {
                     let content = raw
                         .into_string()
-                        .map_err(|_| CliError::InvalidUtf8Argument("content"))?;
-                    let Command::Remember(remember) = &mut command else {
-                        unreachable!("remember command checked above");
-                    };
-                    if !remember.content.is_empty() {
-                        return Err(CliError::UnexpectedArgument(content));
+                        .map_err(|_| CliError::InvalidUtf8Argument("argument"))?;
+                    match &mut command {
+                        Command::Remember(remember) => {
+                            if !remember.content.is_empty() {
+                                return Err(CliError::UnexpectedArgument(content));
+                            }
+                            remember.content = content;
+                        }
+                        Command::Recall(recall) => {
+                            if !recall.query.is_empty() {
+                                return Err(CliError::UnexpectedArgument(content));
+                            }
+                            recall.query = content;
+                        }
+                        _ => unreachable!("command checked above"),
                     }
-                    remember.content = content;
                 }
                 other if other.starts_with("--") => return Err(CliError::UnknownFlag(token)),
                 other => return Err(CliError::UnexpectedArgument(other.to_string())),
@@ -247,6 +293,11 @@ impl Cli {
             && remember.content.is_empty()
         {
             return Err(CliError::MissingArgument("content"));
+        }
+        if let Command::Recall(recall) = &command
+            && recall.query.is_empty()
+        {
+            return Err(CliError::MissingArgument("query"));
         }
 
         Ok(Self {
@@ -272,6 +323,16 @@ fn parse_tags(value: &str) -> Vec<String> {
         .filter(|tag| !tag.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn parse_limit(flag: &'static str, value: &str) -> Result<usize, CliError> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| CliError::InvalidNumberFlag(flag, value.to_string()))?;
+    if limit == 0 {
+        return Err(CliError::InvalidNumberFlag(flag, value.to_string()));
+    }
+    Ok(limit)
 }
 
 fn next_value(
@@ -317,6 +378,7 @@ fn print_help() {
             memoryd doctor [--db <path>] [--bind <addr:port>] [--token <token>]\n\
             memoryd stats  [--db <path>] [--bind <addr:port>] [--token <token>]\n\
             memoryd remember <content> [--kind <kind>] [--session <id>] [--source <source>] [--tags <a,b>] [--db <path>]\n\
+            memoryd recall <query> [--k <limit>] [--db <path>]\n\
             memoryd serve [--db <path>] [--bind <addr:port>] [--token <token>]\n\n\
           Defaults:\n\
             bind: {DEFAULT_BIND}\n\
@@ -334,6 +396,7 @@ enum CliError {
     MissingFlagValue(&'static str),
     InvalidUtf8FlagValue(&'static str),
     InvalidUtf8Argument(&'static str),
+    InvalidNumberFlag(&'static str, String),
     InvalidBind(String),
     Config(memoryd_core::config::ConfigError),
     Store(memoryd_core::store::StoreError),
@@ -353,6 +416,9 @@ impl fmt::Display for CliError {
             Self::InvalidUtf8FlagValue(flag) => write!(f, "value for {flag} must be valid UTF-8"),
             Self::InvalidUtf8Argument(argument) => {
                 write!(f, "argument {argument} must be valid UTF-8")
+            }
+            Self::InvalidNumberFlag(flag, value) => {
+                write!(f, "value for {flag} must be a positive integer: {value}")
             }
             Self::InvalidBind(bind) => write!(f, "invalid bind address: {bind}"),
             Self::Config(err) => write!(f, "configuration error: {err}"),
@@ -419,6 +485,34 @@ fn remember_response_json(ack: &CaptureAck) -> Result<String, CliError> {
     }))?)
 }
 
+fn recall_response_json(result: &RecallResult) -> Result<String, CliError> {
+    Ok(serde_json::to_string(&recall_response_value(result))?)
+}
+
+fn recall_response_value(result: &RecallResult) -> serde_json::Value {
+    let hits = result
+        .hits
+        .iter()
+        .map(|hit| {
+            serde_json::json!({
+                "raw_event_id": hit.raw_event_id,
+                "session_id": hit.session_id,
+                "ts_ms": hit.ts_ms,
+                "source": hit.source,
+                "kind": hit.kind,
+                "content": hit.content,
+                "score": hit.score,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "results": hits,
+        "degraded": result.degraded,
+        "mode": result.mode,
+    })
+}
+
 fn handle_http_connection(
     store: &mut Store,
     cfg: &Config,
@@ -443,7 +537,7 @@ fn handle_http_request(
         return HttpResponse::error(401, "unauthorized", "authorization failed");
     }
 
-    if request.path != "/v1/capture" {
+    if request.path != "/v1/capture" && request.path != "/v1/recall" {
         return HttpResponse::error(404, "not_found", "route not found");
     }
 
@@ -459,6 +553,14 @@ fn handle_http_request(
         Ok(body) => body,
         Err(_) => return HttpResponse::error(400, "invalid_json", "request body must be JSON"),
     };
+    match request.path.as_str() {
+        "/v1/capture" => handle_http_capture(store, body),
+        "/v1/recall" => handle_http_recall(store, body),
+        _ => HttpResponse::error(404, "not_found", "route not found"),
+    }
+}
+
+fn handle_http_capture(store: &mut Store, body: serde_json::Value) -> HttpResponse {
     let event = match capture_event_from_json(body) {
         Ok(event) => event,
         Err(message) => return HttpResponse::error(422, "invalid_request", message),
@@ -480,6 +582,21 @@ fn handle_http_request(
             HttpResponse::error(422, "invalid_request", "capture fields must not be empty")
         }
         Err(_) => HttpResponse::error(500, "store_error", "capture could not be persisted"),
+    }
+}
+
+fn handle_http_recall(store: &Store, body: serde_json::Value) -> HttpResponse {
+    let args = match recall_request_from_json(body) {
+        Ok(args) => args,
+        Err(message) => return HttpResponse::error(422, "invalid_request", message),
+    };
+
+    match store.recall_events(&args.query, args.limit) {
+        Ok(result) => HttpResponse::json(200, "OK", recall_response_value(&result)),
+        Err(StoreError::InvalidRecallQuery) => {
+            HttpResponse::error(422, "invalid_request", "query must contain searchable text")
+        }
+        Err(_) => HttpResponse::error(500, "store_error", "recall could not be completed"),
     }
 }
 
@@ -628,6 +745,26 @@ fn capture_event_from_json(value: serde_json::Value) -> Result<NewRawEvent, &'st
     })
 }
 
+fn recall_request_from_json(value: serde_json::Value) -> Result<RecallArgs, &'static str> {
+    let object = value
+        .as_object()
+        .ok_or("request body must be a JSON object")?;
+    let query = required_json_string(object, "query")?;
+    let limit = match object.get("k").or_else(|| object.get("limit")) {
+        Some(value) if value.is_u64() => {
+            usize::try_from(value.as_u64().ok_or("k is out of range")?)
+                .map_err(|_| "k is out of range")?
+        }
+        Some(_) => return Err("k must be a positive integer"),
+        None => 5,
+    };
+    if limit == 0 {
+        return Err("k must be a positive integer");
+    }
+
+    Ok(RecallArgs { query, limit })
+}
+
 fn required_json_string(
     object: &serde_json::Map<String, serde_json::Value>,
     field: &'static str,
@@ -641,6 +778,7 @@ fn required_json_string(
             "agent" => "agent is required",
             "source" => "source is required",
             "kind" => "kind is required",
+            "query" => "query is required",
             _ => "required string field is missing",
         })
 }
@@ -820,6 +958,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_recall_with_limit() {
+        let cli = Cli::parse(["memoryd", "recall", "wal timeout", "--k", "3"].map(OsString::from))
+            .expect("cli parses");
+
+        let Command::Recall(args) = cli.command else {
+            panic!("expected recall command");
+        };
+        assert_eq!(args.query, "wal timeout");
+        assert_eq!(args.limit, 3);
+    }
+
+    #[test]
     fn remember_command_persists_memory_capture() {
         let path = temp_db_path("remember-command");
         let cli = Cli::parse(
@@ -848,6 +998,49 @@ mod tests {
         assert_eq!(table_rows(&stats, "sessions"), 1);
         assert_eq!(table_rows(&stats, "raw_events"), 1);
         assert_eq!(table_rows(&stats, "jobs"), 1);
+        assert_eq!(table_rows(&stats, "provider_usage"), 0);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn recall_command_reads_lexical_capture_without_provider_usage() {
+        let path = temp_db_path("recall-command");
+        {
+            let mut store = Store::open(&path).expect("store opens");
+            store
+                .capture_event(NewRawEvent {
+                    session_id: "session-1".to_string(),
+                    agent: "claude".to_string(),
+                    source: "tool_result".to_string(),
+                    kind: "observation".to_string(),
+                    payload: serde_json::json!({"text": "WAL timeout fixed"}),
+                    provenance: serde_json::json!({}),
+                    ts_ms: 1234,
+                })
+                .expect("capture succeeds");
+        }
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "recall",
+                "wal timeout",
+                "--k",
+                "5",
+                "--db",
+                path.to_str().expect("path is UTF-8"),
+            ]
+            .map(OsString::from),
+        )
+        .expect("cli parses");
+        let Command::Recall(args) = cli.command.clone() else {
+            panic!("expected recall command");
+        };
+
+        recall(cli, args).expect("recall succeeds");
+
+        let store = Store::open(&path).expect("store opens");
+        let stats = store.table_stats().expect("table stats");
         assert_eq!(table_rows(&stats, "provider_usage"), 0);
 
         cleanup_db_files(&path);
@@ -1018,6 +1211,69 @@ mod tests {
         let stats = store.table_stats().expect("table stats");
         assert_eq!(table_rows(&stats, "raw_events"), 0);
         assert_eq!(table_rows(&stats, "jobs"), 0);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn http_recall_returns_lexical_matches_without_provider_usage() {
+        let path = temp_db_path("http-recall");
+        let cfg = Config::with_db_path(path.clone());
+        let mut store = Store::open(&path).expect("store opens");
+        store
+            .capture_event(NewRawEvent {
+                session_id: "session-1".to_string(),
+                agent: "claude".to_string(),
+                source: "tool_result".to_string(),
+                kind: "observation".to_string(),
+                payload: serde_json::json!({"text": "WAL timeout fixed"}),
+                provenance: serde_json::json!({}),
+                ts_ms: 1234,
+            })
+            .expect("capture succeeds");
+
+        let response = handle_http_request(
+            &mut store,
+            &cfg,
+            Some("127.0.0.1:65000".parse().expect("peer parses")),
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/v1/recall".to_string(),
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: br#"{"query":"wal timeout","k":5}"#.to_vec(),
+            },
+        );
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["mode"], "lexical");
+        assert_eq!(response.body["results"][0]["raw_event_id"], 1);
+        assert_eq!(response.body["results"][0]["content"], "WAL timeout fixed");
+        let stats = store.table_stats().expect("table stats");
+        assert_eq!(table_rows(&stats, "provider_usage"), 0);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn http_recall_rejects_empty_query() {
+        let path = temp_db_path("http-recall-empty");
+        let cfg = Config::with_db_path(path.clone());
+        let mut store = Store::open(&path).expect("store opens");
+
+        let response = handle_http_request(
+            &mut store,
+            &cfg,
+            Some("127.0.0.1:65000".parse().expect("peer parses")),
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/v1/recall".to_string(),
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: br#"{"query":"?!","k":5}"#.to_vec(),
+            },
+        );
+
+        assert_eq!(response.status, 422);
+        assert_eq!(response.body["error"]["code"], "invalid_request");
 
         cleanup_db_files(&path);
     }
