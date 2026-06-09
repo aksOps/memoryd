@@ -16,7 +16,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component clippy rustfmt
+        run: rustup toolchain install 1.95.0 --profile minimal --component clippy --component rustfmt
 
       - name: Format check
         run: cargo fmt --all -- --check
