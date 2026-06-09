@@ -20,9 +20,12 @@ Status legend:
 - `[~]` M3 — queue leasing, governor caps, the embed worker, and the `null` adapter
   are delivered and gated; paid/remote adapters and `setup` are deferred to a later
   M3 increment.
-- `[ ]` M4 and later are not started.
+- `[x]` M4 — the vector-rerank engine (`vectorindex` + semantic recall + query cache
+  + lexical degrade) is delivered and gated; it activates once a non-`null` embedding
+  provider is configured.
+- `[ ]` M5 and later are not started.
 
-Next implementation target: M4 (vector rerank over the embeddings M3 produces).
+Next implementation target: M5 (idempotent historic import).
 
 ## M0 — Store Skeleton, Config, CLI Shell, Security Gate
 
@@ -202,18 +205,41 @@ integration test of the `serve` worker thread (the tick is unit-tested directly)
 
 ## M4 — Vector Rerank In Recall
 
-Status: `[ ]` Not started.
+Status: `[x]` Engine delivered and gated. Production semantic recall activates once a
+non-`null` embedding provider is configured (deferred M3 increment); the `null` adapter
+carries no semantic signal, so `recall --semantic` degrades to lexical today. Uplift is
+proven with a deterministic concept test-double (no network).
 
-- `[ ]` Add `vectorindex` trait.
-- `[ ]` Add brute-force cosine implementation over bounded candidate shortlist.
-- `[ ]` Add query embedding cache using `embeddings` or a dedicated cache shape.
-- `[ ]` Add optional semantic rerank in recall when embeddings/provider are
-  available.
-- `[ ]` Add lexical fallback with the same response shape when provider is
-  unavailable.
-- `[ ]` Add cache-hit test proving no provider call and unchanged cost ledger.
-- `[ ]` Add instrumentation/test proving <=256 vectors compared per query.
-- `[ ]` Add labeled fixture showing recall@10 uplift over lexical-only.
+- `[x]` Add `vectorindex` trait (`VectorIndex`) with a stable signature for the M9 HNSW swap.
+- `[x]` Add brute-force cosine over the bounded candidate shortlist (<=256, never the table).
+- `[x]` Add query-embedding cache (`embeddings`, `owner_type='query'`); a cache hit makes no
+  provider call and writes no ledger row.
+- `[x]` Add semantic rerank (FTS prefilter -> cosine over candidates -> bm25/cosine fusion at
+  `w_sem=0.34`, `w_lex=0.18`), gated on `ProviderAdapter::embeds_semantically`.
+- `[x]` Add lexical fallback with the same response shape when no semantic signal is available
+  (`degraded=true`, `mode="lexical"`).
+- `[x]` Add cache-hit test proving no second provider call and a single query ledger row.
+- `[x]` Add test proving at most 256 vectors compared per query (`compared` instrumentation).
+- `[x]` Add labeled fixture showing semantic rerank surfaces the concept-relevant match that
+  lexical-only mis-ranks (recall@1 uplift via the concept test-double).
+
+### M4 evidence (2026-06-09)
+
+- `semantic_recall_outranks_lexical_on_labeled_fixture`: three docs share the FTS token "lock";
+  the query ties lexically (falls back to ts DESC, surfacing the wrong doc), but the concept
+  embedding ranks the truly-relevant doc first.
+- `query_embedding_is_cached_with_no_second_provider_call`: the second identical query makes
+  zero provider calls; exactly one query-embed ledger row exists.
+- `null_provider_degrades_semantic_to_lexical_same_shape`: `null` adapter -> `mode="lexical"`,
+  `degraded=true`, identical hit order to `recall_events`, no query embedding written.
+- `semantic_recall_compares_at_most_candidate_cap`: 300 matching events -> `compared == 256`.
+- `vectorindex` unit tests: cosine identity/orthogonality/zero/mismatched-dim; brute-force
+  ranking and top-k truncation.
+
+#### Deferred
+
+Wiring semantic recall to a real embedding provider (the `openai_compat`/`ollama` adapters
+from the deferred M3 increment). Until then `recall --semantic` degrades to lexical.
 
 ## M5 — Idempotent Historic Import
 
@@ -325,7 +351,10 @@ Status: `[ ]` Not started.
    deferred to M6.
 2. M3 core plane landed: exactly-once leasing, governor caps, embed worker, and the
    `null` adapter (writes `embeddings` + `provider_usage`).
-3. Start M4 (vector rerank in recall) over the embeddings the embed worker produces.
-4. Land the deferred M3 increment: `openai_compat`/`ollama` adapters, reachability
-   probe + failover, and the `setup` command.
-5. Add M0 release-build/disk-free evidence if those plan requirements remain.
+3. M4 vector-rerank engine landed (brute-force cosine over the FTS shortlist, query
+   cache, lexical degrade); proven with a concept test-double. Production semantic
+   awaits a real embedding provider.
+4. Start M5 (idempotent historic import).
+5. Land the deferred M3 increment: `openai_compat`/`ollama` adapters, reachability
+   probe + failover, the `setup` command, and wiring real semantic recall.
+6. Add M0 release-build/disk-free evidence if those plan requirements remain.

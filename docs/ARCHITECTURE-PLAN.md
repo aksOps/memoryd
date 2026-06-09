@@ -5170,6 +5170,15 @@ This slice retires C1/C3 (caps + bounded-queue backpressure proven on the trivia
 
 ### 21.7 M4 — Vector rerank in recall (brute-force over shortlist)
 
+> **Status (2026-06-09): engine delivered.** `vectorindex::BruteForce` reranks the
+> bounded FTS shortlist (<=256) by cosine fused with bm25; the query embedding is cached
+> (`owner_type='query'`); recall degrades to lexical with the same response shape when no
+> semantic signal is available. Gated on `ProviderAdapter::embeds_semantically` so the
+> default `null` adapter (hash) never reranks by noise. **Deferred:** wiring to a real
+> embedding provider (`openai_compat`/`ollama`, deferred M3 increment) — until then
+> `recall --semantic` degrades to lexical. Uplift, cache-hit, degrade, and the <=256 cap
+> are proven with a deterministic concept test-double (no network).
+
 #### Goal
 Semantic recall: rerank the FTS shortlist by cosine over cached `embeddings`, with cached-query short-circuit and clean lexical degrade when no provider/embedding is available.
 

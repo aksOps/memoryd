@@ -70,6 +70,12 @@ Implemented now:
   and `provider_usage` rows (`est_cost = 0`; paid adapters are blocked at the default
   zero spend cap). Remote adapters (`openai_compat`/`ollama`) and the `setup` command
   are deferred behind the in-place `ProviderAdapter` seam.
+- M4 vector rerank: a `vectorindex` (brute-force cosine over the <=256 FTS-prefiltered
+  shortlist) reranks recall by semantic similarity fused with bm25, with a query-embedding
+  cache (`owner_type='query'`; cache hit = no provider call) and clean lexical degrade when
+  no semantic signal is available. Gated on `ProviderAdapter::embeds_semantically`, so the
+  default `null` adapter (hash, no signal) keeps recall lexical; production semantic recall
+  activates with a real embedding provider. Uplift proven with a deterministic test double.
 - CI/security gates for format, build, clippy, tests, dependency policy,
   advisory audit, and SBOM generation.
 - OpenSSF Best Practices passing evidence.
