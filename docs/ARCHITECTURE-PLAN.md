@@ -5431,6 +5431,29 @@ fn commit_fact(&self, approval: &Approval) -> Result<FactId>; // requires approv
 
 ### 21.12 M9 — In-process HNSW behind the VectorIndex trait (perf only)
 
+> **Status (2026-06-09): delivered.** A second `VectorIndex` implementation — an
+> in-process **HNSW** graph — lands behind the existing trait with **no** change to the
+> trait or any recall call-site signature. It is **dependency-free** (no `rand`:
+> deterministic level assignment via a std-hash-seeded geometric distribution),
+> **`unsafe`-free**, and **deterministic** (total-ordered heaps + id tie-breaks).
+> `BruteForce` remains the **default and the correctness oracle**. Selection: a
+> validated `Caps.vector_index_kind` ("brute-force" | "hnsw") feeds
+> `vectorindex::from_kind`, and `recall --index <brute-force|hnsw>` overrides it per
+> call. **Validated:** on a 400-vector fixture HNSW's recall@10 overlaps the BruteForce
+> top-10 by ≥ 9/10 (within ε) and the top-1 matches exactly; a store-level test confirms
+> `recall_semantic` returns the same ranking under HNSW as under BruteForce.
+> **Deviations (documented in code):** (1) the `VectorIndex` trait is **stateless** —
+> candidates are passed per call — so HNSW builds its graph **per `search` call**; over
+> the ≤256 FTS-prefiltered shortlist the current recall pipeline passes, that build cost
+> makes HNSW *slower* than BruteForce, so BruteForce stays the default. HNSW's latency
+> win requires a **persistent full-corpus index**, which is deferred — this milestone
+> lands the algorithm, the config seam, and oracle parity. (2) Neighbor selection uses
+> the simple closest-M heuristic (not the §4 extended/keep-pruned heuristic), sufficient
+> for recall@10 parity at personal scale. (3) Selection is config-validated but there is
+> still no config-file/env parser (deferred, as in M8); the `recall --index` flag is the
+> runtime-reachable selector, and the index applies to the raw-event semantic recall
+> path (`recall_semantic`).
+
 #### Goal
 Scale semantic recall beyond brute-force shortlist sizes with **no** API change and **no** external vector DB (H3).
 

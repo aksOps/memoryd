@@ -6060,4 +6060,44 @@ mod tests {
         );
         cleanup_db_files(&path);
     }
+
+    #[test]
+    fn recall_semantic_with_hnsw_matches_brute_force_oracle() {
+        use crate::vectorindex::{BruteForce, Hnsw};
+        let path = temp_db_path("recall-semantic-hnsw");
+        let mut store = Store::open(&path).expect("store opens");
+        let adapter = ConceptAdapter;
+        let a = capture_id(&mut store, 1000, "lock mutex contention");
+        let b = capture_id(&mut store, 1001, "lock database schema");
+        let c = capture_id(&mut store, 1002, "lock report dashboard");
+        for (id, text) in [
+            (a, "lock mutex contention"),
+            (b, "lock database schema"),
+            (c, "lock report dashboard"),
+        ] {
+            let v = adapter.embed(&[text.to_string()]).expect("embed");
+            Store::store_embedding(
+                &store.conn,
+                "raw_event",
+                &id.to_string(),
+                adapter.model_id(),
+                &v[0],
+                1000,
+            )
+            .expect("store embedding");
+        }
+        let oracle = store
+            .recall_semantic("lock deadlock", 3, &adapter, &BruteForce, 2000)
+            .expect("brute recall");
+        let hnsw = store
+            .recall_semantic("lock deadlock", 3, &adapter, &Hnsw::default(), 2000)
+            .expect("hnsw recall");
+        let oracle_ids: Vec<i64> = oracle.hits.iter().map(|h| h.raw_event_id).collect();
+        let hnsw_ids: Vec<i64> = hnsw.hits.iter().map(|h| h.raw_event_id).collect();
+        assert_eq!(
+            hnsw_ids, oracle_ids,
+            "HNSW recall matches the BruteForce oracle"
+        );
+        cleanup_db_files(&path);
+    }
 }

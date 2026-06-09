@@ -38,9 +38,14 @@ Status legend:
   `profile_facts` directly — enforced by the NOT NULL approval_id FK), and
   `approve [--list] [--id N --accept|--reject]` commits/rejects them; LLM extraction is
   stubbed (deterministic kind-based, optional gated `summarize` refinement).
-- `[ ]` M9 and later are not started.
+- `[x]` M9 — in-process HNSW behind the `VectorIndex` trait is delivered: a
+  dependency-free, deterministic, unsafe-free second implementation, config-selectable
+  (`Caps.vector_index_kind` + `recall --index`), with `BruteForce` as the default and
+  oracle; recall@10 within epsilon of BruteForce on a fixture, no API change.
+- `[ ]` M10 (bench/packaging) and the deferred M3 increment remain.
 
-Next implementation target: M9 (in-process HNSW behind the VectorIndex trait, perf only).
+Next implementation target: the deferred M3 increment (openai_compat/ollama adapters,
+reachability/failover, setup CLI, runtime spend ledger) and/or M10.
 
 ## M0 — Store Skeleton, Config, CLI Shell, Security Gate
 
@@ -326,15 +331,20 @@ is stubbed (deterministic kind-based, optional gated `summarize` refinement).
 
 ## M9 — In-Process HNSW Behind VectorIndex
 
-Status: `[ ]` Not started.
+Status: `[x]` Delivered. Dependency-free, deterministic, unsafe-free HNSW; builds
+per-call (stateless trait), so BruteForce stays default + oracle. Persistent full-corpus
+index (the real latency win) and a large perf fixture are deferred to M10.
 
-- `[ ]` Add HNSW `VectorIndex` implementation behind the M4 trait.
-- `[ ]` Keep brute-force implementation selectable as correctness oracle.
-- `[ ]` Add fixture requiring HNSW recall@10 within epsilon of brute force.
-- `[ ]` Add 200k-embedding performance fixture.
-- `[ ]` Verify p99 semantic recall remains `< 100 ms` within memory caps.
-- `[ ]` Verify no API changes to M4 recall callers.
-- `[ ]` Keep SQLite as the only durable store.
+- `[x]` Add HNSW `VectorIndex` implementation behind the M4 trait (no trait change).
+- `[x]` Keep brute-force implementation selectable as correctness oracle
+  (`Caps.vector_index_kind` + `recall --index`, default brute-force).
+- `[x]` Fixture: HNSW recall@10 within epsilon of brute force (overlap >= 9/10, top-1
+  exact) — `hnsw_recall_at_10_within_epsilon`, `hnsw_matches_brute_force_top1_exact`.
+- `[~]` Large (200k) perf fixture + p99 `< 100 ms` measurement: deferred to the M10
+  bench harness (the per-call build means HNSW is not yet a latency win over the ≤256
+  shortlist; the persistent index lands later).
+- `[x]` No API changes to M4 recall callers (trait + signatures unchanged).
+- `[x]` SQLite remains the only durable store (HNSW is in-memory, per-call).
 
 ## M10 — Bench, Doctor Hardening, Packaging
 
