@@ -1,7 +1,9 @@
 # OpenSSF Best Practices Evidence
 
 This file tracks repository evidence for the OpenSSF Best Practices passing
-badge at https://www.bestpractices.dev/en/projects/13135.
+badge at https://www.bestpractices.dev/en/projects/13135. The project is
+registered as id `13135` and the local machine-readable status is mirrored in
+`.bestpractices.json`.
 
 ## Badge Setup
 
@@ -99,10 +101,10 @@ Use the following concise answers when completing the web form.
 | `build_floss_tools` | Met. Rust/Cargo and project dependencies are FLOSS. |
 | `test` | Met. `README.md`, `CONTRIBUTING.md`, and CI document `cargo test --workspace --locked`. |
 | `test_invocation` | Met. `cargo test --workspace --locked` is standard Rust test invocation. |
-| `test_most` | Met. Current major features have unit tests for config, store, CLI parsing, HTTP capture/recall, and validation paths. |
+| `test_most` | Met. Current major features have unit tests for config, store, CLI parsing, HTTP capture/recall, redaction, and validation paths. |
 | `test_continuous_integration` | Met URL: `https://github.com/aksOps/memoryd/blob/main/.github/workflows/ci.yml`. |
 | `test_policy` | Met. `CONTRIBUTING.md` requires tests for major new functionality and bug fixes. |
-| `tests_are_added` | Met. The current capture and recall features include store, CLI, auth, validation, and no-provider-call tests. |
+| `tests_are_added` | Met. The current capture, recall, and redaction features include store, CLI, HTTP, auth, validation, and no-provider-call tests. |
 | `tests_documented_added` | Met URL: `https://github.com/aksOps/memoryd/blob/main/CONTRIBUTING.md`. |
 | `warnings` | Met. CI runs `cargo clippy --workspace --all-targets --locked -- -D warnings`; Rust `unsafe_code` is forbidden. |
 | `warnings_fixed` | Met. CI fails on clippy warnings. |
@@ -112,8 +114,8 @@ Use the following concise answers when completing the web form.
 
 | Criterion | Suggested answer |
 |---|---|
-| `know_secure_design` | Met. Primary development follows least privilege, fail-closed remote bind auth, local-first defaults, no inline provider calls, and dependency/security gates. |
-| `know_common_errors` | Met. The project explicitly addresses auth bypass, secret leakage, dependency CVEs, SQL injection via parameterized queries, unbounded request/body size, and unsafe Rust. |
+| `know_secure_design` | Met. Primary development follows least privilege, fail-closed remote bind auth, local-first defaults, deterministic redaction before persistence, no inline provider calls, and dependency/security gates. |
+| `know_common_errors` | Met. The project explicitly addresses auth bypass, secret leakage through best-effort redaction and secret scanning, dependency CVEs, SQL injection via parameterized queries, unbounded request/body size, and unsafe Rust. |
 | `crypto_published` | N/A. Current code does not implement cryptographic protocols. |
 | `crypto_call` | N/A. Current code does not implement cryptography. |
 | `crypto_floss` | N/A. Current code does not implement cryptography. |
@@ -132,16 +134,18 @@ Use the following concise answers when completing the web form.
 | `static_analysis_common_vulnerabilities` | Met. cargo-audit and cargo-deny check RustSec advisories and dependency policy. |
 | `static_analysis_fixed` | Met. CI blocks unresolved warnings/advisories by policy. |
 | `static_analysis_often` | Met. CI runs on push to `main` and pull requests. |
-| `dynamic_analysis` | Met. Automated tests exercise SQLite migration, capture, recall, HTTP auth, and request validation. |
+| `dynamic_analysis` | Met. Automated tests exercise SQLite migration, capture, recall, redaction, HTTP auth, and request validation. |
 | `dynamic_analysis_unsafe` | N/A. Project is Rust with `unsafe_code = "forbid"`; no memory-unsafe project code is produced. |
 | `dynamic_analysis_enable_assertions` | Met. Rust tests run with assertions enabled. |
 | `dynamic_analysis_fixed` | Met. Confirmed exploitable findings from tests/dynamic analysis are fixed before release. |
 
-## External Criteria Still Requiring Maintainer Action
+## External Criteria Maintainer Actions
 
-The following cannot be completed from local files alone:
+These criteria depend on repository or third-party service state rather than
+local files alone. Current status:
 
-- Publish the repository at an HTTPS URL.
-- Enable or confirm GitHub issues and pull requests.
-- Enable GitHub private vulnerability reporting if private reports are desired.
-- Complete the bestpractices.dev self-certification form for project `13135`.
+- Repository is public at `https://github.com/aksOps/memoryd`.
+- GitHub issues and pull requests are enabled.
+- GitHub private vulnerability reporting is enabled.
+- The bestpractices.dev self-certification form for project `13135` is complete
+  and passing.

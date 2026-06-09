@@ -32,6 +32,28 @@ Borrow concepts, not code:
 - No Postgres.
 - Clean-room implementation only.
 
+## Current Implementation Status
+
+Implemented now:
+
+- Rust workspace with `memoryd` binary and `memoryd-core` library.
+- SQLite schema migrations through v2, including canonical tables and FTS over
+  captured raw events.
+- CLI commands: `doctor`, `stats`, `remember`, `recall`, and `serve`.
+- REST endpoints: `POST /v1/capture` and `POST /v1/recall` on the local HTTP
+  server.
+- Deterministic best-effort redaction before metadata, payload, provenance, and
+  recall index persistence.
+- CI/security gates for format, build, clippy, tests, dependency policy,
+  advisory audit, and SBOM generation.
+- OpenSSF Best Practices passing evidence.
+
+Still planned:
+
+- Background workers, governor admission, provider adapters, vector reranking,
+  dreaming/consolidation, MCP/hook facades, approval-gated profile facts,
+  per-redaction audit entries, portable snapshots, and npm binary distribution.
+
 ## Required Capabilities
 
 - Remote server mode.
@@ -190,7 +212,8 @@ Benchmark modes should include:
 
 - Localhost-only bind by default.
 - Auth required for non-loopback remote access.
-- Secret redaction before persistence and provider calls where possible.
+- Secret redaction before persistence is implemented; provider-send redaction
+  reports remain planned with the provider worker path.
 - Secure provider credential storage.
 - Audit logging for writes, imports, dreams, approvals, deletes, and provider calls.
 - Dependency policy for Rust crates and npm wrapper packages.

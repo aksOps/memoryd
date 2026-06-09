@@ -28,8 +28,8 @@ memoryd remember <content> [--kind <kind>] [--session <id>] [--source <source>] 
 ```
 
 Writes a memory capture through the same append-only path as HTTP capture. It
-returns after the raw event and one embed job are persisted. It does not call a
-provider inline.
+redacts common secret shapes before persistence, returns after the raw event and
+one embed job are persisted, and does not call a provider inline.
 
 Output JSON:
 
@@ -49,8 +49,8 @@ Output JSON:
 memoryd recall <query> [--k <limit>] [--db <path>]
 ```
 
-Runs local lexical recall over captured raw events using SQLite FTS. It does not
-call a provider inline.
+Runs local lexical recall over redacted captured raw events using SQLite FTS. It
+does not call a provider inline.
 
 Output JSON:
 
@@ -87,8 +87,9 @@ Base URL: `http://127.0.0.1:7077` by default.
 
 ### `POST /v1/capture`
 
-Appends a raw event, upserts its session, enqueues one `embed` job, and returns
-immediately. The handler performs no provider calls.
+Redacts common secret shapes, appends the redacted raw event, upserts its
+session, enqueues one `embed` job, and returns immediately. The handler performs
+no provider calls.
 
 Request headers:
 
@@ -126,6 +127,16 @@ Response `202 Accepted`:
 }
 ```
 
+The persisted `session_id`, `agent`, `source`, `kind`, `payload`, `provenance`,
+and recall index text are redacted before the SQLite transaction. If a metadata
+field itself contains a bearer-style secret, the response reflects the redacted
+stored value. Redaction replaces matched content with `[REDACTED]`.
+
+Current redaction coverage is deterministic and best-effort: sensitive JSON keys,
+bearer-style credentials, common API-key prefixes, private-key markers, emails,
+and high-entropy token-like spans. It is not a proof that arbitrary proprietary
+secret formats will always be detected.
+
 Error envelope:
 
 ```json
@@ -142,8 +153,8 @@ and `500`.
 
 ### `POST /v1/recall`
 
-Runs local lexical recall over captured raw events. The handler performs no
-provider calls and writes no provider usage rows.
+Runs local lexical recall over redacted captured raw events. The handler performs
+no provider calls and writes no provider usage rows.
 
 Request body:
 

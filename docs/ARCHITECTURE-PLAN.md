@@ -1,9 +1,10 @@
 # memoryd — Clean-Room Rust Memory Daemon: Architecture & Milestone Plan
 
-> Implementation-ready plan for a portable, helper-sized, SQLite-only, remote-providers-only-by-default, clean-room Rust memory daemon for AI coding agents and personal long-term memory. Generated as a planning artifact; no code.
+> Implementation-ready plan for a portable, helper-sized, SQLite-only, remote-providers-only-by-default, clean-room Rust memory daemon for AI coding agents and personal long-term memory. This began as a planning artifact and is now reconciled against the current implementation status below.
 
 ## Table of Contents
 
+0. [Current Implementation Status](#0-current-implementation-status)
 1. [Executive Recommendation](#1-executive-recommendation)
 2. [Restated Goal](#2-restated-goal)
 3. [Constraints And Assumptions](#3-constraints-and-assumptions)
@@ -30,6 +31,47 @@
 
 ---
 
+## 0. Current Implementation Status
+
+This document remains the target architecture and milestone plan. The current
+code intentionally implements a narrow foreground slice first.
+
+Implemented now:
+
+- Rust workspace with a `memoryd` binary and `memoryd-core` library.
+- SQLite schema migrations through v2, including the canonical tables,
+  `memories_fts`, and `raw_events_fts`.
+- Local-first config defaults: localhost bind, null provider mode, and zero paid
+  provider spend.
+- CLI commands: `doctor`, `stats`, `remember`, `recall`, and `serve`.
+- REST endpoints: `POST /v1/capture` and `POST /v1/recall`.
+- Fast capture writes a redacted raw event, upserts its session, inserts one
+  pending `embed` job, and returns without provider calls.
+- Recall is lexical-only over redacted captured raw events using SQLite FTS.
+- Deterministic best-effort redaction runs before metadata, payload, provenance,
+  and recall index persistence.
+- CI/security gates cover formatting, build, clippy, tests, dependency policy,
+  advisory audit, and SBOM generation.
+- OpenSSF Best Practices evidence is complete and passing.
+
+Still planned:
+
+- Background worker execution, governor admission, provider adapters, vector
+  reranking, graph expansion, dreaming/consolidation, MCP and hook facades,
+  approval-gated profile facts, per-redaction `audit_log` entries, snapshots,
+  benchmark harness, and npm binary distribution.
+
+Implementation notes that differ from the target design for now:
+
+- The current HTTP server uses a minimal standard-library listener rather than
+  Axum/Hyper.
+- The current crate layout is two crates rather than the planned multi-crate
+  decomposition.
+- The current REST surface is `/v1/capture` and `/v1/recall`; the broader route
+  set in §14 remains target API design.
+
+---
+
 ## 1. Executive Recommendation
 
 **Architecture in one paragraph.** Build `memoryd` as **Governed Two-Plane Memory**: a single portable Rust binary that puts a *cheap, append-only foreground plane* (capture + recall over SQLite) in front of a *fully resource-governed background plane* (bounded job queue + a fixed worker pool + scheduled "dreaming") that performs all expensive, remote-provider work deferred, batched, capped, and scheduled. SQLite (WAL) is the only durable store — events, curated memories, the association graph, embeddings, jobs, audit, and the spend ledger all live in it; there is no Postgres, no Docker, no external vector DB. All LLM and embedding work goes through remote OpenAI-/Ollama-compatible provider adapters the owner already pays for or hosts; the daemon ships no model runtime, ever, and degrades to lexical-only recall when no provider is reachable. It is a *helper-sized daemon, not a second agent runtime*: adaptive over time because it dreams, but tiny at every instant because it dreams on a leash (bounded queue/workers/memory/CPU/dream-wall-clock and a default **$0.00** per-window spend cap).
@@ -48,11 +90,11 @@
 - Ships nothing that can mutate profile/identity (H6 risk = 0 by construction); MCP facade, graph recall, dedup, profile/approvals, scheduled dreaming, and HNSW are deferred behind seams already in place.
 
 **Top 3 risks.**
-1. **Privacy leakage to remote providers (Critical).** Coding sessions are dense with secrets; the background plane is the only thing that calls out. Mitigated by localhost-default bind, entitlement-first/local-preferred adapters, **on-by-default pre-send redaction**, and a full audit trail.
+1. **Privacy leakage to remote providers (Critical).** Coding sessions are dense with secrets; the background plane is the only thing that calls out. Mitigated by localhost-default bind, entitlement-first/local-preferred adapters, **on-by-default pre-send redaction**, and, in the target architecture, a full audit trail. Current implementation already redacts before persistence; per-redaction audit entries are still planned.
 2. **Provider cost overrun (High).** Mitigated by a default **$0.00** per-window spend cap backed by the `provider_usage` ledger and enforced at governor admission; paid APIs are opt-in + budget-gated; on breach, LLM steps skip/re-queue while non-LLM maintenance completes.
 3. **Memory + SQLite-vector bloat/perf cliff (High).** Mitigated by governed `purge`/decay on indexed due-rows only (no scans), retention windows, the bounded prefilter-then-rerank recall, and the HNSW seam ready to swap in past ~50k active memories.
 
-**Bottom line.** Build the governed two-plane memory daemon: cheap on the hot path, everything expensive deferred and capped, one binary, SQLite-only, remote-providers-only, providers as the sole seam — **proceed to M0**.
+**Bottom line.** Build the governed two-plane memory daemon: cheap on the hot path, everything expensive deferred and capped, one binary, SQLite-only, remote-providers-only, providers as the sole seam — continue from the shipped foreground slice toward the governed background plane.
 
 ---
 
@@ -251,10 +293,10 @@ Canonical modules (15 top-level): **`gateway`, `capture`, `recall`, `store`, `qu
 ### 5.3 End-to-end data flow — the three distinct paths
 
 **(1) FAST capture path — microsecond-class, never blocks the agent (S6, H7).**
-`agent → gateway (auth) → capture.append()` writes to `raw_events` (and upserts `sessions`) in one append-only SQLite transaction, enqueues a lightweight `embed`/`triage` job into `jobs`, and returns immediately. No LLM, no embedding, no scan inline. If `store` is saturated, backpressure returns a fast "accepted-degraded" and the agent proceeds — capture is best-effort. This path touches only `gateway → capture → store(raw_events,sessions,jobs)`.
+`agent → gateway (auth) → capture.append()` redacts metadata/payload/provenance, writes to `raw_events` (and upserts `sessions`) in one append-only SQLite transaction, writes the redacted recall index text, enqueues a lightweight `embed`/`triage` job into `jobs`, and returns immediately. No LLM, no embedding, no scan inline. If `store` is saturated, backpressure returns a fast "accepted-degraded" and the agent proceeds — capture is best-effort. This path touches only `gateway → capture → store(raw_events,sessions,jobs)`.
 
 **(2) RECALL path — bounded read, no full-table scan (H7), no inline model call when cache suffices.**
-`agent → gateway → recall`: (a) **prefilter** via FTS5 + indexed metadata (session, recency, tags) to a bounded candidate set; (b) **rerank** those candidates only, via `vectorindex` cosine over cached `embeddings` (compute a query embedding through `adapters` *only if* not cached and a provider is reachable; else lexical-only degrade per A1/C4); (c) optional one-hop **graph expansion** over `memory_links`; (d) **score** each candidate over the `scoring_variables` and return top-K `memories` with provenance (`memory_versions` lineage). Reads only; writes nothing except an optional access-stat bump queued as a job. Sub-100ms target at personal scale (A3).
+Current implementation is lexical-only over `raw_events_fts`. Target design: `agent → gateway → recall`: (a) **prefilter** via FTS5 + indexed metadata (session, recency, tags) to a bounded candidate set; (b) **rerank** those candidates only, via `vectorindex` cosine over cached `embeddings` (compute a query embedding through `adapters` *only if* not cached and a provider is reachable; else lexical-only degrade per A1/C4); (c) optional one-hop **graph expansion** over `memory_links`; (d) **score** each candidate over the `scoring_variables` and return top-K `memories` with provenance (`memory_versions` lineage). Reads only; writes nothing except an optional access-stat bump queued as a job. Sub-100ms target at personal scale (A3).
 
 **(3) BACKGROUND / dream / worker path — all expensive work, governed (C1, C3, H7).**
 Triggered by schedule (e.g. nightly), explicit `dream`/`import`, or queue drain under idle. `queue` hands jobs to `governor`, which admits them only within caps (queue depth, worker concurrency, per-worker memory, CPU share, **dream wall-clock**, **per-window provider spend** via `provider_usage`). `workers` then: `embed` raw/changed rows; `consolidate` raw_events→durable `memories` (LLM summarization via `adapters` when budget allows, lexical/dedup-only when not — C3 degrade); apply **decay** (lifecycle transitions, no full scan — only rows due, by indexed `next_review`/score); `associate` to strengthen/prune `memory_links` by embedding+co-occurrence; `dedup`; and `extract-profile` which *proposes* `profile_facts` into `approvals` — **never** mutating profile silently (H6). Each run records a `dream_runs` row and `audit_log` entries; provider calls record `provider_usage`. On cap breach: graceful degradation — LLM steps skip and re-queue, non-LLM maintenance still completes. This path writes `memories`, `memory_versions`, `memory_links`, `embeddings`, `profile_facts`(via approval), `dream_runs`, `audit_log`, `provider_usage`; it is the *only* plane that calls providers or does heavy compute.
@@ -265,12 +307,12 @@ This recommendation — **Governed Two-Plane Memory**, Option B spine + Provider
 
 ## 6. Core Modules
 
-The workspace is a **single Cargo workspace** with one binary crate and a small set of library crates. The split is deliberate and conservative: crates exist only where they (a) define a stable seam (`adapters`, `vectorindex`), (b) form the durable substrate every plane depends on (`store`, `config`), or (c) need independent test surfaces and compile isolation. Everything else lives as **modules inside one `memoryd-core` library crate** to keep the build simple, the binary small, and link-time optimization effective (H8 maintainability, single-binary distribution).
+The target workspace is a **single Cargo workspace** with one binary crate and a small set of library crates. The current implementation deliberately starts smaller with `memoryd` and `memoryd-core`; split out the planned seam crates only when their interfaces become real. The target split is conservative: crates exist only where they (a) define a stable seam (`adapters`, `vectorindex`), (b) form the durable substrate every plane depends on (`store`, `config`), or (c) need independent test surfaces and compile isolation. Everything else lives as **modules inside one `memoryd-core` library crate** to keep the build simple, the binary small, and link-time optimization effective (H8 maintainability, single-binary distribution).
 
 ### 6.1 Crate layout (workspace members)
 
 ```
-memoryd/                         # workspace root (Cargo.toml [workspace])
+memoryd/                         # target workspace root (Cargo.toml [workspace])
 ├── crates/
 │   ├── memoryd            # [bin]  thin entrypoint → cli; the single portable binary
 │   ├── memoryd-cli        # [lib]  cli            — arg parse, command dispatch, human/JSON output
@@ -430,7 +472,7 @@ CREATE INDEX ix_jobs_ready ON jobs(priority, scheduled_at, id) WHERE state IN ('
 
 ### 6.5 `gateway` — server, REST API, MCP facade, hook receiver  *(module in `memoryd-core`)*  — **F**
 
-**Responsibility.** The single network surface. One Axum/Hyper server that exposes three co-located facades over the same handlers: **REST/JSON core**, an **MCP facade**, and a **hook receiver**. Enforces bearer auth, 127.0.0.1 default bind, request size caps, and per-route rate limits. Dispatches to `capture` (fast) or `recall` (read); never calls a provider inline.
+**Responsibility.** The single network surface. Target design: one Axum/Hyper server that exposes three co-located facades over the same handlers: **REST/JSON core**, an **MCP facade**, and a **hook receiver**. Enforces bearer auth, 127.0.0.1 default bind, request size caps, and per-route rate limits. Dispatches to `capture` (fast) or `recall` (read); never calls a provider inline. Current implementation uses a minimal standard-library HTTP listener with `POST /v1/capture` and `POST /v1/recall` only.
 
 ```rust
 pub struct Gateway { capture: Capture, recall: Recall, store: Store, cfg: Arc<Config> }
@@ -487,16 +529,16 @@ impl Capture {
 
 #### Redaction/privacy filter (sub-component) — **F**
 
-Synchronous, deterministic, **no network**. Applied before persistence so secrets never hit disk unredacted.
+Synchronous, deterministic, **no network**. Applied before persistence so matched secrets do not hit disk unredacted.
 
 ```rust
-pub struct Redactor { patterns: Vec<Regex>, entropy_min: f32 }
+pub struct Redactor { patterns: Vec<Pattern>, entropy_min: f32 }
 impl Redactor {
     pub fn scrub(&self, payload: &str) -> (String, RedactionReport);  // masks tokens, keys, emails, PII
 }
 ```
 
-Default patterns: API-key shapes, bearer/JWT, AWS keys, private-key PEM headers, emails, and high-entropy (>4.0 bits/char over ≥20 chars) strings. Redactions are recorded in `audit_log`. Cost budget: <1ms per event at 4KB payload.
+Current implementation: dependency-free best-effort masking for sensitive JSON keys, bearer-style credentials, common API-key prefixes, private-key markers, emails, and high-entropy token-like spans (>4.0 bits/char over ≥20 chars). It redacts metadata fields, payloads, provenance, and recall index text before the SQLite transaction. Planned next hardening: record per-redaction summaries in `audit_log` without storing the original secret. Cost budget: <1ms per event at 4KB payload.
 
 - **Inputs:** `NewRawEvent`. **Outputs:** `CaptureAck`; rows in `raw_events`, `sessions`, `jobs`. **Depends on:** `store`, `queue`, `audit`.
 
@@ -731,7 +773,7 @@ pub enum Decision { Approve, Reject }
 
 ### 6.17 `audit` — audit/provenance log  *(module in `memoryd-core`)*  — **C**
 
-**Responsibility.** Append-only accountability trail for every mutating/security-relevant action (H8/H9): captures, redactions, consolidations, decay/cleanup, profile decisions, provider calls, config changes. Provenance for `memories` is carried via `memory_versions` (`created_by_job`, `reason`); `audit_log` is the cross-cutting action ledger.
+**Responsibility.** Target append-only accountability trail for every mutating/security-relevant action (H8/H9): captures, redactions, consolidations, decay/cleanup, profile decisions, provider calls, config changes. Provenance for `memories` is carried via `memory_versions` (`created_by_job`, `reason`); `audit_log` is the cross-cutting action ledger. Current implementation has the table but does not yet emit per-action audit rows.
 
 ```rust
 pub struct Audit { store: Store }
@@ -811,8 +853,8 @@ pub trait ProviderAdapter: LlmAdapter + EmbeddingAdapter {}
 | `config` | core | C | — | no |
 | `store` | memoryd-store | C | all 13 | no |
 | `gateway` | core | **F** | raw_events, jobs (via capture) | no |
-| `capture` (+redact) | core | **F** | raw_events, sessions, jobs, audit_log | no |
-| `recall` | core | **F** | memories, embeddings, memory_links | embed-only, cache-first |
+| `capture` (+redact) | core | **F** | current: raw_events, sessions, jobs, raw_events_fts; target adds audit_log | no |
+| `recall` | core | **F** | current: raw_events_fts/raw_events; target: memories, embeddings, memory_links | current: no; target: embed-only, cache-first |
 | `relevance` | core | **F**/W | memories (read) | no |
 | `queue` | core | W | jobs | no |
 | `governor` | core | W | provider_usage, jobs | no (gates) |
@@ -2549,7 +2591,7 @@ max_tokens_per_job_chat_out = 1000
 - **Sources, in resolution order:** `keychain:<service>/<account>` (OS keychain via the `keyring` crate, **4.0.1**, with explicit per-platform features — `apple-native` on macOS, `windows-native` on Windows, `sync-secret-service` on Linux/BSD; no default features per crate design) → `env:VAR` → (no third option; **no secrets in the TOML file ever**).
 - **Keychain backends:** macOS Keychain, Windows Credential Manager, Linux Secret Service (D-Bus, secrets encrypted on the bus). Keyutils is *not* used as the primary store (non-persistent across reboot).
 - **`setup` command** writes credentials into the OS keychain interactively (prompt, never echoed, never passed as argv — read from stdin/TTY) so they never land in shell history or the config file.
-- **Never logged.** Credentials are wrapped in a `Secret<String>` (`secrecy` crate) with a redacting `Debug`/`Display`; the HTTP client attaches the bearer at send time from the secret and the redaction guarantees it cannot appear in `audit_log`, error bodies, or tracing. `Upstream{body}` errors are scrubbed of `Authorization` echoes before logging.
+- **Target: never logged.** Credentials are wrapped in a `Secret<String>` (`secrecy` crate) with a redacting `Debug`/`Display`; the HTTP client attaches the bearer at send time from the secret, and log/audit/error-body redaction prevents credential echoes. `Upstream{body}` errors are scrubbed of `Authorization` echoes before logging.
 - **Air-gapped/offline (per global build policy):** with only `ollama`/`opencode` reachable on localhost and `null` terminal, the daemon is fully functional with **zero** outbound public-internet calls; metered adapters simply never activate.
 
 ### 12.8 Degradation matrix (provider state → behavior)
@@ -3803,17 +3845,26 @@ Every authenticated mutating request is attributed to `actor = "owner:<agent_lab
 
 ### 17.3 Secret & PII Redaction Policy
 
-Redaction is applied at three boundaries, in this order of trust: **capture (write-time)**, **logs (emit-time)**, **export (read-out-time)**. The redactor is a single audited module (`store::redact`) reused by all three; there is no second implementation.
+Current implementation applies deterministic best-effort redaction at the
+**capture write-time** boundary before SQLite persistence, using `[REDACTED]` as
+the replacement text. It covers metadata fields, payloads, provenance, and recall
+index text. It does not yet emit redaction audit rows, scrub a structured logging
+layer, or implement export-time defense-in-depth.
+
+Target policy: redaction is applied at three boundaries, in this order of trust:
+**capture (write-time)**, **logs (emit-time)**, **export (read-out-time)**. The
+redactor should be a single audited module reused by all three; there should be
+no second implementation.
 
 **Where applied:**
 
 | Boundary | When | Behavior |
 |----------|------|----------|
-| `capture.append()` | before the `raw_events` INSERT, on `payload` | matched spans replaced with `‹redacted:KIND›`; original is **not** stored; a `provenance` flag `redacted=true` is set. Fast-path cost bounded: single linear regex-set pass, no backtracking (RE2-style via `regex` crate, which has no catastrophic backtracking). |
+| `capture.append()` | before the `raw_events` INSERT, on metadata, `payload`, `provenance`, and recall index text | current: matched spans replaced with `[REDACTED]`; original is **not** stored for matched content; target adds redaction summary provenance/audit metadata. Fast-path cost remains bounded and deterministic. |
 | structured logs (`tracing`) | at the subscriber layer | a `tracing` `Layer` scrubs field values before formatting; token, TLS key paths, and provider credentials are on a hard denylist and are never logged even at `trace`. |
 | `export` command | while serializing memories/events | re-runs the redactor as a defense-in-depth pass even though capture already redacted; `--include-raw` (opt-in, audited) bypasses only the re-pass, never the capture-time redaction. |
 
-**Pattern set (versioned `redaction_ruleset_version` recorded in `audit_log`):**
+**Target pattern set (eventually versioned as `redaction_ruleset_version` and recorded in `audit_log`):**
 
 ```
 KIND                 PATTERN (illustrative; full set in store/redact/patterns.rs)
@@ -3839,7 +3890,7 @@ impl Redactor {
 }
 ```
 
-PII rules (`email`, `cc_pan`) are **opt-in** via `config.redaction.pii = true` because over-redaction degrades recall quality; the choice is recorded so an operator audit can see whether PII passed through. The redactor itself is a primary fuzz/property target (§17.10).
+Target PII policy: rules such as `cc_pan` should be configurable because over-redaction degrades recall quality; the choice should be recorded so an operator audit can see whether PII passed through. Current implementation redacts email-like spans by default. The redactor itself is a primary fuzz/property target (§17.10).
 
 ### 17.4 Provider Credential Storage
 
@@ -3857,7 +3908,7 @@ Provider credential rotation follows the same `setup --rotate-credential <adapte
 
 ### 17.6 Audit Logging (`audit_log`)
 
-Every mutating or security-relevant action writes an append-only `audit_log` row in the **same SQLite transaction** as the mutation it records (so the audit trail cannot diverge from state). The table is append-only by convention and enforced by an `AFTER UPDATE`/`AFTER DELETE` trigger that raises on any modification.
+Target behavior: every mutating or security-relevant action writes an append-only `audit_log` row in the **same SQLite transaction** as the mutation it records (so the audit trail cannot diverge from state). Current implementation creates the table but does not yet emit these rows. The table is append-only by convention and should be enforced by an `AFTER UPDATE`/`AFTER DELETE` trigger that raises on any modification.
 
 ```sql
 -- canonical audit_log (key per shared vocab): id, ts, actor, action, target_type, target_ref, detail
@@ -5409,8 +5460,8 @@ Recommended defaults: import `source_trust = 0.6` (live capture `= 1.0`); import
 - **Guardrail (in design).**
   - **Localhost-only bind by default; bearer token for any remote access** (H9, `gateway` §5.2) — nothing leaves the box without explicit network config.
   - **`null` and `ollama` (local) adapters exist precisely for the privacy-max posture**: a user can run fully local-embedding / no-LLM and still get lexical recall (degrade path, §5.3 path 2/A1).
-  - **Pre-send redaction in `capture`/before adapter dispatch:** a secret-pattern scrubber (high-entropy strings, known key prefixes `sk-`, `ghp_`, `AKIA`, PEM blocks) marks `raw_events.payload` regions; redacted form is what `consolidate`/`embed` send. Redaction events hit `audit_log`.
-  - `export` (CLI) honors the same redaction and records every export in `audit_log` (H8).
+  - **Current guardrail:** capture redacts matched secret material before SQLite persistence, including metadata, payload, provenance, and recall index text. Future workers should only see this redacted form by default.
+  - **Target guardrail:** provider dispatch and export re-run the same redactor as defense in depth; redaction summaries and exports are recorded in `audit_log` without storing original secret material.
 
 Recommended defaults: redaction **on by default**; default embedding adapter selection prefers a **local `ollama`** endpoint if reachable before any remote `openai_compat` (entitlement-first, H4); a `config` flag `privacy.remote_content = {full|redacted|metadata_only}` defaulting to `redacted`.
 
