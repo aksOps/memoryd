@@ -109,7 +109,10 @@ fn serve(cli: Cli) -> Result<(), CliError> {
 
     let worker_db = cfg.db_path.clone();
     let worker_caps = cfg.caps.clone();
-    std::thread::spawn(move || {
+    // Detached for M3: the worker runs for the process lifetime. Graceful shutdown
+    // (draining in-flight jobs) and consolidating onto the planned single-writer
+    // actor (ARCHITECTURE-PLAN s7.1/U5) are deferred; today it is a second writer.
+    let _worker = std::thread::spawn(move || {
         let adapter = memoryd_core::adapters::NullAdapter::new();
         let mut worker_store = match Store::open(&worker_db) {
             Ok(store) => store,
