@@ -5199,18 +5199,18 @@ pub struct BruteForce; // cosine over candidate shortlist
 |------|-------|
 | Modules | `vectorindex` (BruteForce) |
 | Tables | reads/writes `embeddings` (query-embedding cache) |
-| CLI | `recall --semantic` flag (default on when provider reachable) |
+| CLI | `recall --semantic` opt-in flag (degrades to lexical until a real embedding provider is wired) |
 
 #### Entry / Exit
 | Entry | Exit (evidence) |
 |------|------|
-| M3 embeddings exist | Semantic recall beats lexical-only on a labeled fixture (recall@10 uplift, bench) |
+| M3 embeddings exist | Semantic recall beats lexical-only on a labeled fixture (recall@1 uplift, deterministic concept test-double; `bench` harness lands in M9/§20.6) |
 | — | Cached query embedding → **no** provider call (cache-hit test); cost ledger unchanged |
 | — | Provider unreachable mid-query → automatic lexical fallback, same response shape (degrade test) |
-| — | Cosine runs over shortlist only — EXPLAIN/instrumentation shows ≤256 vectors compared |
+| — | Cosine runs over shortlist only — `RecallResult.compared` instrumentation shows ≤256 vectors compared |
 
 #### Risks retired
-C2/U1 (vector seam without external DB, H3), semantic-vs-lexical degrade proven on the live read path.
+C2/U1 (vector seam without external DB, H3), semantic-vs-lexical degrade proven on the live read path. Uplift/cache-hit/degrade/cap proven with a deterministic concept test-double (no network); real-provider rerank quality is validated when the embedding adapter is wired (deferred M3 increment).
 
 ---
 

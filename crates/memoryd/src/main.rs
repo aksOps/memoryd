@@ -1184,6 +1184,62 @@ mod tests {
     }
 
     #[test]
+    fn parses_recall_with_semantic_flag() {
+        let cli =
+            Cli::parse(["memoryd", "recall", "wal timeout", "--semantic"].map(OsString::from))
+                .expect("cli parses");
+
+        let Command::Recall(args) = cli.command else {
+            panic!("expected recall command");
+        };
+        assert_eq!(args.query, "wal timeout");
+        assert!(args.semantic, "--semantic sets the semantic flag");
+    }
+
+    #[test]
+    fn recall_with_mode_semantic_degrades_to_lexical_under_null() {
+        let path = temp_db_path("recall-with-mode-degrade");
+        {
+            let mut store = Store::open(&path).expect("store opens");
+            store
+                .capture_event(NewRawEvent {
+                    session_id: "session-1".to_string(),
+                    agent: "claude".to_string(),
+                    source: "tool_result".to_string(),
+                    kind: "observation".to_string(),
+                    payload: serde_json::json!({"text": "WAL timeout fixed"}),
+                    provenance: serde_json::json!({}),
+                    ts_ms: 1234,
+                })
+                .expect("capture succeeds");
+        }
+        let store = Store::open(&path).expect("store opens");
+
+        let args = RecallArgs {
+            query: "wal timeout".to_string(),
+            limit: 5,
+            semantic: true,
+        };
+        let result = recall_with_mode(&store, &args).expect("recall succeeds");
+
+        // The only shipped adapter is null, which self-degrades
+        // (embeds_semantically=false), so `--semantic` returns lexical-shaped results
+        // flagged degraded — no provider spend, no query embedding cached.
+        assert_eq!(result.mode, "lexical");
+        assert!(result.degraded);
+        assert_eq!(result.compared, 0);
+        assert!(
+            !result.hits.is_empty(),
+            "lexical fallback still finds the match"
+        );
+
+        let stats = store.table_stats().expect("table stats");
+        assert_eq!(table_rows(&stats, "provider_usage"), 0);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
     fn http_capture_route_persists_event_on_loopback() {
         let path = temp_db_path("http-capture");
         let cfg = Config::with_db_path(path.clone());

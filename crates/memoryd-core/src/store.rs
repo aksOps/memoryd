@@ -2,10 +2,8 @@ use crate::adapters::{ProviderAdapter, prompt_token_estimate};
 use crate::vectorindex::{Candidate, VectorIndex};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -322,6 +320,7 @@ impl Store {
 
         let candidates = self.lexical_hits(&fts_query, RECALL_CANDIDATE_CAP)?;
         if candidates.is_empty() {
+            // Semantic was attempted but nothing matched: not a degrade, just empty.
             return Ok(RecallResult {
                 hits: Vec::new(),
                 degraded: false,
@@ -357,15 +356,19 @@ impl Store {
         }
         let compared = vectors.len();
         if compared == 0 {
+            // Provider worked but no shortlisted event is embedded yet: fall back to
+            // lexical, flagged degraded like the other no-semantic-signal paths.
             let hits = self.lexical_hits(&fts_query, limit)?;
             return Ok(RecallResult {
                 hits,
-                degraded: false,
+                degraded: true,
                 mode: "lexical",
                 compared: 0,
             });
         }
 
+        // Score every candidate (k = all): fusion needs each candidate's cosine, not
+        // an ANN top-k. (M9 HNSW will revisit this integration.)
         let scored = index.search(&query_vec, &vectors, vectors.len());
         let cosine: HashMap<i64, f32> = scored.into_iter().map(|s| (s.id, s.score)).collect();
 
@@ -377,6 +380,11 @@ impl Store {
                 (lo.min(v), hi.max(v))
             });
         let span = hi - lo;
+        // Plan s9.4 weights cover a 7-term formula; M4 uses only the two active
+        // signals, so renormalize them to sum to 1.0 (fused score stays in [0, 1]).
+        let weight_sum = RECALL_W_SEM + RECALL_W_LEX;
+        let w_sem = RECALL_W_SEM / weight_sum;
+        let w_lex = RECALL_W_LEX / weight_sum;
 
         let mut fused: Vec<RecallHit> = candidates
             .into_iter()
@@ -390,7 +398,7 @@ impl Store {
                 let sem = cosine
                     .get(&hit.raw_event_id)
                     .map_or(0.0, |c| (c + 1.0) / 2.0);
-                hit.score = f64::from(RECALL_W_SEM * sem + RECALL_W_LEX * lex);
+                hit.score = f64::from(w_sem * sem + w_lex * lex);
                 hit
             })
             .collect();
@@ -432,13 +440,17 @@ impl Store {
         let Some(vector) = vectors.into_iter().next().filter(|v| !v.is_empty()) else {
             return Ok(None);
         };
-        self.store_embedding("query", &owner_id, model_id, &vector, now_ms)?;
-        self.conn.execute(
+        // Cache the embedding and its usage ledger row atomically (unchecked_transaction
+        // is the &self escape hatch; no outer transaction is held here).
+        let tx = self.conn.unchecked_transaction()?;
+        Self::store_embedding(&tx, "query", &owner_id, model_id, &vector, now_ms)?;
+        tx.execute(
             "INSERT INTO provider_usage
                 (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
              VALUES (?1, ?2, ?3, 'embed', ?4, 0, 0.0, NULL)",
             params![now_ms, adapter.id(), model_id, prompt_token_estimate(query)],
         )?;
+        tx.commit()?;
         Ok(Some(vector))
     }
 
@@ -461,7 +473,7 @@ impl Store {
     }
 
     fn store_embedding(
-        &self,
+        conn: &Connection,
         owner_type: &str,
         owner_id: &str,
         model_id: &str,
@@ -473,7 +485,7 @@ impl Store {
         for value in vector {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO embeddings (id, owner_type, owner_id, model_id, dim, vector, created_at)
              VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(owner_type, owner_id, model_id)
@@ -1209,9 +1221,14 @@ fn decode_f32(bytes: &[u8]) -> Vec<f32> {
 }
 
 fn query_cache_id(query: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    query.hash(&mut hasher);
-    format!("q-{:016x}", hasher.finish())
+    // FNV-1a 64-bit: stable across Rust versions/platforms (unlike DefaultHasher), so
+    // cached query embeddings keep matching after a toolchain upgrade. Cache key only.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in query.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("q-{hash:016x}")
 }
 
 fn unix_ms_now() -> i64 {
@@ -2615,15 +2632,15 @@ mod tests {
             (c, "lock report dashboard"),
         ] {
             let v = adapter.embed(&[text.to_string()]).expect("embed");
-            store
-                .store_embedding(
-                    "raw_event",
-                    &id.to_string(),
-                    adapter.model_id(),
-                    &v[0],
-                    1000,
-                )
-                .expect("store embedding");
+            Store::store_embedding(
+                &store.conn,
+                "raw_event",
+                &id.to_string(),
+                adapter.model_id(),
+                &v[0],
+                1000,
+            )
+            .expect("store embedding");
         }
 
         let lexical = store
@@ -2656,9 +2673,15 @@ mod tests {
         let seed = ConceptAdapter
             .embed(&["lock mutex".to_string()])
             .expect("embed");
-        store
-            .store_embedding("raw_event", &id.to_string(), "concept-3", &seed[0], 1000)
-            .expect("store embedding");
+        Store::store_embedding(
+            &store.conn,
+            "raw_event",
+            &id.to_string(),
+            "concept-3",
+            &seed[0],
+            1000,
+        )
+        .expect("store embedding");
 
         let adapter = CountingConceptAdapter::default();
         assert_eq!(adapter.calls(), 0);
@@ -2718,6 +2741,37 @@ mod tests {
             )
             .expect("query embedding count");
         assert_eq!(query_rows, 0, "degrade path makes no provider call");
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn semantic_recall_with_no_fts_matches_returns_empty() {
+        use crate::vectorindex::BruteForce;
+        let path = temp_db_path("recall-semantic-empty");
+        let mut store = Store::open(&path).expect("store opens");
+        capture_id(&mut store, 1000, "lock mutex");
+
+        let result = store
+            .recall_semantic("zzzznomatch", 5, &ConceptAdapter, &BruteForce, 2000)
+            .expect("semantic recall");
+
+        // Empty shortlist short-circuits before the query embedding: an attempted but
+        // empty semantic result, not a degrade.
+        assert!(result.hits.is_empty());
+        assert_eq!(result.compared, 0);
+        assert_eq!(result.mode, "semantic");
+        assert!(!result.degraded);
+
+        let query_rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM embeddings WHERE owner_type = 'query'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query embedding count");
+        assert_eq!(query_rows, 0, "empty shortlist makes no provider call");
 
         cleanup_db_files(&path);
     }
