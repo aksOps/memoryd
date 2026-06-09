@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component clippy rustfmt
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Bootstrap security tooling
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/bootstrap-security-tools.sh
+
+      - name: Dependency policy
+        run: .tools/security/bin/cargo-deny check advisories bans licenses sources
+
+      - name: Advisory audit
+        run: .tools/security/bin/cargo-audit audit --deny warnings
+
+      - name: Generate SBOM
+        run: .tools/security/bin/cargo-cyclonedx cyclonedx --manifest-path crates/memoryd/Cargo.toml --format json --override-filename bom
+
+      - name: Verify SBOM exists
+        run: test -s crates/memoryd/bom.json

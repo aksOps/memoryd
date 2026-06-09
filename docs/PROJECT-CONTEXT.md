@@ -1,0 +1,212 @@
+# Project Context: memoryd
+
+## Product Thesis
+
+`memoryd` is a clean-room Rust memory daemon for AI coding agents and personal long-term memory.
+
+It should capture useful context from agent sessions, import historic data, build durable memories, clean up noise, strengthen useful associations, run scheduled dreaming/consolidation, and return only high-value context to future agents.
+
+The system should feel like an adaptive personal memory substrate. It is not a full autonomous agent, not a heavy database stack, and not something that occupies the host machine.
+
+## Conceptual Inspirations
+
+Borrow concepts, not code:
+
+- Shodh-Memory: adaptive relevance, activation, decay, association strengthening, tiered memory, self-cleanup.
+- agentmemory: coding-agent hooks, MCP tools, cross-agent support, session capture, replayable provenance.
+- claude-mem: session compression, handoff continuity, future-session context injection.
+
+## Key Decisions
+
+- Implementation language: Rust.
+- Distribution target: single portable binary.
+- npm distribution: wrapper package around prebuilt Rust binaries is desired.
+- Use `pnpm` for Node/package-manager workflows going forward. npm remains the registry/distribution target, not the preferred local package manager.
+- Use `/mnt/gdrive/dev/memoryd/` for portable project artifacts, prompt archives, exports, benchmark artifacts, and release-adjacent files where appropriate.
+- Durable store: SQLite only.
+- Remote LLM and embeddings: supported, but remote-provider only by default.
+- No local model runtime requirement now or in the future.
+- Existing entitlements such as Ollama Pro and OpenCode-accessible LLMs may be used as provider adapters.
+- No additional pay-per-token/API spend by default.
+- No Docker requirement.
+- No Postgres.
+- Clean-room implementation only.
+
+## Required Capabilities
+
+- Remote server mode.
+- MCP interface.
+- REST API.
+- Agent hooks for Claude Code, Codex, OpenCode, Cursor, and similar tools.
+- Historic data import from Claude Code JSONL, agentmemory, claude-mem, Git history, notes, and chat exports.
+- Dreaming/consolidation feature.
+- Batched remote embeddings.
+- Batched remote LLM summarization/reflection.
+- No-additional-cost LLM mode using existing subscriptions/entitlements such as Ollama Pro and OpenCode-accessible models.
+- Adaptive relevance scoring.
+- Decay and cleanup of unnecessary information.
+- Deduplication and merge of repeated memories.
+- User profile / "how I think" model.
+- Approval workflow for identity/profile changes.
+- Secret redaction and privacy filtering.
+- Audit trail and provenance.
+- Export/import portable snapshots.
+- Small-VM resource governor.
+- Plugin architecture for optional future extensions, especially provider adapters and in-process/local embeddings, while keeping the default build remote-only and lightweight.
+- Benchmark harness with LongMemEval-S-style retrieval evaluation.
+- Security model with authentication, authorization, least-privilege defaults, dependency auditing, CVE scanning, SBOM generation, and release gates that block known unresolved critical/high vulnerabilities.
+- Maintainability plan with small modules, clear interfaces, tests, docs, upgrade policy, dependency policy, and architectural decision records.
+
+## Resource Invariants
+
+The daemon must never grow out of proportion. It is a helper daemon, not a second agent runtime.
+
+Design around:
+
+- Bounded queues.
+- Bounded workers.
+- Bounded memory.
+- Bounded CPU usage.
+- Bounded dream runtime.
+- Batch sizes for embeddings and LLM calls.
+- Backpressure behavior.
+- Idle/scheduled background processing.
+- Fast capture path that only appends minimal events.
+- Heavy work always deferred to workers.
+- Graceful degradation when overloaded.
+
+Default small-VM profile should assume:
+
+- One worker.
+- SQLite only.
+- Remote LLM calls batched.
+- Remote embedding calls batched.
+- Dreaming scheduled, not continuous.
+- Cleanup incremental.
+- Recall fast and always available.
+- No full database scans during normal operation.
+- No additional paid API spend unless explicitly configured.
+
+## Memory Lifecycle Ideas
+
+Candidate states to consider:
+
+- raw_event.
+- candidate_memory.
+- active_memory.
+- reinforced_memory.
+- stale_memory.
+- superseded_memory.
+- archived_memory.
+- rejected_memory.
+
+Profile and identity changes should require approval. Low-risk cleanup can be automatic only when confidence is high and provenance is retained.
+
+## Dreaming Requirements
+
+Dreaming means scheduled/idle consolidation, not autonomous agency.
+
+It should:
+
+- Replay recent events and sessions.
+- Cluster related memories.
+- Extract durable patterns and preferences.
+- Strengthen useful links.
+- Decay stale/noisy memories.
+- Merge duplicates.
+- Generate a dream journal.
+- Queue uncertain inferences for approval.
+- Respect strict runtime and provider budgets.
+
+## Historic Import Requirements
+
+Import should support:
+
+- Claude Code JSONL.
+- agentmemory export/API.
+- claude-mem export/db.
+- Git history.
+- Markdown/Obsidian notes.
+- ChatGPT/Claude exports.
+- Generic JSONL.
+
+Imported data should be staged as low-confidence candidate memories first. Dream/consolidation may promote it, but identity/profile updates require approval.
+
+## Provider Strategy
+
+Remote provider adapters should support:
+
+- Remote embeddings.
+- Remote LLM summarization/reflection.
+- Ollama Pro or Ollama-compatible hosted endpoint.
+- OpenCode-accessible models.
+- OpenAI-compatible providers.
+- Cached fixture providers for tests and benchmarks.
+
+Strict spend guards are required:
+
+- No new paid APIs enabled by default.
+- Max calls per minute.
+- Max tokens per job.
+- Daily usage budget.
+- Provider dry-run.
+- Provider usage logging.
+
+## Benchmark Plan Ideas
+
+Benchmarks to consider:
+
+- LongMemEval-S-style retrieval evaluation.
+- LoCoMo-style long conversation memory.
+- LaMP-style personalization/profile evaluation.
+- BEIR/MTEB small retrieval subsets.
+- HotpotQA or MuSiQue multi-hop retrieval subset.
+- Synthetic small-VM stress tests.
+- Import/dream throughput tests.
+- Idle CPU/RAM tests.
+
+Metrics should include:
+
+- R@5.
+- R@10.
+- MRR.
+- p50/p95 recall latency.
+- Ingest throughput.
+- Dream runtime.
+- Queue delay.
+- Memory footprint.
+- Disk growth.
+- Provider call count.
+- Provider token usage.
+
+Benchmark modes should include:
+
+- Free-only retrieval mode.
+- Cached embedding fixture mode.
+- No-additional-cost LLM judge mode using existing entitlements.
+- Provider-backed mode with explicit budget.
+
+## Security And Maintainability Requirements
+
+- Localhost-only bind by default.
+- Auth required for non-loopback remote access.
+- Secret redaction before persistence and provider calls where possible.
+- Secure provider credential storage.
+- Audit logging for writes, imports, dreams, approvals, deletes, and provider calls.
+- Dependency policy for Rust crates and npm wrapper packages.
+- CVE/advisory scanning in CI and release workflows.
+- Release gates blocking known unresolved critical/high vulnerabilities.
+- SBOM generation for release artifacts.
+- License policy for dependencies.
+- Supply-chain controls for npm binary packages and GitHub Releases.
+- Plugin safety boundaries.
+- Fuzz/property tests for parsers, importers, and redactors where appropriate.
+- Small modules, clear interfaces, docs, test coverage, ADRs, and upgrade workflow.
+
+Possible tools: `cargo audit`, `cargo deny`, OSV-Scanner, `gitleaks`, `npm audit`, SBOM generation, release checksums/signatures.
+
+## Artifact Locations
+
+- Local working project: `/home/dev/projects/memoryd`.
+- Google Drive artifact root: `/mnt/gdrive/dev/memoryd`.
+- Planning prompts: `/mnt/gdrive/dev/memoryd/prompts`.

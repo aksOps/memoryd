@@ -1,0 +1,46 @@
+Dynamic Plan Launcher Prompt: Clean-Room Rust Memory Daemon
+
+Use this with Opus 4.8 on high/xhigh reasoning in dynamic planning mode.
+
+Use the project context and the intended detailed plan brief as the source material.
+
+Do not write code. Do not propose implementation shortcuts that violate the constraints. Your job is to produce an implementation-ready architecture and milestone plan.
+
+First, restate the problem and identify any conflicting requirements. If critical information is missing, ask only the minimum necessary clarification questions. Otherwise proceed.
+
+Preserve these hard constraints:
+
+- Rust clean-room implementation.
+- No fork or source copying from Shodh-Memory, agentmemory, or claude-mem.
+- No Docker.
+- No Postgres.
+- SQLite-only durable store.
+- Remote LLM and remote embeddings only by default.
+- Existing Ollama Pro/OpenCode LLM access may be used, but no additional paid API spend by default.
+- Small-VM helper daemon, not a second agent runtime.
+- All expensive work must be queued, batched, bounded, and resource-governed.
+- Security, CVE avoidance, SBOM, dependency auditing, and maintainability are first-class requirements.
+
+Produce the full detailed plan, including:
+
+- Architecture options.
+- Recommended architecture.
+- Core modules.
+- SQLite schema.
+- Memory lifecycle.
+- Relevance, decay, and cleanup model.
+- Dreaming workflow.
+- Historic import workflow.
+- Remote provider strategy.
+- Plugin architecture.
+- MCP, REST, and CLI surfaces.
+- LongMemEval-S-style and related benchmark plan.
+- npm distribution strategy.
+- Security, CVE, and supply-chain controls.
+- Maintainability plan.
+- Small-VM resource profile.
+- MVP definition.
+- Milestone roadmap.
+- Risks and open questions.
+
+Be opinionated. Prefer simple, durable architecture over trendy complexity. Keep the daemon helper-sized.

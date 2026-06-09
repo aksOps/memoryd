@@ -1,0 +1,13 @@
+[package]
+name = "memoryd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+memoryd-core = { path = "../memoryd-core", version = "0.1.0" }
+serde_json = { version = "1.0.150", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true
