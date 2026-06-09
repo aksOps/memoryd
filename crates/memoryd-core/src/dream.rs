@@ -44,7 +44,10 @@ pub const CO_OCCUR_GROUP_CAP: usize = 64;
 pub(crate) const ASSOCIATE_BATCH: usize = 500;
 /// Recall recency half-life: a hit accessed this long ago scores 0.5 on the recency term.
 const RECENCY_HALFLIFE_MS: i64 = 7 * DAY_MS;
-/// Recall-time fusion weights (ARCHITECTURE-PLAN §9.3 `[scoring.recall]`).
+/// Recall-time fusion weights (ARCHITECTURE-PLAN §9.3 `[scoring.recall]`). These sum to
+/// 0.95 by design: `lifecycle_bonus`/`provenance`/`supersession` are *additive,
+/// unweighted* terms (per §9.3), which is why `score_recall` clamps to [0, 1.45] rather
+/// than [0, 1].
 const RW_SEM: f64 = 0.34;
 const RW_LEX: f64 = 0.18;
 const RW_REC: f64 = 0.12;
