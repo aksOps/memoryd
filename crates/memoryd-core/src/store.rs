@@ -1,4 +1,8 @@
-use crate::adapters::{ProviderAdapter, prompt_token_estimate};
+use crate::adapters::{AdapterError, ProviderAdapter, prompt_token_estimate};
+use crate::dream::{
+    ARCHIVE_GRACE_MS, DORMANT_HALVINGS, decay_score, half_life_ms, lifecycle_for, memory_kind_for,
+    next_decay_at, normalize, score_base, trust_for_source,
+};
 use crate::import::{ImportError, ImportSummary, ImportUnit, content_hash, parse_jsonl};
 use crate::vectorindex::{Candidate, VectorIndex};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -8,7 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub const CANONICAL_TABLES: [&str; 13] = [
     "sessions",
@@ -477,6 +481,275 @@ impl Store {
             skipped: usize::try_from(skipped).unwrap_or(0),
             state,
         })
+    }
+
+    /// Open a new `dream_runs` row in the `running` state; returns its id.
+    pub fn create_dream_run(&self, trigger: &str, now_ms: i64) -> Result<String, StoreError> {
+        let id: String = self.conn.query_row(
+            "INSERT INTO dream_runs (id, trigger, started_at, status)
+             VALUES (lower(hex(randomblob(16))), ?1, ?2, 'running')
+             RETURNING id",
+            params![trigger, now_ms],
+            |row| row.get(0),
+        )?;
+        Ok(id)
+    }
+
+    /// Finalize a `dream_runs` row with its accounting and terminal status.
+    pub fn finish_dream_run(
+        &self,
+        run_id: &str,
+        finished_at: i64,
+        jobs_run: i64,
+        memories_touched: i64,
+        tokens_used: i64,
+        status: &str,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE dream_runs SET finished_at = ?1, jobs_run = ?2, memories_touched = ?3,
+                tokens_used = ?4, status = ?5 WHERE id = ?6",
+            params![
+                finished_at,
+                jobs_run,
+                memories_touched,
+                tokens_used,
+                status,
+                run_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Consolidate up to `limit` pending `raw_events` into durable `memories`.
+    ///
+    /// Exact-normalized-text duplicates within the batch collapse into one memory
+    /// (lexical dedup-cluster); each new memory gets an immutable `memory_versions` v1
+    /// citing its source raw_event ids. The LLM summary is used only when a metered
+    /// adapter is configured *and* the per-run spend stays within `budget_usd`;
+    /// otherwise a deterministic lexical representative is used (the shipped `null`
+    /// adapter always takes that path). The whole batch commits in one transaction, so
+    /// a wall-clock cut between batches never leaves a half-consolidated cluster.
+    pub(crate) fn consolidate_pending<A: ProviderAdapter>(
+        &mut self,
+        adapter: &A,
+        budget_usd: f64,
+        window_spend: &mut f64,
+        run_id: &str,
+        limit: usize,
+        now_ms: i64,
+    ) -> Result<ConsolidateBatch, StoreError> {
+        let limit_i = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows: Vec<(i64, String, String, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, payload, source, kind FROM raw_events
+                 WHERE consolidated_at IS NULL ORDER BY id LIMIT ?1",
+            )?;
+            let mapped = stmt.query_map(params![limit_i], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        if rows.is_empty() {
+            return Ok(ConsolidateBatch {
+                memories_created: 0,
+                raw_consumed: 0,
+                tokens: 0,
+                budget_hit: false,
+            });
+        }
+        let raw_consumed = rows.len();
+
+        // Cluster by normalized text, preserving first-seen order for determinism.
+        let mut order: Vec<String> = Vec::new();
+        let mut clusters: HashMap<String, Cluster> = HashMap::new();
+        for (id, payload, source, kind) in rows {
+            let text = raw_event_text(&payload);
+            let key = normalize(&text);
+            let entry = clusters.entry(key.clone()).or_insert_with(|| {
+                order.push(key.clone());
+                Cluster {
+                    text: text.clone(),
+                    source: source.clone(),
+                    kind: kind.clone(),
+                    ids: Vec::new(),
+                }
+            });
+            entry.ids.push(id);
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut memories_created = 0usize;
+        let mut tokens = 0i64;
+        let mut budget_hit = false;
+        for key in &order {
+            let cluster = &clusters[key];
+            let price = adapter.usd_per_1k_prompt_tokens();
+            let tokens_est = prompt_token_estimate(&cluster.text);
+            let content = if price > 0.0 {
+                let est_cost = tokens_est as f64 / 1000.0 * price;
+                if *window_spend + est_cost <= budget_usd {
+                    match adapter.summarize(std::slice::from_ref(&cluster.text))? {
+                        Some(summary) => {
+                            tx.execute(
+                                "INSERT INTO provider_usage
+                                    (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
+                                 VALUES (?1, ?2, ?3, 'complete', ?4, 0, ?5, NULL)",
+                                params![now_ms, adapter.id(), adapter.model_id(), tokens_est, est_cost],
+                            )?;
+                            *window_spend += est_cost;
+                            tokens += tokens_est;
+                            summary
+                        }
+                        None => cluster.text.clone(),
+                    }
+                } else {
+                    // Spend cap would be exceeded: degrade this and subsequent clusters.
+                    budget_hit = true;
+                    cluster.text.clone()
+                }
+            } else {
+                // Free / null adapter: try summarize (None for null), no spend impact.
+                adapter
+                    .summarize(std::slice::from_ref(&cluster.text))?
+                    .unwrap_or_else(|| cluster.text.clone())
+            };
+
+            let mem_kind = memory_kind_for(&cluster.kind);
+            let trust = trust_for_source(&cluster.source, &cluster.kind);
+            let decay_at = half_life_ms(mem_kind).map(|hl| now_ms + hl * DORMANT_HALVINGS);
+            let base = score_base(1.0, 0, trust, "active");
+            let ids_csv = cluster
+                .ids
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let reason = format!("consolidate:dedup-cluster raw_events=[{ids_csv}]");
+
+            let mem_id: String =
+                tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+            let ver_id: String =
+                tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+            tx.execute(
+                "INSERT INTO memories
+                    (id, current_version_id, kind, content, lifecycle_state, relevance_score,
+                     last_accessed_at, access_count, decay_at, created_at,
+                     source_trust, decay_score, decay_recomputed_at)
+                 VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, 0, ?7, ?6, ?8, 1.0, ?6)",
+                params![
+                    mem_id, ver_id, mem_kind, content, base, now_ms, decay_at, trust
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO memory_versions
+                    (id, memory_id, version_no, content, reason, created_by_job, created_at)
+                 VALUES (?1, ?2, 1, ?3, ?4, NULL, ?5)",
+                params![ver_id, mem_id, content, reason, now_ms],
+            )?;
+            let detail = serde_json::to_string(&serde_json::json!({
+                "dream_run": run_id,
+                "kind": mem_kind,
+                "raw_events": cluster.ids.len(),
+            }))?;
+            insert_audit_log(
+                &tx,
+                AUDIT_ACTOR,
+                "consolidate",
+                "memory",
+                Some(mem_id.as_str()),
+                Some(detail.as_str()),
+                now_ms,
+            )?;
+            for id in &cluster.ids {
+                tx.execute(
+                    "UPDATE raw_events SET consolidated_at = ?1 WHERE id = ?2",
+                    params![now_ms, id],
+                )?;
+            }
+            memories_created += 1;
+        }
+        tx.commit()?;
+        Ok(ConsolidateBatch {
+            memories_created,
+            raw_consumed,
+            tokens,
+            budget_hit,
+        })
+    }
+
+    /// Recompute decay + lifecycle for up to `limit` *due* memories (those whose
+    /// `decay_at` checkpoint has passed), scan-free via `memories_decay_due`. State is
+    /// a pure function of age, so access (which resets `last_accessed_at`) revives a
+    /// memory on the next pass; `decay_at` is advanced to the next transition so a row
+    /// is never re-selected within a run. One transaction per batch.
+    pub(crate) fn decay_due(
+        &mut self,
+        limit: usize,
+        now_ms: i64,
+    ) -> Result<DecayBatch, StoreError> {
+        let limit_i = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows: Vec<(String, String, i64, i64, f64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, kind, COALESCE(last_accessed_at, created_at), access_count, source_trust
+                 FROM memories
+                 WHERE lifecycle_state IN ('active', 'associated', 'decaying', 'dormant')
+                   AND decay_at IS NOT NULL AND decay_at <= ?1
+                 ORDER BY decay_at ASC LIMIT ?2",
+            )?;
+            let mapped = stmt.query_map(params![now_ms, limit_i], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, f64>(4)?,
+                ))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        if rows.is_empty() {
+            return Ok(DecayBatch { touched: 0 });
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut touched = 0usize;
+        for (id, kind, last_accessed, access_count, trust) in &rows {
+            let Some(hl) = half_life_ms(kind) else {
+                continue;
+            };
+            let dt = now_ms - *last_accessed;
+            let score = decay_score(dt, hl);
+            let state = lifecycle_for(score, dt, hl, ARCHIVE_GRACE_MS);
+            let new_decay_at = next_decay_at(state, *last_accessed, hl, ARCHIVE_GRACE_MS);
+            let base = score_base(score, *access_count, *trust, state);
+            tx.execute(
+                "UPDATE memories SET decay_score = ?1, relevance_score = ?2, lifecycle_state = ?3,
+                    decay_at = ?4, decay_recomputed_at = ?5 WHERE id = ?6",
+                params![score, base, state, new_decay_at, now_ms, id],
+            )?;
+            touched += 1;
+        }
+        let detail = serde_json::to_string(&serde_json::json!({ "memories_touched": touched }))?;
+        insert_audit_log(
+            &tx,
+            AUDIT_ACTOR,
+            "decay",
+            "memory",
+            None,
+            Some(detail.as_str()),
+            now_ms,
+        )?;
+        tx.commit()?;
+        Ok(DecayBatch { touched })
     }
 
     pub fn doctor_report(&self) -> Result<DoctorReport, StoreError> {
@@ -1069,6 +1342,7 @@ pub enum StoreError {
     InvalidCaptureField(&'static str),
     InvalidRecallQuery,
     Import(String),
+    Adapter(String),
 }
 
 impl fmt::Display for StoreError {
@@ -1082,6 +1356,7 @@ impl fmt::Display for StoreError {
             }
             Self::InvalidRecallQuery => write!(f, "recall query must contain searchable text"),
             Self::Import(msg) => write!(f, "import error: {msg}"),
+            Self::Adapter(msg) => write!(f, "provider adapter error: {msg}"),
         }
     }
 }
@@ -1091,6 +1366,12 @@ impl std::error::Error for StoreError {}
 impl From<ImportError> for StoreError {
     fn from(err: ImportError) -> Self {
         Self::Import(err.to_string())
+    }
+}
+
+impl From<AdapterError> for StoreError {
+    fn from(err: AdapterError) -> Self {
+        Self::Adapter(err.to_string())
     }
 }
 
@@ -1605,6 +1886,24 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
         )?;
     }
 
+    let applied_0004 = tx
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [4],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+
+    if !applied_0004 {
+        tx.execute_batch(MIGRATION_0004)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (?1, ?2, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
+            (4, "0004_memory_decay_and_consolidation"),
+        )?;
+    }
+
     tx.commit()?;
     Ok(())
 }
@@ -1834,11 +2133,55 @@ enum StageOutcome {
     Paused,
 }
 
+/// Counts from one consolidation batch (one transaction over a bounded raw_event slice).
+pub struct ConsolidateBatch {
+    pub memories_created: usize,
+    pub raw_consumed: usize,
+    pub tokens: i64,
+    pub budget_hit: bool,
+}
+
+/// Counts from one decay batch.
+pub struct DecayBatch {
+    pub touched: usize,
+}
+
+/// A dedup-cluster of raw_events sharing the same normalized text.
+struct Cluster {
+    text: String,
+    source: String,
+    kind: String,
+    ids: Vec<i64>,
+}
+
+/// Extract the consolidatable text from a raw_event payload (`text` field, else the
+/// raw payload JSON).
+fn raw_event_text(payload: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| payload.to_string())
+}
+
 // Staging-dedup key for imported rows (ARCHITECTURE-PLAN s11.6). NULL for native
 // captures; the partial unique index makes re-import a no-op for seen content.
 const MIGRATION_0003: &str = r#"
 ALTER TABLE raw_events ADD COLUMN content_hash BLOB;
 CREATE UNIQUE INDEX ux_raw_import_hash ON raw_events(content_hash) WHERE kind = 'import';
+"#;
+
+// M6 decay/consolidation columns (ARCHITECTURE-PLAN s9.1) + the consolidation cursor.
+const MIGRATION_0004: &str = r#"
+ALTER TABLE memories ADD COLUMN source_trust REAL NOT NULL DEFAULT 0.5;
+ALTER TABLE memories ADD COLUMN decay_score REAL NOT NULL DEFAULT 1.0;
+ALTER TABLE memories ADD COLUMN decay_recomputed_at INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE raw_events ADD COLUMN consolidated_at INTEGER;
+CREATE INDEX raw_events_unconsolidated ON raw_events(id) WHERE consolidated_at IS NULL;
 "#;
 
 #[cfg(test)]
@@ -2924,6 +3267,432 @@ mod tests {
             .capture_event(test_event_with_text("s", ts, text))
             .expect("capture succeeds")
             .raw_event_id
+    }
+
+    /// Deterministic metered LLM test-double: summarizes to a fixed string and reports
+    /// a nonzero per-token price so the dream spend cap can be exercised offline.
+    struct SummarizingAdapter;
+    impl crate::adapters::ProviderAdapter for SummarizingAdapter {
+        fn id(&self) -> &'static str {
+            "openai_compat"
+        }
+        fn model_id(&self) -> &str {
+            "stub-llm"
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, crate::adapters::AdapterError> {
+            Ok(texts.iter().map(|_| vec![0.0f32]).collect())
+        }
+        fn reachable(&self) -> bool {
+            true
+        }
+        fn summarize(
+            &self,
+            texts: &[String],
+        ) -> Result<Option<String>, crate::adapters::AdapterError> {
+            Ok(Some(format!("summary:{}", texts.join("|"))))
+        }
+        fn usd_per_1k_prompt_tokens(&self) -> f64 {
+            1.0
+        }
+    }
+
+    fn seed_memory(
+        store: &Store,
+        id: &str,
+        kind: &str,
+        last_accessed: i64,
+        decay_at: i64,
+        state: &str,
+    ) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO memories
+                    (id, kind, content, lifecycle_state, relevance_score, last_accessed_at,
+                     access_count, decay_at, created_at, source_trust, decay_score, decay_recomputed_at)
+                 VALUES (?1, ?2, ?3, ?4, 0.5, ?5, 0, ?6, ?5, 0.5, 1.0, 0)",
+                params![id, kind, format!("content {id}"), state, last_accessed, decay_at],
+            )
+            .expect("seed memory");
+    }
+
+    #[test]
+    fn consolidate_dedup_clusters_duplicate_raw_events() {
+        use crate::adapters::NullAdapter;
+        use crate::dream::{DreamOptions, dream_once};
+        let path = temp_db_path("dream-consolidate");
+        let mut store = Store::open(&path).expect("store opens");
+        capture_id(&mut store, 1000, "wal busy_timeout fix");
+        capture_id(&mut store, 1001, "wal busy_timeout fix"); // duplicate text
+        capture_id(&mut store, 1002, "vacuum schedule");
+
+        let now = 2_000_000_000_000i64;
+        let opts = DreamOptions {
+            trigger: "manual",
+            budget_usd: 0.0,
+            max_seconds: 60,
+        };
+        let outcome = dream_once(
+            &mut store,
+            &NullAdapter::new(),
+            &crate::config::Caps::small(),
+            &opts,
+            &|| now,
+        )
+        .expect("dream runs");
+
+        assert_eq!(
+            outcome.consolidated, 2,
+            "two distinct texts collapse to two memories"
+        );
+        assert_eq!(outcome.status, "completed");
+        let mems: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mems, 2);
+        let vers: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_versions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vers, 2, "one immutable v1 per memory");
+        let pending: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM raw_events WHERE consolidated_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0, "all raw_events consumed");
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn consolidate_with_llm_records_tokens_and_provider_usage() {
+        use crate::dream::{DreamOptions, dream_once};
+        let path = temp_db_path("dream-llm");
+        let mut store = Store::open(&path).expect("store opens");
+        capture_id(&mut store, 1000, "first event text");
+        capture_id(&mut store, 1001, "second event text");
+
+        let now = 2_000_000_000_000i64;
+        let opts = DreamOptions {
+            trigger: "manual",
+            budget_usd: 1000.0,
+            max_seconds: 60,
+        };
+        let outcome = dream_once(
+            &mut store,
+            &SummarizingAdapter,
+            &crate::config::Caps::small(),
+            &opts,
+            &|| now,
+        )
+        .expect("dream runs");
+
+        assert_eq!(outcome.consolidated, 2);
+        assert!(outcome.tokens_used > 0, "LLM summarize recorded tokens");
+        assert_eq!(outcome.status, "completed");
+        let content: String = store
+            .conn
+            .query_row(
+                "SELECT content FROM memories ORDER BY created_at, id LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            content.starts_with("summary:"),
+            "memory body is the LLM stub summary, got {content}"
+        );
+        let usage: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM provider_usage WHERE op = 'complete'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(usage, 2, "one complete-usage row per cluster");
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn spend_cap_degrades_consolidation_to_lexical() {
+        use crate::dream::{DreamOptions, dream_once};
+        let path = temp_db_path("dream-budget");
+        let mut store = Store::open(&path).expect("store opens");
+        capture_id(&mut store, 1000, "alpha alpha alpha");
+        capture_id(&mut store, 1001, "beta beta beta");
+        capture_id(&mut store, 1002, "gamma gamma gamma");
+
+        let now = 2_000_000_000_000i64;
+        // Budget allows roughly one cluster's summarize; the rest must degrade to lexical.
+        let budget = 0.005;
+        let opts = DreamOptions {
+            trigger: "manual",
+            budget_usd: budget,
+            max_seconds: 60,
+        };
+        let outcome = dream_once(
+            &mut store,
+            &SummarizingAdapter,
+            &crate::config::Caps::small(),
+            &opts,
+            &|| now,
+        )
+        .expect("dream runs");
+
+        assert_eq!(
+            outcome.consolidated, 3,
+            "all clusters consolidated (some lexically)"
+        );
+        assert_eq!(outcome.status, "budget_capped");
+        let spend: f64 = store
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(est_cost), 0) FROM provider_usage",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            spend <= budget + 1e-12,
+            "provider spend stays within the cap, got {spend}"
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn dream_wallclock_cap_stops_with_partial() {
+        use crate::adapters::NullAdapter;
+        use crate::dream::{DreamOptions, dream_once};
+        use std::cell::Cell;
+        let path = temp_db_path("dream-wallclock");
+        let mut store = Store::open(&path).expect("store opens");
+        for i in 0..5 {
+            capture_id(&mut store, 1000 + i, &format!("event number {i}"));
+        }
+        // Each clock read advances 10s; max_seconds=5 -> the deadline trips immediately.
+        let t = Cell::new(1_000_000i64);
+        let clock = || {
+            let v = t.get();
+            t.set(v + 10_000);
+            v
+        };
+        let opts = DreamOptions {
+            trigger: "manual",
+            budget_usd: 0.0,
+            max_seconds: 5,
+        };
+        let outcome = dream_once(
+            &mut store,
+            &NullAdapter::new(),
+            &crate::config::Caps::small(),
+            &opts,
+            &clock,
+        )
+        .expect("dream runs");
+
+        assert_eq!(outcome.status, "partial");
+        let pending: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM raw_events WHERE consolidated_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(pending > 0, "wall-clock cap leaves work for the next run");
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn decay_transitions_follow_canonical_order_over_due_rows() {
+        let path = temp_db_path("dream-decay");
+        let store = Store::open(&path).expect("store opens");
+        let hl = 14 * 86_400_000i64; // observation half-life
+        let now = 100 * 86_400_000i64;
+        seed_memory(
+            &store,
+            "m_active",
+            "observation",
+            now - hl / 2,
+            now - 1,
+            "active",
+        );
+        seed_memory(
+            &store,
+            "m_decay",
+            "observation",
+            now - hl * 3 / 2,
+            now - 1,
+            "active",
+        );
+        seed_memory(
+            &store,
+            "m_dorm",
+            "observation",
+            now - hl * 3,
+            now - 1,
+            "active",
+        );
+        seed_memory(
+            &store,
+            "m_arch",
+            "observation",
+            now - hl * 10,
+            now - 1,
+            "active",
+        );
+
+        let mut store = store;
+        let batch = store.decay_due(500, now).expect("decay runs");
+        assert_eq!(batch.touched, 4);
+        let state = |id: &str| -> String {
+            store
+                .conn
+                .query_row(
+                    "SELECT lifecycle_state FROM memories WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(state("m_active"), "active");
+        assert_eq!(state("m_decay"), "decaying");
+        assert_eq!(state("m_dorm"), "dormant");
+        assert_eq!(state("m_arch"), "archived");
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn decay_query_plan_uses_index_no_scan() {
+        let path = temp_db_path("dream-explain");
+        let store = Store::open(&path).expect("store opens");
+        let plan: Vec<String> = {
+            let mut stmt = store
+                .conn
+                .prepare(
+                    "EXPLAIN QUERY PLAN SELECT id, kind, COALESCE(last_accessed_at, created_at), \
+                     access_count, source_trust FROM memories \
+                     WHERE lifecycle_state IN ('active','associated','decaying','dormant') \
+                     AND decay_at IS NOT NULL AND decay_at <= ?1 ORDER BY decay_at ASC LIMIT ?2",
+                )
+                .unwrap();
+            stmt.query_map(params![0i64, 10i64], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let joined = plan.join(" | ");
+        assert!(
+            joined.contains("USING INDEX"),
+            "decay must use an index, got: {joined}"
+        );
+        assert!(
+            !joined.contains("SCAN"),
+            "decay must not full-scan, got: {joined}"
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn dream_run_records_accounting() {
+        use crate::adapters::NullAdapter;
+        use crate::dream::{DreamOptions, dream_once};
+        let path = temp_db_path("dream-accounting");
+        let mut store = Store::open(&path).expect("store opens");
+        capture_id(&mut store, 1000, "one");
+        capture_id(&mut store, 1001, "two");
+        let now = 2_000_000_000_000i64;
+        let opts = DreamOptions {
+            trigger: "manual",
+            budget_usd: 0.0,
+            max_seconds: 60,
+        };
+        let outcome = dream_once(
+            &mut store,
+            &NullAdapter::new(),
+            &crate::config::Caps::small(),
+            &opts,
+            &|| now,
+        )
+        .expect("dream runs");
+
+        let (trigger, touched, status, finished): (String, i64, String, Option<i64>) = store
+            .conn
+            .query_row(
+                "SELECT trigger, memories_touched, status, finished_at FROM dream_runs WHERE id = ?1",
+                params![outcome.run_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(trigger, "manual");
+        assert_eq!(touched, 2);
+        assert_eq!(status, "completed");
+        assert!(finished.is_some(), "finished_at is stamped");
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn consolidation_versions_are_immutable_through_decay() {
+        use crate::adapters::NullAdapter;
+        use crate::dream::{DreamOptions, dream_once};
+        let path = temp_db_path("dream-immutable");
+        let mut store = Store::open(&path).expect("store opens");
+        capture_id(&mut store, 1000, "durable knowledge one");
+        capture_id(&mut store, 1001, "durable knowledge two");
+        let now = 2_000_000_000_000i64;
+        let opts = DreamOptions {
+            trigger: "manual",
+            budget_usd: 0.0,
+            max_seconds: 60,
+        };
+        dream_once(
+            &mut store,
+            &NullAdapter::new(),
+            &crate::config::Caps::small(),
+            &opts,
+            &|| now,
+        )
+        .expect("dream");
+
+        let before: Vec<(String, String)> = {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT content, reason FROM memory_versions ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        // Force the memories due, then decay them.
+        store
+            .conn
+            .execute("UPDATE memories SET decay_at = 1", [])
+            .unwrap();
+        store.decay_due(500, now).expect("decay");
+
+        let after: Vec<(String, String)> = {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT content, reason FROM memory_versions ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(before.len(), 2);
+        assert_eq!(
+            before, after,
+            "decay never rewrites or adds memory_versions"
+        );
+        cleanup_db_files(&path);
     }
 
     fn temp_jsonl(name: &str, lines: &[&str]) -> PathBuf {

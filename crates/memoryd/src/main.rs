@@ -14,6 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAX_HTTP_LINE_BYTES: usize = 8 * 1024;
 const MAX_HTTP_HEADERS: usize = 64;
 const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
+/// How often the `serve` dream scheduler runs a consolidate+decay pass.
+const DREAM_INTERVAL_SECS: u64 = 300;
 
 fn main() -> ExitCode {
     match run(env::args_os()) {
@@ -34,6 +36,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
         Command::Remember(args) => remember(cli, args),
         Command::Recall(args) => recall(cli, args),
         Command::Import(args) => import(cli, args),
+        Command::Dream(args) => dream(cli, args),
         Command::Help => {
             print_help();
             Ok(())
@@ -130,6 +133,26 @@ fn import(cli: Cli, args: ImportArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Run one dream pass now: consolidate pending raw_events into durable memories and
+/// decay due memories, under the wall-clock + spend caps (overridable via flags). The
+/// shipped `null` adapter consolidates lexically with no spend.
+fn dream(cli: Cli, args: DreamArgs) -> Result<(), CliError> {
+    let cfg = cli.config()?;
+    cfg.validate()?;
+
+    let mut store = Store::open(&cfg.db_path)?;
+    let adapter = memoryd_core::adapters::NullAdapter::new();
+    let opts = memoryd_core::dream::DreamOptions {
+        trigger: "manual",
+        budget_usd: args.budget_usd.unwrap_or(cfg.caps.paid_spend_cap_usd),
+        max_seconds: args.max_seconds.unwrap_or(cfg.caps.dream_wallclock_secs),
+    };
+    let outcome =
+        memoryd_core::dream::dream_once(&mut store, &adapter, &cfg.caps, &opts, &|| unix_ms_now())?;
+    println!("{}", dream_response_json(&outcome)?);
+    Ok(())
+}
+
 /// Run semantic recall when requested, else lexical. Only the no-spend `null`
 /// adapter ships today, and it self-degrades to lexical (`embeds_semantically`
 /// is false), so `--semantic` is safe by default; a configured non-`null` embedding
@@ -179,11 +202,46 @@ fn serve(cli: Cli) -> Result<(), CliError> {
         }
     });
 
+    let dream_db = cfg.db_path.clone();
+    let dream_caps = cfg.caps.clone();
+    // M6: a second governed background loop runs a dream pass on an interval
+    // (consolidate + decay), capped by dream_wallclock_secs + paid_spend_cap_usd. Like
+    // the embed worker it is a detached writer for now (the single-writer actor is
+    // deferred, ARCHITECTURE-PLAN s7.1/U5).
+    let _dream_worker = std::thread::spawn(move || {
+        let adapter = memoryd_core::adapters::NullAdapter::new();
+        let mut dream_store = match Store::open(&dream_db) {
+            Ok(store) => store,
+            Err(err) => {
+                eprintln!("memoryd: dream store open failed: {err}");
+                return;
+            }
+        };
+        let opts = memoryd_core::dream::DreamOptions {
+            trigger: "scheduled",
+            budget_usd: dream_caps.paid_spend_cap_usd,
+            max_seconds: dream_caps.dream_wallclock_secs,
+        };
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(DREAM_INTERVAL_SECS));
+            if let Err(err) = memoryd_core::dream::dream_once(
+                &mut dream_store,
+                &adapter,
+                &dream_caps,
+                &opts,
+                &|| unix_ms_now(),
+            ) {
+                eprintln!("memoryd: dream tick failed: {err}");
+            }
+        }
+    });
+
     let listener = TcpListener::bind(cfg.bind)?;
     println!("memoryd serve");
     println!("bind: {}", cfg.bind);
     println!("db_path: {}", cfg.db_path.display());
     println!("worker: embed (null adapter)");
+    println!("dream: scheduled every {DREAM_INTERVAL_SECS}s");
 
     for stream in listener.incoming() {
         match stream {
@@ -199,7 +257,7 @@ fn serve(cli: Cli) -> Result<(), CliError> {
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Command {
     Doctor,
     Stats,
@@ -207,6 +265,7 @@ enum Command {
     Remember(RememberArgs),
     Recall(RecallArgs),
     Import(ImportArgs),
+    Dream(DreamArgs),
     Help,
 }
 
@@ -263,6 +322,12 @@ impl Default for ImportArgs {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+struct DreamArgs {
+    budget_usd: Option<f64>,
+    max_seconds: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 struct Cli {
     command: Command,
@@ -284,6 +349,7 @@ impl Cli {
                 "remember" => Command::Remember(RememberArgs::default()),
                 "recall" => Command::Recall(RecallArgs::default()),
                 "import" => Command::Import(ImportArgs::default()),
+                "dream" => Command::Dream(DreamArgs::default()),
                 "--help" | "-h" | "help" => Command::Help,
                 other => return Err(CliError::UnknownCommand(other.to_string())),
             },
@@ -337,6 +403,29 @@ impl Cli {
                         return Err(CliError::UnknownFlag(token));
                     };
                     import.path = next_string(&mut args, "--path")?;
+                }
+                "--budget-usd" => {
+                    let Command::Dream(dream) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    let value = next_string(&mut args, "--budget-usd")?;
+                    dream.budget_usd = Some(value.parse::<f64>().map_err(|_| {
+                        CliError::InvalidNumberFlag("--budget-usd", value.to_string())
+                    })?);
+                }
+                "--max-seconds" => {
+                    let Command::Dream(dream) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    let value = next_string(&mut args, "--max-seconds")?;
+                    dream.max_seconds = Some(value.parse::<u64>().map_err(|_| {
+                        CliError::InvalidNumberFlag("--max-seconds", value.to_string())
+                    })?);
+                }
+                "--now" => {
+                    if !matches!(command, Command::Dream(_)) {
+                        return Err(CliError::UnknownFlag(token));
+                    }
                 }
                 "--tags" => {
                     let Command::Remember(remember) = &mut command else {
@@ -489,6 +578,7 @@ fn print_help() {
             memoryd remember <content> [--kind <kind>] [--session <id>] [--source <source>] [--tags <a,b>] [--db <path>]\n\
             memoryd recall <query> [--k <limit>] [--semantic] [--db <path>]\n\
             memoryd import --source jsonl --path <file> [--db <path>]\n\
+            memoryd dream [--now] [--budget-usd <n>] [--max-seconds <n>] [--db <path>]\n\
             memoryd serve [--db <path>] [--bind <addr:port>] [--token <token>]\n\n\
           Defaults:\n\
             bind: {DEFAULT_BIND}\n\
@@ -583,6 +673,16 @@ fn remember_event(args: RememberArgs) -> NewRawEvent {
         }),
         ts_ms: unix_ms_now(),
     }
+}
+
+fn dream_response_json(outcome: &memoryd_core::dream::DreamOutcome) -> Result<String, CliError> {
+    Ok(serde_json::to_string(&serde_json::json!({
+        "run_id": outcome.run_id,
+        "consolidated": outcome.consolidated,
+        "decayed": outcome.decayed,
+        "tokens_used": outcome.tokens_used,
+        "status": outcome.status,
+    }))?)
 }
 
 fn import_response_json(summary: &memoryd_core::import::ImportSummary) -> Result<String, CliError> {
@@ -1368,6 +1468,75 @@ mod tests {
 
         let _ = fs::remove_file(&src);
         cleanup_db_files(&db);
+    }
+
+    #[test]
+    fn parses_dream_with_flags() {
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "dream",
+                "--now",
+                "--budget-usd",
+                "2.5",
+                "--max-seconds",
+                "30",
+            ]
+            .map(OsString::from),
+        )
+        .expect("cli parses");
+        let Command::Dream(args) = cli.command else {
+            panic!("expected dream command");
+        };
+        assert_eq!(args.budget_usd, Some(2.5));
+        assert_eq!(args.max_seconds, Some(30));
+    }
+
+    #[test]
+    fn dream_command_consolidates_captured_events() {
+        let path = temp_db_path("dream-command");
+        {
+            let mut store = Store::open(&path).expect("store opens");
+            for (i, text) in ["wal fix", "wal fix", "vacuum schedule"].iter().enumerate() {
+                store
+                    .capture_event(NewRawEvent {
+                        session_id: "s1".to_string(),
+                        agent: "claude".to_string(),
+                        source: "tool_result".to_string(),
+                        kind: "observation".to_string(),
+                        payload: serde_json::json!({ "text": text }),
+                        provenance: serde_json::json!({}),
+                        ts_ms: 1000 + i as i64,
+                    })
+                    .expect("capture succeeds");
+            }
+        }
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "dream",
+                "--now",
+                "--db",
+                path.to_str().expect("path is UTF-8"),
+            ]
+            .map(OsString::from),
+        )
+        .expect("cli parses");
+        let Command::Dream(args) = cli.command.clone() else {
+            panic!("expected dream command");
+        };
+
+        dream(cli, args).expect("dream succeeds");
+
+        let store = Store::open(&path).expect("store opens");
+        let stats = store.table_stats().expect("table stats");
+        assert_eq!(
+            table_rows(&stats, "memories"),
+            2,
+            "duplicate texts dedup to two memories"
+        );
+        assert_eq!(table_rows(&stats, "dream_runs"), 1);
+        cleanup_db_files(&path);
     }
 
     #[test]

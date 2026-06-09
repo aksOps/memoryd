@@ -24,6 +24,18 @@ pub trait ProviderAdapter {
     fn embeds_semantically(&self) -> bool {
         true
     }
+    /// Summarize a cluster of texts into one consolidated memory body. `None` means
+    /// the adapter has no LLM/chat capability (e.g. `null`), so the caller falls back
+    /// to a deterministic lexical representative. The default keeps consolidation
+    /// network-free and free of spend.
+    fn summarize(&self, _texts: &[String]) -> Result<Option<String>, AdapterError> {
+        Ok(None)
+    }
+    /// Price signal used to gate LLM summarization against the dream spend cap. `0.0`
+    /// (the default, and `null`) means free, so the spend cap never binds.
+    fn usd_per_1k_prompt_tokens(&self) -> f64 {
+        0.0
+    }
 }
 
 /// Deterministic, dependency-free embedding adapter for the default no-spend profile.

@@ -5259,6 +5259,27 @@ Import idempotency/resumability; provenance integrity for backfilled data; gover
 
 ### 21.9 M6 — Dream plane: consolidate + decay (capped, degradable)
 
+> **Status (2026-06-09): delivered.** `dream [--now] [--budget-usd N] [--max-seconds N]`
+> (and a periodic scheduler thread in `serve`) consolidates pending `raw_events` into
+> durable `memories` + immutable `memory_versions`, then decays due memories — under a
+> wall-clock cap (`partial` + work left for the next run) and a provider-spend cap
+> (`budget_capped`, degrade to lexical, `provider_usage` ≤ cap), with a `dream_runs`
+> accounting row. Decay selects only due rows via the `memories_decay_due` index
+> (EXPLAIN: no scan) and walks `active→decaying→dormant→archived` by §9.6 half-lives.
+> Migration 0004 adds `memories.{source_trust,decay_score,decay_recomputed_at}` and a
+> `raw_events.consolidated_at` cursor. **Decisions:** consolidation is lexical
+> *dedup-cluster* (exact-normalized-text duplicates within a batch collapse to one
+> memory); a periodic dream scheduler runs inside `serve` (per the owner's choice).
+> **Deviations (documented in code):** (1) the LLM-summary path is exercised only by a
+> deterministic metered test-double — the shipped `null` adapter always consolidates
+> lexically (no spend); cost is a flat token-estimate × price, not real provider
+> billing (deferred M3 increment). (2) `R_base` omits `graph_centrality` (lands with
+> associations, M7). (3) dedup is within a single consolidation batch (cross-batch /
+> semantic dedup is the M7 `associate`/`dedup` worker). (4) `dormant→archived` uses
+> `decay_at + ARCHIVE_GRACE` as the age proxy (no dedicated dormant-since column).
+> **Deferred:** §9.7 cleanup/purge tiers, supersession/contradiction, profile/approvals
+> (M8), and `confirmed`/`centrality`/`superseded_by` columns.
+
 #### Goal
 The thesis: scheduled/explicit consolidation of `raw_events`→durable `memories`, plus lifecycle decay — all under `dream_runs` accounting and a hard provider-spend cap, degrading to non-LLM maintenance when over budget.
 

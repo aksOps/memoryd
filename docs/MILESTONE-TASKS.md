@@ -26,9 +26,12 @@ Status legend:
 - `[x]` M5 — generic JSONL historic import is delivered and gated: idempotent by
   `content_hash`, resumable, governor-bounded, routed through the normal capture path;
   source-specific importers and distillation into `memories` are deferred (M6).
-- `[ ]` M6 and later are not started.
+- `[x]` M6 — the dream plane (consolidate dedup-cluster + decay lifecycle) is delivered
+  and gated under wall-clock + spend caps with `dream_runs` accounting and a `serve`
+  scheduler; the LLM-summary path is test-double-only and §9.7 cleanup/M7/M8 are deferred.
+- `[ ]` M7 and later are not started.
 
-Next implementation target: M6 (dream plane: consolidate and decay).
+Next implementation target: M7 (association graph + one-hop recall).
 
 ## M0 — Store Skeleton, Config, CLI Shell, Security Gate
 
@@ -262,21 +265,20 @@ Evidence: 8 `import` unit tests (parse/normalize/hash) + 5 store integration tes
 
 ## M6 — Dream Plane: Consolidate And Decay
 
-Status: `[ ]` Not started.
+Status: `[x]` Delivered. LLM-summary path test-double-only; §9.7 cleanup/M7/M8 deferred.
 
-- `[ ]` Add `dream` CLI with explicit run mode.
-- `[ ]` Add `dream_runs` creation and completion accounting.
-- `[ ]` Add wall-clock cap enforcement with partial status and requeue.
-- `[ ]` Add spend cap enforcement using `provider_usage` totals.
-- `[ ]` Add consolidate worker that creates `memories` and immutable
-  `memory_versions`.
-- `[ ]` Add lexical/dedup-only consolidation fallback when LLM budget is zero or
-  provider unavailable.
-- `[ ]` Add decay worker that touches only due rows through indexed access.
-- `[ ]` Enforce canonical lifecycle transitions for decay.
-- `[ ]` Audit dream mutations.
-- `[ ]` Add tests for wall-clock cap, spend cap, no-scan decay, and immutable
-  versions.
+- `[x]` Add `dream` CLI with explicit run mode (`dream --now [--budget-usd] [--max-seconds]`) + a periodic scheduler thread in `serve`.
+- `[x]` Add `dream_runs` creation and completion accounting (`create_dream_run`/`finish_dream_run`; jobs_run/memories_touched/tokens_used/status).
+- `[x]` Add wall-clock cap enforcement with partial status and requeue (`dream_wallclock_cap_stops_with_partial`).
+- `[x]` Add spend cap enforcement using `provider_usage` totals (`spend_cap_degrades_consolidation_to_lexical`; spend ≤ cap).
+- `[x]` Add consolidate worker that creates `memories` and immutable `memory_versions` (`consolidate_pending`).
+- `[x]` Add lexical/dedup-only consolidation fallback when LLM budget is zero or provider unavailable (default `null` path).
+- `[x]` Add decay worker that touches only due rows through indexed access (`decay_due` via `memories_decay_due`; `decay_query_plan_uses_index_no_scan`).
+- `[x]` Enforce canonical lifecycle transitions for decay (`decay_transitions_follow_canonical_order_over_due_rows`).
+- `[x]` Audit dream mutations (`consolidate`/`decay` audit_log rows).
+- `[x]` Add tests for wall-clock cap, spend cap, no-scan decay, and immutable versions (`consolidation_versions_are_immutable_through_decay`).
+
+Evidence: 6 dream unit tests (decay/lifecycle/score) + 8 store integration tests + 2 CLI tests; end-to-end `dream` smoke verified. Deviations recorded in §21.9.
 
 ## M7 — Association Graph And One-Hop Recall
 
