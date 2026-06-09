@@ -5223,8 +5223,9 @@ C2/U1 (vector seam without external DB, H3), semantic-vs-lexical degrade proven 
 > 0003); re-import skips already-seen content and `import_batches` tracks
 > `total/processed/skipped/state`. When the embed queue is full the batch
 > `state='paused'` and resumes on the next run. **Deviations from the §11 sketch (each
-> documented in code):** (1) `content_hash` is inline **FNV-1a 64-bit** (8-byte BLOB),
-> not BLAKE3 — the dependency set stays `rusqlite` + `serde_json`; (2) normalization is
+> documented in code):** (1) `content_hash` is inline **FNV-1a 64-bit** (8-byte BLOB)
+> over the normalized *redacted* text (so the dedup key matches stored content), not
+> BLAKE3 — the dependency set stays `rusqlite` + `serde_json`; (2) normalization is
 > trim + ASCII-whitespace-collapse, not NFC Unicode (would add a dep); (3) resume
 > re-scans and dedups rather than seeking the `cursor` column (simple + correct at
 > personal scale; `cursor`/`content_root_sha` left unused). **Deferred:** source-specific

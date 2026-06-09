@@ -119,7 +119,8 @@ fn normalize(text: &str) -> String {
 ///
 /// FNV-1a (not BLAKE3 as the design sketch suggested) keeps the dependency set at
 /// `rusqlite` + `serde_json`; it matches the inline hash already used for query-cache
-/// keys. Collision risk is negligible at personal-archive scale.
+/// keys. Collision risk is negligible at personal-archive scale. The caller passes the
+/// post-redaction text, so the key matches stored content and never derives from a secret.
 pub fn content_hash(source_tag: &str, text: &str) -> Vec<u8> {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut mix = |bytes: &[u8]| {
