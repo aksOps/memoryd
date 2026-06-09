@@ -114,10 +114,10 @@ fn import(cli: Cli, args: ImportArgs) -> Result<(), CliError> {
         return Err(CliError::MissingArgument("--path"));
     }
     if args.source != "jsonl" {
-        return Err(CliError::Store(StoreError::Import(format!(
-            "unsupported import source {:?}; only \"jsonl\" is supported in this build",
-            args.source
-        ))));
+        // Don't echo the user-supplied value (it could contain a pasted secret).
+        return Err(CliError::Store(StoreError::Import(
+            "unsupported import source; only \"jsonl\" is supported in this build".to_string(),
+        )));
     }
 
     let mut store = Store::open(&cfg.db_path)?;

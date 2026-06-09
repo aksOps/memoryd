@@ -215,16 +215,26 @@ impl Store {
     ///
     /// Each non-blank line becomes one `kind='import'` raw event routed through the
     /// same session / FTS / embed-queue path as native capture (no privileged path,
-    /// H7). Re-running is safe: already-staged content is skipped by `content_hash`,
-    /// so `processed` advances and the same row is never written twice. When the embed
-    /// queue is full the run *pauses* (batch left resumable) rather than dropping work.
-    /// Only `source = "jsonl"` is supported in this slice.
+    /// H7). Re-running is safe: already-seen content is skipped by `content_hash`, so
+    /// the same row is never written twice. `processed`/`skipped` are reset per run, so
+    /// at completion `processed + skipped == total`. When the embed queue is full the
+    /// run *pauses* (batch left resumable) rather than dropping work. Only
+    /// `source = "jsonl"` is supported in this slice.
     pub fn import_jsonl(
         &mut self,
         source: &str,
         path: &Path,
         max_active_jobs: usize,
     ) -> Result<ImportSummary, StoreError> {
+        // Bound memory on a constrained host: the file is read whole before parsing,
+        // so reject oversized inputs with a clear message rather than risking an OOM.
+        let file_bytes = fs::metadata(path)?.len();
+        if file_bytes > MAX_IMPORT_FILE_BYTES {
+            return Err(StoreError::Import(format!(
+                "import file is {file_bytes} bytes; the limit is {MAX_IMPORT_FILE_BYTES} \
+                 bytes - split the source or import it in chunks"
+            )));
+        }
         let contents = fs::read_to_string(path)?;
         let units = parse_jsonl(&contents)?;
         let path_or_uri = path.display().to_string();
@@ -269,24 +279,18 @@ impl Store {
         now: i64,
     ) -> Result<String, StoreError> {
         let total = i64::try_from(total).unwrap_or(i64::MAX);
-        let existing: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT id FROM import_batches WHERE source = ?1 AND path_or_uri = ?2",
-                params![source, path_or_uri],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(id) = existing {
-            self.conn.execute(
-                "UPDATE import_batches SET total = ?1, state = 'staging' WHERE id = ?2",
-                params![total, id],
-            )?;
-            return Ok(id);
-        }
+        // Atomic find-or-create: one statement, no SELECT-then-write race. On resume the
+        // counters reset so each run reports its own progress (processed + skipped == total
+        // at completion); dedup over content_hash - not the counters - prevents double-staging.
         let id: String = self.conn.query_row(
             "INSERT INTO import_batches (id, source, path_or_uri, total, state, started_at)
              VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, 'staging', ?4)
+             ON CONFLICT(source, path_or_uri) DO UPDATE SET
+                total = excluded.total,
+                state = 'staging',
+                processed = 0,
+                skipped = 0,
+                finished_at = NULL
              RETURNING id",
             params![source, path_or_uri, total, now],
             |row| row.get(0),
@@ -304,11 +308,23 @@ impl Store {
         source: &str,
         path_or_uri: &str,
         unit: &ImportUnit,
-        default_ts: i64,
+        batch_ts: i64,
         max_active_jobs: usize,
     ) -> Result<StageOutcome, StoreError> {
-        let hash = content_hash(source, &unit.text);
-        let tx = self.conn.transaction()?;
+        // Redact at the boundary (defense-in-depth, s11.7) reusing the capture path's
+        // helpers, and key dedup off the *redacted* text so the content_hash matches what
+        // is stored and never derives from an unredacted secret.
+        let RedactedString {
+            value: text,
+            redactions: text_redactions,
+        } = redact_inline_string_with_count(&unit.text);
+        let hash = content_hash(source, &text);
+
+        // IMMEDIATE so the dedup check + staging insert take the write lock up front;
+        // concurrent importers then serialize and dedup gracefully instead of racing.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let already = tx
             .query_row(
@@ -334,12 +350,6 @@ impl Store {
             return Ok(StageOutcome::Paused);
         }
 
-        // Redact at the boundary (defense-in-depth, s11.7), reusing the capture path's
-        // helpers so imported text is scrubbed identically to native capture.
-        let RedactedString {
-            value: text,
-            redactions: text_redactions,
-        } = redact_inline_string_with_count(&unit.text);
         let RedactedString {
             value: session_id,
             redactions: session_redactions,
@@ -356,7 +366,7 @@ impl Store {
         validate_capture_field("agent", &agent)?;
         validate_capture_field("source", &event_source)?;
 
-        let ts_ms = unit.ts_ms.unwrap_or(default_ts);
+        let ts_ms = unit.ts_ms.unwrap_or(batch_ts);
         let payload_value = serde_json::json!({ "text": text });
         let provenance_value = serde_json::json!({
             "import_batch": batch_id,
@@ -405,7 +415,7 @@ impl Store {
         tx.execute(
             "INSERT INTO jobs (kind, priority, state, payload, scheduled_at)
              VALUES ('embed', 100, 'pending', ?1, ?2)",
-            params![job_payload.as_str(), default_ts],
+            params![job_payload.as_str(), batch_ts],
         )?;
         let raw_event_ref = raw_event_id.to_string();
         let stage_detail = serde_json::to_string(&serde_json::json!({
@@ -420,7 +430,7 @@ impl Store {
             "raw_event",
             Some(raw_event_ref.as_str()),
             Some(stage_detail.as_str()),
-            default_ts,
+            batch_ts,
         )?;
         let redactions =
             text_redactions + session_redactions + agent_redactions + source_redactions;
@@ -436,7 +446,7 @@ impl Store {
                 "raw_event",
                 Some(raw_event_ref.as_str()),
                 Some(redaction_detail.as_str()),
-                default_ts,
+                batch_ts,
             )?;
         }
         tx.execute(
@@ -1813,6 +1823,10 @@ CREATE VIRTUAL TABLE raw_events_fts USING fts5(
 );
 "#;
 
+/// Cap on the whole-file read in [`Store::import_jsonl`] - bounds memory on a small VM.
+/// 64 MiB of JSONL is hundreds of thousands of records, well beyond personal scale.
+const MAX_IMPORT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Outcome of staging one import unit: a new row, a dedup skip, or a queue-full pause.
 enum StageOutcome {
     Staged,
@@ -3020,7 +3034,7 @@ mod tests {
             second.batch_id, first.batch_id,
             "re-import reuses the batch row"
         );
-        assert_eq!(second.processed, 2, "processed does not double-count");
+        assert_eq!(second.processed, 0, "re-import stages nothing new");
         assert_eq!(second.skipped, 2, "both units dedup on re-import");
         assert_eq!(second.state, "completed");
 
@@ -3096,7 +3110,7 @@ mod tests {
             .expect("resumed import");
         assert_eq!(second.batch_id, first.batch_id);
         assert_eq!(second.total, 4);
-        assert_eq!(second.processed, 4, "two new units staged on resume");
+        assert_eq!(second.processed, 2, "two new units staged this run");
         assert_eq!(second.skipped, 2, "two already-seen units skip");
         assert_eq!(second.state, "completed");
         assert_eq!(count_imported(&store), 4, "no duplicates after resume");
@@ -3145,7 +3159,7 @@ mod tests {
             .import_jsonl("jsonl", &src, 2)
             .expect("resumed import");
         assert_eq!(second.state, "completed");
-        assert_eq!(second.processed, 3, "resumes from where it paused");
+        assert_eq!(second.processed, 1, "one remaining unit staged this run");
         assert_eq!(
             second.skipped, 2,
             "the two already-staged units dedup on resume"
