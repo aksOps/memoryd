@@ -997,8 +997,12 @@ impl Store {
     /// `approvals(pending)` — **never** writing `profile_facts` directly (H6: the
     /// `profile_facts.approval_id` NOT NULL FK structurally forbids an un-approved fact).
     /// Deterministic, propose-once-per-`fact_key`: a candidate is skipped when any
-    /// approval already exists for its key (any state — respects prior accept/reject) or
-    /// an active fact already holds that key. The fact *value* is optionally refined by
+    /// approval already exists for its key (any state) or an active fact holds it. The
+    /// "any state" scope is deliberate — re-proposing a *rejected* fact on every dream
+    /// (every ~300s under `serve`) would nag the owner, which violates the
+    /// never-surprise-the-user mandate. The trade-off is that a rejection is durable;
+    /// re-proposal/un-reject is a deferred enhancement (the rejection is in `audit_log`).
+    /// The fact *value* is optionally refined by
     /// the gated LLM `summarize` path (exercised by a metered test-double; the `null`
     /// adapter uses the memory content verbatim — no spend, no network). One IMMEDIATE tx.
     pub(crate) fn extract_profile_pending<A: ProviderAdapter>(
@@ -1153,17 +1157,30 @@ impl Store {
         accept: bool,
         now_ms: i64,
     ) -> Result<ApprovalDecision, StoreError> {
-        let row: Option<(String, String, String)> = self
+        let row: Option<(String, String)> = self
             .conn
             .query_row(
-                "SELECT target_type, proposed_change, state FROM approvals WHERE id = ?1",
+                "SELECT target_type, proposed_change FROM approvals WHERE id = ?1",
                 params![approval_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let Some((target_type, proposed_change, state)) = row else {
+        let Some((target_type, proposed_change)) = row else {
             return Err(StoreError::ApprovalNotFound(approval_id.to_string()));
         };
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Authoritative state check INSIDE the write tx: the outer read holds no lock, so
+        // a second decider (e.g. a concurrent CLI process) could otherwise slip past it
+        // and double-commit. The IMMEDIATE tx serializes writers; re-reading here sees
+        // any prior committed decision.
+        let state: String = tx.query_row(
+            "SELECT state FROM approvals WHERE id = ?1",
+            params![approval_id],
+            |r| r.get(0),
+        )?;
         if state != "pending" {
             return Ok(ApprovalDecision {
                 state,
@@ -1171,10 +1188,6 @@ impl Store {
                 already_decided: true,
             });
         }
-
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (new_state, committed_fact) = if accept {
             tx.execute(
                 "UPDATE approvals SET state = 'approved', decided_at = ?1 WHERE id = ?2",
@@ -1190,6 +1203,11 @@ impl Store {
                     .get("fact_value")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                if fact_key.is_empty() {
+                    return Err(StoreError::MalformedApproval(format!(
+                        "approval {approval_id} has no fact_key"
+                    )));
+                }
                 let confidence = change
                     .get("confidence")
                     .and_then(serde_json::Value::as_f64)
@@ -2110,6 +2128,7 @@ pub enum StoreError {
     Import(String),
     Adapter(String),
     ApprovalNotFound(String),
+    MalformedApproval(String),
 }
 
 impl fmt::Display for StoreError {
@@ -2125,6 +2144,7 @@ impl fmt::Display for StoreError {
             Self::Import(msg) => write!(f, "import error: {msg}"),
             Self::Adapter(msg) => write!(f, "provider adapter error: {msg}"),
             Self::ApprovalNotFound(id) => write!(f, "approval not found: {id}"),
+            Self::MalformedApproval(msg) => write!(f, "malformed approval: {msg}"),
         }
     }
 }
@@ -3150,8 +3170,7 @@ CREATE INDEX memories_session ON memories(source_session) WHERE source_session I
 "#;
 
 const MIGRATION_0006: &str = r#"
-CREATE INDEX approvals_pending_target ON approvals(target_type, target_ref)
-    WHERE state = 'pending';
+CREATE INDEX approvals_target ON approvals(target_type, target_ref);
 "#;
 
 #[cfg(test)]
@@ -6000,6 +6019,44 @@ mod tests {
             count(&store, "SELECT COUNT(*) FROM profile_facts"),
             0,
             "H6: nothing committed without approval"
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn decide_approval_rejects_malformed_proposal_without_committing() {
+        let path = temp_db_path("m8-malformed");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        // A JSON-valid but structurally-empty proposal must not commit an empty-keyed fact.
+        let aid: String = store
+            .conn
+            .query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO approvals (id, target_type, target_ref, proposed_change, state, requested_at)
+                 VALUES (?1, 'profile_fact', 'x', '{}', 'pending', ?2)",
+                params![aid, now],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.decide_approval(&aid, true, now + 1),
+            Err(StoreError::MalformedApproval(_))
+        ));
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM profile_facts"), 0);
+        let st: String = store
+            .conn
+            .query_row(
+                "SELECT state FROM approvals WHERE id=?1",
+                params![aid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            st, "pending",
+            "malformed accept rolled back, approval untouched"
         );
         cleanup_db_files(&path);
     }

@@ -5390,7 +5390,14 @@ Graph growth bounded (no unbounded fan-out), graph contribution to recall valida
 > memories (e.g. an HTTP capture with `kind:"preference"`); `remember`-d content is not
 > auto-proposed. **Deferred:** the `expired` approval transition, the
 > `memory_cleanup`/`memory_purge` approval flows (only `profile_fact` is produced/
-> committed in M8), and confidence-threshold gating of proposals.
+> committed in M8), and confidence-threshold gating of proposals. **Deliberate
+> behaviors:** (a) a rejected `fact_key` is *durable* — extraction will not re-propose
+> it (re-proposing every dream would nag the owner); un-reject/clear is deferred, and
+> the rejection is recorded in `audit_log`. (b) `memoryd remember --kind <k>` stores the
+> kind in the event payload but consolidates to an `observation` memory, so it does not
+> feed profile extraction; typed profile facts come from the HTTP capture API (or import)
+> with a profile `kind`. Wiring `remember --kind` through to `raw_events.kind` is a
+> deferred M1/M8 follow-up.
 
 #### Goal
 Propose long-term profile/preference facts from memories — and **never** write them silently. Every profile mutation passes a human approval gate.
