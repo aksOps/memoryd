@@ -325,14 +325,26 @@ impl<'a> HnswGraph<'a> {
     }
 }
 
+/// FNV-1a (64-bit) over the little-endian bytes of each input word. Unlike
+/// `DefaultHasher` — whose algorithm the std docs reserve the right to change between
+/// Rust releases — FNV-1a has a fixed, specified output, so the HNSW level assignment
+/// is reproducible across toolchain versions, not merely within one binary. No `rand`
+/// dependency.
+fn fnv1a(words: &[u64]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &word in words {
+        for byte in word.to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
+}
+
 /// Deterministic geometric level for a node, hash-seeded (no `rand` dependency):
 /// `floor(-ln(u) * m_l)` with `u` a stable uniform in `(0, 1)` derived from the index.
 fn level_for(index: usize, m_l: f64) -> usize {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    (index as u64).hash(&mut hasher);
-    0x9E37_79B9_7F4A_7C15u64.hash(&mut hasher);
-    let raw = hasher.finish();
+    let raw = fnv1a(&[index as u64, 0x9E37_79B9_7F4A_7C15]);
     // 53-bit mantissa mapped to (0, 1): never 0 (so -ln is finite), never 1.
     let u = ((raw >> 11) as f64 + 1.0) / (((1u64 << 53) as f64) + 1.0);
     (-u.ln() * m_l).floor() as usize
@@ -405,20 +417,14 @@ mod tests {
         assert!(BruteForce.search(&[1.0], &[], 5).is_empty());
     }
 
-    use std::hash::{Hash, Hasher};
-
-    /// Deterministic fixture vectors (no `rand`): each component is a stable hash of
-    /// (id, dim) mapped into [-1, 1].
+    /// Deterministic fixture vectors (no `rand`): each component is a stable FNV-1a
+    /// hash of (id, dim) mapped into [-1, 1].
     fn fixture(n: usize, dim: usize) -> Vec<Candidate> {
         (0..n)
             .map(|i| {
                 let vector = (0..dim)
                     .map(|j| {
-                        let mut h = std::collections::hash_map::DefaultHasher::new();
-                        (i as u64).hash(&mut h);
-                        (j as u64).hash(&mut h);
-                        0xA5A5_5A5A_u64.hash(&mut h);
-                        let raw = h.finish();
+                        let raw = fnv1a(&[i as u64, j as u64, 0xA5A5_5A5A]);
                         (((raw >> 11) as f64 / ((1u64 << 53) as f64)) * 2.0 - 1.0) as f32
                     })
                     .collect();

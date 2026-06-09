@@ -1025,6 +1025,10 @@ fn handle_http_recall(store: &Store, body: serde_json::Value) -> HttpResponse {
         Err(message) => return HttpResponse::error(422, "invalid_request", message),
     };
 
+    // HTTP recall always uses the brute-force oracle: the `--index` selector is a
+    // CLI-only override, and HNSW is not yet a latency win (it builds per call over the
+    // shortlist — see vectorindex.rs / ARCHITECTURE-PLAN §21.12). Revisit when the
+    // persistent full-corpus index lands.
     match recall_with_mode(store, &args, "brute-force") {
         Ok(result) => HttpResponse::json(200, "OK", recall_response_value(&result)),
         Err(StoreError::InvalidRecallQuery) => {
