@@ -33,6 +33,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
         Command::Serve => serve(cli),
         Command::Remember(args) => remember(cli, args),
         Command::Recall(args) => recall(cli, args),
+        Command::Import(args) => import(cli, args),
         Command::Help => {
             print_help();
             Ok(())
@@ -98,6 +99,34 @@ fn recall(cli: Cli, args: RecallArgs) -> Result<(), CliError> {
     let store = Store::open(&cfg.db_path)?;
     let result = recall_with_mode(&store, &args)?;
     println!("{}", recall_response_json(&result)?);
+    Ok(())
+}
+
+/// Backfill historic data through the same capture path. Only the generic JSONL
+/// format ships in this slice; source-specific importers are deferred until it is
+/// stable. The embed queue is bounded by the governor's `queue_depth_max`, so a
+/// large import pauses and resumes rather than flooding the worker.
+fn import(cli: Cli, args: ImportArgs) -> Result<(), CliError> {
+    let cfg = cli.config()?;
+    cfg.validate()?;
+
+    if args.path.is_empty() {
+        return Err(CliError::MissingArgument("--path"));
+    }
+    if args.source != "jsonl" {
+        return Err(CliError::Store(StoreError::Import(format!(
+            "unsupported import source {:?}; only \"jsonl\" is supported in this build",
+            args.source
+        ))));
+    }
+
+    let mut store = Store::open(&cfg.db_path)?;
+    let summary = store.import_jsonl(
+        &args.source,
+        &PathBuf::from(&args.path),
+        cfg.caps.queue_depth_max,
+    )?;
+    println!("{}", import_response_json(&summary)?);
     Ok(())
 }
 
@@ -177,6 +206,7 @@ enum Command {
     Serve,
     Remember(RememberArgs),
     Recall(RecallArgs),
+    Import(ImportArgs),
     Help,
 }
 
@@ -218,6 +248,21 @@ impl Default for RecallArgs {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportArgs {
+    source: String,
+    path: String,
+}
+
+impl Default for ImportArgs {
+    fn default() -> Self {
+        Self {
+            source: "jsonl".to_string(),
+            path: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Cli {
     command: Command,
@@ -238,6 +283,7 @@ impl Cli {
                 "serve" => Command::Serve,
                 "remember" => Command::Remember(RememberArgs::default()),
                 "recall" => Command::Recall(RecallArgs::default()),
+                "import" => Command::Import(ImportArgs::default()),
                 "--help" | "-h" | "help" => Command::Help,
                 other => return Err(CliError::UnknownCommand(other.to_string())),
             },
@@ -277,11 +323,20 @@ impl Cli {
                     };
                     remember.session_id = next_string(&mut args, "--session")?;
                 }
-                "--source" => {
-                    let Command::Remember(remember) = &mut command else {
+                "--source" => match &mut command {
+                    Command::Remember(remember) => {
+                        remember.source = next_string(&mut args, "--source")?;
+                    }
+                    Command::Import(import) => {
+                        import.source = next_string(&mut args, "--source")?;
+                    }
+                    _ => return Err(CliError::UnknownFlag(token)),
+                },
+                "--path" => {
+                    let Command::Import(import) = &mut command else {
                         return Err(CliError::UnknownFlag(token));
                     };
-                    remember.source = next_string(&mut args, "--source")?;
+                    import.path = next_string(&mut args, "--path")?;
                 }
                 "--tags" => {
                     let Command::Remember(remember) = &mut command else {
@@ -433,6 +488,7 @@ fn print_help() {
             memoryd stats  [--db <path>] [--bind <addr:port>] [--token <token>]\n\
             memoryd remember <content> [--kind <kind>] [--session <id>] [--source <source>] [--tags <a,b>] [--db <path>]\n\
             memoryd recall <query> [--k <limit>] [--semantic] [--db <path>]\n\
+            memoryd import --source jsonl --path <file> [--db <path>]\n\
             memoryd serve [--db <path>] [--bind <addr:port>] [--token <token>]\n\n\
           Defaults:\n\
             bind: {DEFAULT_BIND}\n\
@@ -527,6 +583,18 @@ fn remember_event(args: RememberArgs) -> NewRawEvent {
         }),
         ts_ms: unix_ms_now(),
     }
+}
+
+fn import_response_json(summary: &memoryd_core::import::ImportSummary) -> Result<String, CliError> {
+    Ok(serde_json::to_string(&serde_json::json!({
+        "batch_id": summary.batch_id,
+        "source": summary.source,
+        "path": summary.path,
+        "total": summary.total,
+        "processed": summary.processed,
+        "skipped": summary.skipped,
+        "state": summary.state,
+    }))?)
 }
 
 fn remember_response_json(ack: &CaptureAck) -> Result<String, CliError> {
@@ -1237,6 +1305,69 @@ mod tests {
         assert_eq!(table_rows(&stats, "provider_usage"), 0);
 
         cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn parses_import_with_source_and_path() {
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "import",
+                "--source",
+                "jsonl",
+                "--path",
+                "/tmp/hist.jsonl",
+            ]
+            .map(OsString::from),
+        )
+        .expect("cli parses");
+        let Command::Import(args) = cli.command else {
+            panic!("expected import command");
+        };
+        assert_eq!(args.source, "jsonl");
+        assert_eq!(args.path, "/tmp/hist.jsonl");
+    }
+
+    #[test]
+    fn import_command_stages_jsonl_through_capture_path() {
+        let db = temp_db_path("import-command");
+        let src =
+            std::env::temp_dir().join(format!("memoryd-import-cmd-{}.jsonl", std::process::id()));
+        fs::write(
+            &src,
+            "{\"text\":\"flyway runs migrations\",\"ts_ms\":1}\n\
+             {\"text\":\"wal checkpoint tuning\",\"ts_ms\":2}\n",
+        )
+        .expect("write jsonl fixture");
+
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "import",
+                "--source",
+                "jsonl",
+                "--path",
+                src.to_str().expect("path is UTF-8"),
+                "--db",
+                db.to_str().expect("path is UTF-8"),
+            ]
+            .map(OsString::from),
+        )
+        .expect("cli parses");
+        let Command::Import(args) = cli.command.clone() else {
+            panic!("expected import command");
+        };
+
+        import(cli, args).expect("import succeeds");
+
+        let store = Store::open(&db).expect("store opens");
+        let stats = store.table_stats().expect("table stats");
+        assert_eq!(table_rows(&stats, "raw_events"), 2);
+        assert_eq!(table_rows(&stats, "jobs"), 2);
+        assert_eq!(table_rows(&stats, "import_batches"), 1);
+
+        let _ = fs::remove_file(&src);
+        cleanup_db_files(&db);
     }
 
     #[test]

@@ -5216,6 +5216,21 @@ C2/U1 (vector seam without external DB, H3), semantic-vs-lexical degrade proven 
 
 ### 21.8 M5 — Import sources (idempotent historic backfill)
 
+> **Status (2026-06-09): delivered (generic JSONL).** `import --source jsonl --path <p>`
+> stages each non-blank line as a `kind='import'` raw event through the same
+> session / FTS / embed-queue path as native capture (no privileged path). Idempotency
+> is enforced by a `content_hash` partial-unique index (`ux_raw_import_hash`, migration
+> 0003); re-import skips already-seen content and `import_batches` tracks
+> `total/processed/skipped/state`. When the embed queue is full the batch
+> `state='paused'` and resumes on the next run. **Deviations from the §11 sketch (each
+> documented in code):** (1) `content_hash` is inline **FNV-1a 64-bit** (8-byte BLOB),
+> not BLAKE3 — the dependency set stays `rusqlite` + `serde_json`; (2) normalization is
+> trim + ASCII-whitespace-collapse, not NFC Unicode (would add a dep); (3) resume
+> re-scans and dedups rather than seeking the `cursor` column (simple + correct at
+> personal scale; `cursor`/`content_root_sha` left unused). **Deferred:** source-specific
+> importers (chatlog/markdown/claude-mem), and distillation into `memories` (that is the
+> M6 `consolidate` worker — M5 stages raw events only, no privileged promotion).
+
 #### Goal
 Bring existing history in (chat logs, session exports) without double-writing, with provenance and resumable progress — feeding the dream plane real data.
 
@@ -5225,16 +5240,16 @@ Bring existing history in (chat logs, session exports) without double-writing, w
 #### Modules / tables / CLI added
 | Adds | Names |
 |------|-------|
-| Modules | import submodule of `workers`/`cli` |
-| Tables | `import_batches`; writes `raw_events`, `sessions`, `jobs` |
-| CLI | `import --source <openai_compat|chatlog|jsonl> --path <p>` |
+| Modules | `import` (core: JSONL parse + content hash); `Store::import_jsonl` staging |
+| Tables | migration 0003 adds `raw_events.content_hash` + `ux_raw_import_hash`; writes `import_batches`, `raw_events`, `sessions`, `jobs` |
+| CLI | `import --source jsonl --path <p>` (jsonl only this slice; other sources error cleanly) |
 
 #### Entry / Exit
 | Entry | Exit (evidence) |
 |------|------|
-| M3 queue live | Re-running an import is a no-op for already-seen content (idempotency test on hash) |
-| — | Interrupted import resumes from `import_batches.processed` (kill-and-restart test) |
-| — | Each imported memory carries source provenance; governor still bounds embed throughput during backfill |
+| M3 queue live | Re-running an import is a no-op for already-seen content (`reimport_jsonl_is_idempotent_no_duplicate_rows`, `import_jsonl_dedups_duplicate_lines_within_file`) |
+| — | Interrupted import resumes without double-staging (`import_pauses_when_embed_queue_is_full_then_resumes`, `interrupted_import_resumes_without_duplicates`) |
+| — | Each imported row carries `import_batch`/`import_source`/`path` provenance and the queue cap bounds staging (`import_jsonl_stages_units_with_provenance_and_embed_jobs`, governor-pause test) |
 
 #### Risks retired
 Import idempotency/resumability; provenance integrity for backfilled data; governor holds under bulk load.

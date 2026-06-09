@@ -23,9 +23,12 @@ Status legend:
 - `[x]` M4 — the vector-rerank engine (`vectorindex` + semantic recall + query cache
   + lexical degrade) is delivered and gated; it activates once a non-`null` embedding
   provider is configured.
-- `[ ]` M5 and later are not started.
+- `[x]` M5 — generic JSONL historic import is delivered and gated: idempotent by
+  `content_hash`, resumable, governor-bounded, routed through the normal capture path;
+  source-specific importers and distillation into `memories` are deferred (M6).
+- `[ ]` M6 and later are not started.
 
-Next implementation target: M5 (idempotent historic import).
+Next implementation target: M6 (dream plane: consolidate and decay).
 
 ## M0 — Store Skeleton, Config, CLI Shell, Security Gate
 
@@ -243,17 +246,19 @@ from the deferred M3 increment). Until then `recall --semantic` degrades to lexi
 
 ## M5 — Idempotent Historic Import
 
-Status: `[ ]` Not started.
+Status: `[x]` Delivered (generic JSONL). Source-specific importers deferred by design.
 
-- `[ ]` Add `import` CLI with source and path arguments.
-- `[ ]` Add generic JSONL importer first.
-- `[ ]` Add source-specific importers only after JSONL path is stable.
-- `[ ]` Use `import_batches` for total, processed, state, and error tracking.
-- `[ ]` Add content hash/idempotency so reruns do not duplicate rows.
-- `[ ]` Add interrupted-import resume behavior.
-- `[ ]` Route imported rows through the same raw event/session/job path as capture.
-- `[ ]` Preserve source provenance on every imported row.
-- `[ ]` Verify governor bounds embed throughput during bulk import.
+- `[x]` Add `import` CLI with source and path arguments (`import --source jsonl --path <p>`).
+- `[x]` Add generic JSONL importer first (`import` module: `parse_jsonl`, `content_hash`).
+- `[ ]` Add source-specific importers only after JSONL path is stable. (Deferred — JSONL path just landed.)
+- `[x]` Use `import_batches` for total, processed, skipped, and state tracking (`paused`/`failed` states; per-unit errors surface via `StoreError::Import`).
+- `[x]` Add content hash/idempotency so reruns do not duplicate rows (migration 0003: `content_hash` BLOB + partial unique index `ux_raw_import_hash`; FNV-1a, not BLAKE3 — dep policy).
+- `[x]` Add interrupted-import resume behavior (queue-full pause + resume; re-scan + dedup).
+- `[x]` Route imported rows through the same raw event/session/job path as capture (reuses redaction/validation/FTS/embed-enqueue helpers; `kind='import'`, normal `embed` jobs).
+- `[x]` Preserve source provenance on every imported row (`import_batch`/`import_source`/`path`).
+- `[x]` Verify governor bounds embed throughput during bulk import (`import_pauses_when_embed_queue_is_full_then_resumes`).
+
+Evidence: 8 `import` unit tests (parse/normalize/hash) + 5 store integration tests + 2 CLI tests; end-to-end import/re-import/recall smoke verified. Deviations recorded in §21.8.
 
 ## M6 — Dream Plane: Consolidate And Decay
 

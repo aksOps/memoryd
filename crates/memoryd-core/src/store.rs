@@ -1,4 +1,5 @@
 use crate::adapters::{ProviderAdapter, prompt_token_estimate};
+use crate::import::{ImportError, ImportSummary, ImportUnit, content_hash, parse_jsonl};
 use crate::vectorindex::{Candidate, VectorIndex};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::HashMap;
@@ -7,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub const CANONICAL_TABLES: [&str; 13] = [
     "sessions",
@@ -207,6 +208,264 @@ impl Store {
             enqueued_job_id,
             degraded,
             processed: false,
+        })
+    }
+
+    /// Import a generic JSONL file into `raw_events`, idempotently and resumably.
+    ///
+    /// Each non-blank line becomes one `kind='import'` raw event routed through the
+    /// same session / FTS / embed-queue path as native capture (no privileged path,
+    /// H7). Re-running is safe: already-staged content is skipped by `content_hash`,
+    /// so `processed` advances and the same row is never written twice. When the embed
+    /// queue is full the run *pauses* (batch left resumable) rather than dropping work.
+    /// Only `source = "jsonl"` is supported in this slice.
+    pub fn import_jsonl(
+        &mut self,
+        source: &str,
+        path: &Path,
+        max_active_jobs: usize,
+    ) -> Result<ImportSummary, StoreError> {
+        let contents = fs::read_to_string(path)?;
+        let units = parse_jsonl(&contents)?;
+        let path_or_uri = path.display().to_string();
+        let now = unix_ms_now();
+
+        let batch_id = self.begin_import_batch(source, &path_or_uri, units.len(), now)?;
+
+        let mut paused = false;
+        for unit in &units {
+            let outcome = self.stage_import_unit(
+                &batch_id,
+                source,
+                &path_or_uri,
+                unit,
+                now,
+                max_active_jobs,
+            )?;
+            if matches!(outcome, StageOutcome::Paused) {
+                paused = true;
+                break;
+            }
+        }
+
+        let state = if paused { "paused" } else { "completed" };
+        let finished_at = if paused { None } else { Some(now) };
+        self.conn.execute(
+            "UPDATE import_batches SET state = ?1, finished_at = ?2 WHERE id = ?3",
+            params![state, finished_at, batch_id],
+        )?;
+
+        self.import_summary(&batch_id, source, &path_or_uri)
+    }
+
+    /// Find-or-create the `import_batches` row for `(source, path_or_uri)` and reset it
+    /// to `staging` with the current unit `total`. The `UNIQUE(source, path_or_uri)`
+    /// constraint makes a re-import reuse the same batch row (idempotency / resume).
+    fn begin_import_batch(
+        &self,
+        source: &str,
+        path_or_uri: &str,
+        total: usize,
+        now: i64,
+    ) -> Result<String, StoreError> {
+        let total = i64::try_from(total).unwrap_or(i64::MAX);
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM import_batches WHERE source = ?1 AND path_or_uri = ?2",
+                params![source, path_or_uri],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            self.conn.execute(
+                "UPDATE import_batches SET total = ?1, state = 'staging' WHERE id = ?2",
+                params![total, id],
+            )?;
+            return Ok(id);
+        }
+        let id: String = self.conn.query_row(
+            "INSERT INTO import_batches (id, source, path_or_uri, total, state, started_at)
+             VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, 'staging', ?4)
+             RETURNING id",
+            params![source, path_or_uri, total, now],
+            |row| row.get(0),
+        )?;
+        Ok(id)
+    }
+
+    /// Stage one import unit in a single transaction so progress is crash-safe.
+    ///
+    /// Dedup, the staging insert, and the `import_batches` counter bump all commit
+    /// together: an interrupted run never double-stages and never loses count.
+    fn stage_import_unit(
+        &mut self,
+        batch_id: &str,
+        source: &str,
+        path_or_uri: &str,
+        unit: &ImportUnit,
+        default_ts: i64,
+        max_active_jobs: usize,
+    ) -> Result<StageOutcome, StoreError> {
+        let hash = content_hash(source, &unit.text);
+        let tx = self.conn.transaction()?;
+
+        let already = tx
+            .query_row(
+                "SELECT 1 FROM raw_events WHERE content_hash = ?1 AND kind = 'import' LIMIT 1",
+                params![hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if already {
+            tx.execute(
+                "UPDATE import_batches SET skipped = skipped + 1 WHERE id = ?1",
+                params![batch_id],
+            )?;
+            tx.commit()?;
+            return Ok(StageOutcome::Skipped);
+        }
+
+        let job_limit = i64::try_from(max_active_jobs).unwrap_or(i64::MAX);
+        if active_job_count(&tx)? >= job_limit {
+            // Queue full: pause without staging so a later run resumes this unit.
+            tx.commit()?;
+            return Ok(StageOutcome::Paused);
+        }
+
+        // Redact at the boundary (defense-in-depth, s11.7), reusing the capture path's
+        // helpers so imported text is scrubbed identically to native capture.
+        let RedactedString {
+            value: text,
+            redactions: text_redactions,
+        } = redact_inline_string_with_count(&unit.text);
+        let RedactedString {
+            value: session_id,
+            redactions: session_redactions,
+        } = redact_inline_string_with_count(&unit.session_id);
+        let RedactedString {
+            value: agent,
+            redactions: agent_redactions,
+        } = redact_inline_string_with_count(&unit.agent);
+        let RedactedString {
+            value: event_source,
+            redactions: source_redactions,
+        } = redact_inline_string_with_count(&unit.source);
+        validate_capture_field("session_id", &session_id)?;
+        validate_capture_field("agent", &agent)?;
+        validate_capture_field("source", &event_source)?;
+
+        let ts_ms = unit.ts_ms.unwrap_or(default_ts);
+        let payload_value = serde_json::json!({ "text": text });
+        let provenance_value = serde_json::json!({
+            "import_batch": batch_id,
+            "import_source": source,
+            "path": path_or_uri,
+        });
+        let fts_content = capture_fts_content(&payload_value);
+        let payload = serde_json::to_string(&payload_value)?;
+        let provenance = serde_json::to_string(&provenance_value)?;
+
+        tx.execute(
+            "INSERT INTO sessions (id, agent, started_at, event_count, status)
+             VALUES (?1, ?2, ?3, 1, 'open')
+             ON CONFLICT(id) DO UPDATE SET
+                started_at = CASE
+                    WHEN excluded.started_at < sessions.started_at THEN excluded.started_at
+                    ELSE sessions.started_at
+                END,
+                event_count = sessions.event_count + 1",
+            params![session_id.as_str(), agent.as_str(), ts_ms],
+        )?;
+        tx.execute(
+            "INSERT INTO raw_events
+                (session_id, ts, source, kind, payload, provenance, content_hash)
+             VALUES (?1, ?2, ?3, 'import', ?4, ?5, ?6)",
+            params![
+                session_id.as_str(),
+                ts_ms,
+                event_source.as_str(),
+                payload.as_str(),
+                provenance.as_str(),
+                hash
+            ],
+        )?;
+        let raw_event_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO raw_events_fts (raw_event_id, content) VALUES (?1, ?2)",
+            params![raw_event_id, fts_content.as_str()],
+        )?;
+        let job_payload = serde_json::to_string(&serde_json::json!({
+            "raw_event_id": raw_event_id,
+            "session_id": session_id,
+            "source": event_source,
+            "kind": "import",
+        }))?;
+        tx.execute(
+            "INSERT INTO jobs (kind, priority, state, payload, scheduled_at)
+             VALUES ('embed', 100, 'pending', ?1, ?2)",
+            params![job_payload.as_str(), default_ts],
+        )?;
+        let raw_event_ref = raw_event_id.to_string();
+        let stage_detail = serde_json::to_string(&serde_json::json!({
+            "import_batch": batch_id,
+            "session_id": session_id,
+            "source": event_source,
+        }))?;
+        insert_audit_log(
+            &tx,
+            AUDIT_ACTOR,
+            "import.stage",
+            "raw_event",
+            Some(raw_event_ref.as_str()),
+            Some(stage_detail.as_str()),
+            default_ts,
+        )?;
+        let redactions =
+            text_redactions + session_redactions + agent_redactions + source_redactions;
+        if redactions > 0 {
+            let redaction_detail = serde_json::to_string(&serde_json::json!({
+                "redactions": redactions,
+                "replacement": REDACTED,
+            }))?;
+            insert_audit_log(
+                &tx,
+                AUDIT_ACTOR,
+                "redaction.apply",
+                "raw_event",
+                Some(raw_event_ref.as_str()),
+                Some(redaction_detail.as_str()),
+                default_ts,
+            )?;
+        }
+        tx.execute(
+            "UPDATE import_batches SET processed = processed + 1 WHERE id = ?1",
+            params![batch_id],
+        )?;
+        tx.commit()?;
+        Ok(StageOutcome::Staged)
+    }
+
+    fn import_summary(
+        &self,
+        batch_id: &str,
+        source: &str,
+        path_or_uri: &str,
+    ) -> Result<ImportSummary, StoreError> {
+        let (total, processed, skipped, state): (i64, i64, i64, String) = self.conn.query_row(
+            "SELECT total, processed, skipped, state FROM import_batches WHERE id = ?1",
+            params![batch_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        Ok(ImportSummary {
+            batch_id: batch_id.to_string(),
+            source: source.to_string(),
+            path: path_or_uri.to_string(),
+            total: usize::try_from(total).unwrap_or(0),
+            processed: usize::try_from(processed).unwrap_or(0),
+            skipped: usize::try_from(skipped).unwrap_or(0),
+            state,
         })
     }
 
@@ -799,6 +1058,7 @@ pub enum StoreError {
     Json(serde_json::Error),
     InvalidCaptureField(&'static str),
     InvalidRecallQuery,
+    Import(String),
 }
 
 impl fmt::Display for StoreError {
@@ -811,11 +1071,18 @@ impl fmt::Display for StoreError {
                 write!(f, "capture field {field} must not be empty")
             }
             Self::InvalidRecallQuery => write!(f, "recall query must contain searchable text"),
+            Self::Import(msg) => write!(f, "import error: {msg}"),
         }
     }
 }
 
 impl std::error::Error for StoreError {}
+
+impl From<ImportError> for StoreError {
+    fn from(err: ImportError) -> Self {
+        Self::Import(err.to_string())
+    }
+}
 
 impl From<std::io::Error> for StoreError {
     fn from(err: std::io::Error) -> Self {
@@ -1310,6 +1577,24 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
         )?;
     }
 
+    let applied_0003 = tx
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [3],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+
+    if !applied_0003 {
+        tx.execute_batch(MIGRATION_0003)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (?1, ?2, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
+            (3, "0003_raw_event_content_hash"),
+        )?;
+    }
+
     tx.commit()?;
     Ok(())
 }
@@ -1526,6 +1811,20 @@ CREATE VIRTUAL TABLE raw_events_fts USING fts5(
     content,
     tokenize = 'unicode61 remove_diacritics 2'
 );
+"#;
+
+/// Outcome of staging one import unit: a new row, a dedup skip, or a queue-full pause.
+enum StageOutcome {
+    Staged,
+    Skipped,
+    Paused,
+}
+
+// Staging-dedup key for imported rows (ARCHITECTURE-PLAN s11.6). NULL for native
+// captures; the partial unique index makes re-import a no-op for seen content.
+const MIGRATION_0003: &str = r#"
+ALTER TABLE raw_events ADD COLUMN content_hash BLOB;
+CREATE UNIQUE INDEX ux_raw_import_hash ON raw_events(content_hash) WHERE kind = 'import';
 "#;
 
 #[cfg(test)]
@@ -2611,6 +2910,250 @@ mod tests {
             .capture_event(test_event_with_text("s", ts, text))
             .expect("capture succeeds")
             .raw_event_id
+    }
+
+    fn temp_jsonl(name: &str, lines: &[&str]) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "memoryd-import-{name}-{}-{nanos}.jsonl",
+            std::process::id()
+        ));
+        fs::write(&path, lines.join("\n")).expect("write jsonl fixture");
+        path
+    }
+
+    fn count_imported(store: &Store) -> i64 {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM raw_events WHERE kind = 'import'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("import row count")
+    }
+
+    #[test]
+    fn import_jsonl_stages_units_with_provenance_and_embed_jobs() {
+        let db = temp_db_path("import-stage");
+        let src = temp_jsonl(
+            "stage",
+            &[
+                "{\"text\":\"wal busy_timeout fix\",\"session_id\":\"imp-1\",\"ts_ms\":1000}",
+                "{\"text\":\"vacuum schedule\",\"session_id\":\"imp-1\",\"ts_ms\":1001}",
+                "{\"text\":\"index plan review\",\"ts_ms\":1002}",
+            ],
+        );
+        let mut store = Store::open(&db).expect("store opens");
+
+        let summary = store
+            .import_jsonl("jsonl", &src, usize::MAX)
+            .expect("import succeeds");
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.processed, 3);
+        assert_eq!(summary.skipped, 0);
+        assert_eq!(summary.state, "completed");
+
+        assert_eq!(count_imported(&store), 3);
+        let embed_jobs: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE kind = 'embed'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("embed job count");
+        assert_eq!(
+            embed_jobs, 3,
+            "imported rows flow through the normal embed queue"
+        );
+
+        let provenance: String = store
+            .conn
+            .query_row(
+                "SELECT provenance FROM raw_events WHERE kind = 'import' ORDER BY id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("provenance");
+        let prov: serde_json::Value = serde_json::from_str(&provenance).expect("provenance json");
+        assert_eq!(prov["import_source"], "jsonl");
+        assert_eq!(prov["import_batch"], summary.batch_id);
+        assert!(
+            prov["path"].as_str().expect("path str").ends_with(".jsonl"),
+            "source path is preserved in provenance"
+        );
+
+        // Imported text is reachable through the same lexical recall path as capture.
+        let recall = store.recall_events("wal", 5).expect("recall");
+        assert!(!recall.hits.is_empty(), "imported content is recall-able");
+
+        let _ = fs::remove_file(&src);
+        cleanup_db_files(&db);
+    }
+
+    #[test]
+    fn reimport_jsonl_is_idempotent_no_duplicate_rows() {
+        let db = temp_db_path("import-idem");
+        let src = temp_jsonl(
+            "idem",
+            &[
+                "{\"text\":\"alpha\",\"ts_ms\":1}",
+                "{\"text\":\"beta\",\"ts_ms\":2}",
+            ],
+        );
+        let mut store = Store::open(&db).expect("store opens");
+
+        let first = store
+            .import_jsonl("jsonl", &src, usize::MAX)
+            .expect("first import");
+        assert_eq!(first.processed, 2);
+        assert_eq!(first.skipped, 0);
+
+        let second = store
+            .import_jsonl("jsonl", &src, usize::MAX)
+            .expect("second import");
+        assert_eq!(
+            second.batch_id, first.batch_id,
+            "re-import reuses the batch row"
+        );
+        assert_eq!(second.processed, 2, "processed does not double-count");
+        assert_eq!(second.skipped, 2, "both units dedup on re-import");
+        assert_eq!(second.state, "completed");
+
+        assert_eq!(count_imported(&store), 2, "no duplicate rows");
+        let batches: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM import_batches", [], |row| row.get(0))
+            .expect("batch count");
+        assert_eq!(batches, 1);
+
+        let _ = fs::remove_file(&src);
+        cleanup_db_files(&db);
+    }
+
+    #[test]
+    fn import_jsonl_dedups_duplicate_lines_within_file() {
+        let db = temp_db_path("import-dup");
+        let src = temp_jsonl(
+            "dup",
+            &[
+                "{\"text\":\"same content\",\"ts_ms\":1}",
+                "{\"text\":\"same content\",\"ts_ms\":2}",
+                "{\"text\":\"other\",\"ts_ms\":3}",
+            ],
+        );
+        let mut store = Store::open(&db).expect("store opens");
+
+        let summary = store
+            .import_jsonl("jsonl", &src, usize::MAX)
+            .expect("import succeeds");
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.processed, 2, "identical text stages once");
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(count_imported(&store), 2);
+
+        let _ = fs::remove_file(&src);
+        cleanup_db_files(&db);
+    }
+
+    #[test]
+    fn interrupted_import_resumes_without_duplicates() {
+        let db = temp_db_path("import-resume");
+        let mut store = Store::open(&db).expect("store opens");
+        let src = temp_jsonl(
+            "resume",
+            &[
+                "{\"text\":\"unit one\",\"ts_ms\":1}",
+                "{\"text\":\"unit two\",\"ts_ms\":2}",
+            ],
+        );
+
+        let first = store
+            .import_jsonl("jsonl", &src, usize::MAX)
+            .expect("first import");
+        assert_eq!(first.processed, 2);
+        assert_eq!(first.state, "completed");
+
+        // Source grew (e.g. a live transcript appended-to); re-import the superset.
+        fs::write(
+            &src,
+            [
+                "{\"text\":\"unit one\",\"ts_ms\":1}",
+                "{\"text\":\"unit two\",\"ts_ms\":2}",
+                "{\"text\":\"unit three\",\"ts_ms\":3}",
+                "{\"text\":\"unit four\",\"ts_ms\":4}",
+            ]
+            .join("\n"),
+        )
+        .expect("grow fixture");
+
+        let second = store
+            .import_jsonl("jsonl", &src, usize::MAX)
+            .expect("resumed import");
+        assert_eq!(second.batch_id, first.batch_id);
+        assert_eq!(second.total, 4);
+        assert_eq!(second.processed, 4, "two new units staged on resume");
+        assert_eq!(second.skipped, 2, "two already-seen units skip");
+        assert_eq!(second.state, "completed");
+        assert_eq!(count_imported(&store), 4, "no duplicates after resume");
+
+        let _ = fs::remove_file(&src);
+        cleanup_db_files(&db);
+    }
+
+    #[test]
+    fn import_pauses_when_embed_queue_is_full_then_resumes() {
+        let db = temp_db_path("import-governed");
+        let src = temp_jsonl(
+            "governed",
+            &[
+                "{\"text\":\"one\",\"ts_ms\":1}",
+                "{\"text\":\"two\",\"ts_ms\":2}",
+                "{\"text\":\"three\",\"ts_ms\":3}",
+            ],
+        );
+        let mut store = Store::open(&db).expect("store opens");
+
+        // Queue cap of 2: the third unit cannot enqueue, so the batch pauses.
+        let first = store.import_jsonl("jsonl", &src, 2).expect("capped import");
+        assert_eq!(first.state, "paused");
+        assert_eq!(
+            first.processed, 2,
+            "governor bounds staging to the queue cap"
+        );
+        assert_eq!(count_imported(&store), 2);
+        let active: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE state IN ('pending', 'deferred', 'running')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("active job count");
+        assert_eq!(active, 2, "embed throughput is bounded during backfill");
+
+        // Worker drains the queue; resuming completes the batch.
+        store
+            .conn
+            .execute("UPDATE jobs SET state = 'done' WHERE state = 'pending'", [])
+            .expect("drain queue");
+        let second = store
+            .import_jsonl("jsonl", &src, 2)
+            .expect("resumed import");
+        assert_eq!(second.state, "completed");
+        assert_eq!(second.processed, 3, "resumes from where it paused");
+        assert_eq!(
+            second.skipped, 2,
+            "the two already-staged units dedup on resume"
+        );
+        assert_eq!(count_imported(&store), 3, "no duplicates after resume");
+
+        let _ = fs::remove_file(&src);
+        cleanup_db_files(&db);
     }
 
     #[test]
