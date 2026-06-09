@@ -81,6 +81,13 @@ Implemented now:
   Idempotent by a `content_hash` partial-unique index (migration 0003; FNV-1a, not BLAKE3),
   resumable, and governor-bounded (pauses when the embed queue is full). Source-specific
   importers and distillation into `memories` are deferred to M6.
+- M6 dream plane: `dream --now` (and a `serve` scheduler) consolidates pending raw_events
+  into durable `memories` + immutable `memory_versions` (lexical dedup-cluster; LLM summary
+  test-double-only) and decays due memories (`active→decaying→dormant→archived`, scan-free
+  via `memories_decay_due`), under wall-clock (`partial`) and provider-spend (`budget_capped`)
+  caps with `dream_runs` accounting. Migration 0004 adds `source_trust`/`decay_score`/
+  `decay_recomputed_at` + a `consolidated_at` cursor. §9.7 cleanup/purge, associations (M7),
+  and profile/approvals (M8) are deferred.
 - CI/security gates for format, build, clippy, tests, dependency policy,
   advisory audit, and SBOM generation.
 - OpenSSF Best Practices passing evidence.
