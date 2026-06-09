@@ -86,8 +86,15 @@ Implemented now:
   test-double-only) and decays due memories (`active→decaying→dormant→archived`, scan-free
   via `memories_decay_due`), under wall-clock (`partial`) and provider-spend (`budget_capped`)
   caps with `dream_runs` accounting. Migration 0004 adds `source_trust`/`decay_score`/
-  `decay_recomputed_at` + a `consolidated_at` cursor. §9.7 cleanup/purge, associations (M7),
-  and profile/approvals (M8) are deferred.
+  `decay_recomputed_at` + a `consolidated_at` cursor. §9.7 cleanup/purge is deferred.
+- M7 association graph + one-hop recall: a `dream` associate phase builds/reinforces/prunes
+  symmetric `memory_links` (co-occurrence by `source_session`; embedding-similarity
+  `semantic` via a test-double — `null` does co-occurrence only), with a per-node fan-out
+  cap (≤32) + weak-floor prune. `recall <q> [--hops 0|1]` adds durable-memory recall over
+  `memories_fts` + one-hop graph expansion, falling back to raw-event recall when no memory
+  matches. `graph_centrality` (§9.4) is precomputed and folded into `R_base` (0.12) and
+  `R_recall`. Migration 0005 adds `memories.centrality`/`source_session`. Link weight
+  temporal-decay and profile/approvals (M8) are deferred.
 - CI/security gates for format, build, clippy, tests, dependency policy,
   advisory audit, and SBOM generation.
 - OpenSSF Best Practices passing evidence.

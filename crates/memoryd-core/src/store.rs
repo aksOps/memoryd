@@ -1,7 +1,8 @@
 use crate::adapters::{AdapterError, ProviderAdapter, prompt_token_estimate};
 use crate::dream::{
-    ARCHIVE_GRACE_MS, decay_score, half_life_ms, lifecycle_for, memory_kind_for, next_decay_at,
-    normalize, score_base, trust_for_source,
+    ARCHIVE_GRACE_MS, ASSOCIATE_FANOUT_CAP, CO_OCCUR_BASE, CO_OCCUR_GROUP_CAP, CO_OCCUR_REINFORCE,
+    SEM_LINK_THRESHOLD, WEAK_LINK_FLOOR, centrality_for, decay_score, half_life_ms, lifecycle_for,
+    memory_kind_for, next_decay_at, normalize, score_base, trust_for_source,
 };
 use crate::import::{ImportError, ImportSummary, ImportUnit, content_hash, parse_jsonl};
 use crate::vectorindex::{Candidate, VectorIndex};
@@ -12,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub const CANONICAL_TABLES: [&str; 13] = [
     "sessions",
@@ -539,9 +540,9 @@ impl Store {
         now_ms: i64,
     ) -> Result<ConsolidateBatch, StoreError> {
         let limit_i = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows: Vec<(i64, String, String, String)> = {
+        let rows: Vec<(i64, String, String, String, String)> = {
             let mut stmt = self.conn.prepare(
-                "SELECT id, payload, source, kind FROM raw_events
+                "SELECT id, payload, source, kind, session_id FROM raw_events
                  WHERE consolidated_at IS NULL ORDER BY id LIMIT ?1",
             )?;
             let mapped = stmt.query_map(params![limit_i], |row| {
@@ -550,6 +551,7 @@ impl Store {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })?;
             mapped.collect::<Result<Vec<_>, _>>()?
@@ -567,7 +569,7 @@ impl Store {
         // Cluster by normalized text, preserving first-seen order for determinism.
         let mut order: Vec<String> = Vec::new();
         let mut clusters: HashMap<String, Cluster> = HashMap::new();
-        for (id, payload, source, kind) in rows {
+        for (id, payload, source, kind, session) in rows {
             let text = raw_event_text(&payload);
             let key = normalize(&text);
             let entry = clusters.entry(key.clone()).or_insert_with(|| {
@@ -576,6 +578,7 @@ impl Store {
                     text: text.clone(),
                     source: source.clone(),
                     kind: kind.clone(),
+                    session: session.clone(),
                     ids: Vec::new(),
                 }
             });
@@ -624,7 +627,7 @@ impl Store {
             let mem_kind = memory_kind_for(&cluster.kind);
             let trust = trust_for_source(&cluster.source, &cluster.kind);
             let decay_at = half_life_ms(mem_kind).map(|hl| now_ms + hl);
-            let base = score_base(1.0, 0, trust, "active");
+            let base = score_base(1.0, 0, trust, "active", 0.0);
             let ids_csv = cluster
                 .ids
                 .iter()
@@ -641,11 +644,23 @@ impl Store {
                 "INSERT INTO memories
                     (id, current_version_id, kind, content, lifecycle_state, relevance_score,
                      last_accessed_at, access_count, decay_at, created_at,
-                     source_trust, decay_score, decay_recomputed_at)
-                 VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, 0, ?7, ?6, ?8, 1.0, ?6)",
+                     source_trust, decay_score, decay_recomputed_at, source_session)
+                 VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, 0, ?7, ?6, ?8, 1.0, ?6, ?9)",
                 params![
-                    mem_id, ver_id, mem_kind, content, base, now_ms, decay_at, trust
+                    mem_id,
+                    ver_id,
+                    mem_kind,
+                    content,
+                    base,
+                    now_ms,
+                    decay_at,
+                    trust,
+                    cluster.session
                 ],
+            )?;
+            tx.execute(
+                "INSERT INTO memories_fts (memory_id, content) VALUES (?1, ?2)",
+                params![mem_id, content],
             )?;
             tx.execute(
                 "INSERT INTO memory_versions
@@ -695,9 +710,10 @@ impl Store {
         now_ms: i64,
     ) -> Result<DecayBatch, StoreError> {
         let limit_i = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows: Vec<(String, String, i64, i64, f64)> = {
+        let rows: Vec<(String, String, i64, i64, f64, f64)> = {
             let mut stmt = self.conn.prepare(
-                "SELECT id, kind, COALESCE(last_accessed_at, created_at), access_count, source_trust
+                "SELECT id, kind, COALESCE(last_accessed_at, created_at), access_count,
+                        source_trust, centrality
                  FROM memories
                  WHERE lifecycle_state IN ('active', 'associated', 'decaying', 'dormant')
                    AND decay_at IS NOT NULL AND decay_at <= ?1
@@ -710,6 +726,7 @@ impl Store {
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, f64>(4)?,
+                    row.get::<_, f64>(5)?,
                 ))
             })?;
             mapped.collect::<Result<Vec<_>, _>>()?
@@ -722,7 +739,7 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut touched = 0usize;
-        for (id, kind, last_accessed, access_count, trust) in &rows {
+        for (id, kind, last_accessed, access_count, trust, centrality) in &rows {
             let Some(hl) = half_life_ms(kind) else {
                 continue;
             };
@@ -730,7 +747,7 @@ impl Store {
             let score = decay_score(dt, hl);
             let state = lifecycle_for(score, dt, hl, ARCHIVE_GRACE_MS);
             let new_decay_at = next_decay_at(state, *last_accessed, hl, ARCHIVE_GRACE_MS);
-            let base = score_base(score, *access_count, *trust, state);
+            let base = score_base(score, *access_count, *trust, state, *centrality);
             tx.execute(
                 "UPDATE memories SET decay_score = ?1, relevance_score = ?2, lifecycle_state = ?3,
                     decay_at = ?4, decay_recomputed_at = ?5 WHERE id = ?6",
@@ -750,6 +767,222 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(DecayBatch { touched })
+    }
+
+    /// Build/reinforce/prune the weighted association graph over recall-eligible
+    /// memories (ARCHITECTURE-PLAN §9.4, §21.10). Two link signals:
+    ///
+    /// * **co-occurrence** (deterministic, works for the no-spend `null` adapter):
+    ///   memories sharing a `source_session` are linked; re-observation reinforces
+    ///   `weight` toward 1.0.
+    /// * **embedding similarity** (`semantic`): only when the adapter carries a usable
+    ///   semantic signal (`embeds_semantically`); pairwise cosine within a bounded
+    ///   window. The `null` adapter skips this path entirely.
+    ///
+    /// Links are stored **symmetrically** (both directions) so the recall hop, the
+    /// per-node fan-out cap, and centrality are all clean `src_memory_id` operations.
+    /// Growth is bounded by the fan-out cap (≤ `ASSOCIATE_FANOUT_CAP` per node); weak
+    /// links (`weight < WEAK_LINK_FLOOR`) are pruned. Centrality is recomputed for the
+    /// batch's candidates and folded into `relevance_score`; a memory that gains a link
+    /// transitions `active → associated`. One IMMEDIATE transaction.
+    pub(crate) fn associate_pending<A: ProviderAdapter>(
+        &mut self,
+        adapter: &A,
+        _run_started_ms: i64,
+        now_ms: i64,
+    ) -> Result<AssociateBatch, StoreError> {
+        struct Cand {
+            id: String,
+            content: String,
+            session: Option<String>,
+            decay_score: f64,
+            access_count: i64,
+            trust: f64,
+            state: String,
+        }
+        // Phase A (no transaction): load candidates, then compute memory embeddings via
+        // the adapter (a non-DB call) so the write transaction below holds no provider latency.
+        let cands: Vec<Cand> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, content, source_session, decay_score, access_count, source_trust,
+                        lifecycle_state
+                 FROM memories
+                 WHERE lifecycle_state IN ('active', 'associated', 'decaying', 'dormant')
+                 ORDER BY created_at ASC, id ASC LIMIT ?1",
+            )?;
+            let mapped = stmt.query_map(params![crate::dream::ASSOCIATE_BATCH as i64], |row| {
+                Ok(Cand {
+                    id: row.get(0)?,
+                    content: row.get(1)?,
+                    session: row.get(2)?,
+                    decay_score: row.get(3)?,
+                    access_count: row.get(4)?,
+                    trust: row.get(5)?,
+                    state: row.get(6)?,
+                })
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        if cands.len() < 2 {
+            return Ok(AssociateBatch::default());
+        }
+
+        let do_semantic = adapter.reachable() && adapter.embeds_semantically();
+        // Semantic pairing is O(n²); bound it to a window. Full-corpus semantic
+        // association awaits ANN (M9 HNSW).
+        let sem_window = cands.len().min(CO_OCCUR_GROUP_CAP);
+        let mut mem_vectors: Vec<Option<Vec<f32>>> = vec![None; cands.len()];
+        if do_semantic {
+            let texts: Vec<String> = cands
+                .iter()
+                .take(sem_window)
+                .map(|c| c.content.clone())
+                .collect();
+            if let Ok(vectors) = adapter.embed(&texts) {
+                for (i, vector) in vectors.into_iter().enumerate() {
+                    if !vector.is_empty() {
+                        mem_vectors[i] = Some(vector);
+                    }
+                }
+            }
+        }
+
+        let mut batch = AssociateBatch::default();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Persist memory embeddings (reused by semantic recall rerank).
+        if do_semantic {
+            for (i, c) in cands.iter().enumerate().take(sem_window) {
+                if let Some(vector) = &mem_vectors[i] {
+                    Self::store_embedding(
+                        &tx,
+                        "memory",
+                        &c.id,
+                        adapter.model_id(),
+                        vector,
+                        now_ms,
+                    )?;
+                }
+            }
+        }
+
+        // Co-occurrence: group by session, cap each group, link every pair (both directions).
+        let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, c) in cands.iter().enumerate() {
+            if let Some(session) = &c.session {
+                groups.entry(session.as_str()).or_default().push(i);
+            }
+        }
+        for members in groups.values() {
+            let capped = &members[..members.len().min(CO_OCCUR_GROUP_CAP)];
+            for a in 0..capped.len() {
+                for b in (a + 1)..capped.len() {
+                    let ia = capped[a];
+                    let ib = capped[b];
+                    let created = upsert_cooccur(&tx, &cands[ia].id, &cands[ib].id, now_ms)?;
+                    upsert_cooccur(&tx, &cands[ib].id, &cands[ia].id, now_ms)?;
+                    if created {
+                        batch.links_created += 1;
+                    } else {
+                        batch.links_reinforced += 1;
+                    }
+                }
+            }
+        }
+
+        // Embedding-similarity links over the bounded window (cross-session allowed).
+        if do_semantic {
+            for i in 0..sem_window {
+                for j in (i + 1)..sem_window {
+                    if let (Some(vi), Some(vj)) = (&mem_vectors[i], &mem_vectors[j]) {
+                        let cos = f64::from(cosine(vi, vj));
+                        if cos >= SEM_LINK_THRESHOLD {
+                            let weight = ((cos + 1.0) / 2.0).clamp(0.0, 1.0);
+                            let created =
+                                upsert_semantic(&tx, &cands[i].id, &cands[j].id, weight, now_ms)?;
+                            upsert_semantic(&tx, &cands[j].id, &cands[i].id, weight, now_ms)?;
+                            if created {
+                                batch.links_created += 1;
+                            } else {
+                                batch.links_reinforced += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Prune weak links, then enforce the per-node fan-out cap (bounds growth, §21.10).
+        batch.links_pruned += tx.execute(
+            "DELETE FROM memory_links WHERE weight < ?1",
+            params![WEAK_LINK_FLOOR],
+        )?;
+        batch.links_pruned += tx.execute(
+            "DELETE FROM memory_links WHERE id IN (
+                 SELECT id FROM (
+                     SELECT id, ROW_NUMBER() OVER (
+                         PARTITION BY src_memory_id ORDER BY weight DESC, id ASC
+                     ) AS rn
+                     FROM memory_links
+                 ) WHERE rn > ?1)",
+            params![ASSOCIATE_FANOUT_CAP as i64],
+        )?;
+
+        // Recompute centrality for the batch's candidates over the final graph; fold it
+        // into relevance_score; promote `active → associated` when a node has any link.
+        for c in &cands {
+            let sum: f64 = tx.query_row(
+                "SELECT COALESCE(SUM(weight), 0.0) FROM memory_links WHERE src_memory_id = ?1",
+                params![c.id],
+                |row| row.get(0),
+            )?;
+            let degree: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM memory_links WHERE src_memory_id = ?1",
+                params![c.id],
+                |row| row.get(0),
+            )?;
+            let centrality = centrality_for(sum);
+            let new_state: &str = if degree > 0 && c.state == "active" {
+                "associated"
+            } else {
+                c.state.as_str()
+            };
+            let relevance = score_base(
+                c.decay_score,
+                c.access_count,
+                c.trust,
+                new_state,
+                centrality,
+            );
+            tx.execute(
+                "UPDATE memories SET centrality = ?1, relevance_score = ?2, lifecycle_state = ?3
+                 WHERE id = ?4",
+                params![centrality, relevance, new_state, c.id],
+            )?;
+            if degree > 0 {
+                batch.nodes_associated += 1;
+            }
+        }
+
+        let detail = serde_json::to_string(&serde_json::json!({
+            "links_created": batch.links_created,
+            "links_reinforced": batch.links_reinforced,
+            "links_pruned": batch.links_pruned,
+            "nodes_associated": batch.nodes_associated,
+        }))?;
+        insert_audit_log(
+            &tx,
+            AUDIT_ACTOR,
+            "associate",
+            "memory",
+            None,
+            Some(detail.as_str()),
+            now_ms,
+        )?;
+        tx.commit()?;
+        Ok(batch)
     }
 
     pub fn doctor_report(&self) -> Result<DoctorReport, StoreError> {
@@ -957,6 +1190,251 @@ impl Store {
             hits: fused,
             degraded: false,
             mode: "semantic",
+            compared,
+        })
+    }
+
+    /// Durable-memory recall with optional one-hop graph expansion (ARCHITECTURE-PLAN
+    /// §5.3 path (c)/(d), §9.3 `R_recall`, §21.10). Pipeline: FTS5 prefilter over
+    /// `memories_fts` → optional semantic rerank (cosine over cached memory embeddings,
+    /// only when the adapter carries a usable semantic signal) → optional one-hop
+    /// expansion over `memory_links` (`hops == 1`) → fuse the canonical recall variables
+    /// → top-`limit`. Returns an empty result (no error) when nothing matches, so the
+    /// caller can fall back to raw-event recall. Reads only (aside from the optional
+    /// query-embedding cache write, shared with [`Store::recall_semantic`]).
+    pub fn recall_memories(
+        &self,
+        query: &str,
+        limit: usize,
+        hops: u8,
+        adapter: &dyn ProviderAdapter,
+        now_ms: i64,
+    ) -> Result<MemoryRecallResult, StoreError> {
+        struct Cand {
+            id: String,
+            kind: String,
+            content: String,
+            bm25: Option<f64>,
+            centrality: f64,
+            trust: f64,
+            last_accessed: i64,
+            access_count: i64,
+            state: String,
+            link_strength: f64,
+            via_hop: bool,
+        }
+        let fts_query = lexical_query(query).ok_or(StoreError::InvalidRecallQuery)?;
+        let limit = limit.clamp(1, 50);
+        let mode: &'static str = if hops >= 1 { "memory+graph" } else { "memory" };
+
+        // (a) FTS5 prefilter, bounded to RECALL_CANDIDATE_CAP best lexical matches.
+        let mut cands: Vec<Cand> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT f.memory_id, m.kind, m.content, bm25(memories_fts) AS score,
+                        m.centrality, m.source_trust,
+                        COALESCE(m.last_accessed_at, m.created_at), m.access_count,
+                        m.lifecycle_state
+                 FROM memories_fts f JOIN memories m ON m.id = f.memory_id
+                 WHERE memories_fts MATCH ?1
+                   AND m.lifecycle_state IN ('active', 'associated', 'decaying', 'dormant')
+                 ORDER BY score LIMIT ?2",
+            )?;
+            let mapped = stmt.query_map(params![fts_query, RECALL_CANDIDATE_CAP], |row| {
+                Ok(Cand {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    content: row.get(2)?,
+                    bm25: Some(row.get(3)?),
+                    centrality: row.get(4)?,
+                    trust: row.get(5)?,
+                    last_accessed: row.get(6)?,
+                    access_count: row.get(7)?,
+                    state: row.get(8)?,
+                    link_strength: 0.0,
+                    via_hop: false,
+                })
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        if cands.is_empty() {
+            return Ok(MemoryRecallResult {
+                hits: Vec::new(),
+                degraded: false,
+                mode,
+                compared: 0,
+            });
+        }
+
+        // (b) Optional semantic rerank: cosine of the query embedding against cached
+        // per-memory embeddings. Only attempted when the adapter has a usable signal.
+        let wants_semantic = adapter.reachable() && adapter.embeds_semantically();
+        let mut cosines: HashMap<String, f64> = HashMap::new();
+        let mut compared = 0usize;
+        if wants_semantic && let Some(query_vec) = self.query_embedding(query, adapter, now_ms)? {
+            let model_id = adapter.model_id();
+            for c in &cands {
+                if let Some(vector) = self.embedding_vector("memory", &c.id, model_id)? {
+                    cosines.insert(c.id.clone(), f64::from(cosine(&query_vec, &vector)));
+                    compared += 1;
+                }
+            }
+        }
+        let semantic_available = compared > 0;
+        let degraded = wants_semantic && !semantic_available;
+
+        // (c) One-hop expansion: pull strongest neighbors of each direct hit (links are
+        // stored symmetrically, so a single src lookup yields the full neighborhood).
+        if hops >= 1 {
+            let direct_ids: Vec<String> = cands.iter().map(|c| c.id.clone()).collect();
+            let mut seen: std::collections::HashMap<String, usize> = cands
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.id.clone(), i))
+                .collect();
+            for src in &direct_ids {
+                let neighbors: Vec<(String, f64)> = {
+                    let mut stmt = self.conn.prepare(
+                        "SELECT dst_memory_id, weight FROM memory_links
+                         WHERE src_memory_id = ?1 ORDER BY weight DESC, dst_memory_id LIMIT ?2",
+                    )?;
+                    let mapped = stmt
+                        .query_map(params![src, ASSOCIATE_FANOUT_CAP as i64], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                        })?;
+                    mapped.collect::<Result<Vec<_>, _>>()?
+                };
+                for (dst, weight) in neighbors {
+                    if let Some(&idx) = seen.get(&dst) {
+                        // Already a candidate: it also earns the strongest reaching link.
+                        if weight > cands[idx].link_strength {
+                            cands[idx].link_strength = weight;
+                        }
+                        continue;
+                    }
+                    let row: Option<(String, String, f64, f64, i64, i64, String)> = self
+                        .conn
+                        .query_row(
+                            "SELECT kind, content, centrality, source_trust,
+                                    COALESCE(last_accessed_at, created_at), access_count,
+                                    lifecycle_state
+                             FROM memories
+                             WHERE id = ?1
+                               AND lifecycle_state IN
+                                   ('active', 'associated', 'decaying', 'dormant')",
+                            params![dst],
+                            |r| {
+                                Ok((
+                                    r.get(0)?,
+                                    r.get(1)?,
+                                    r.get(2)?,
+                                    r.get(3)?,
+                                    r.get(4)?,
+                                    r.get(5)?,
+                                    r.get(6)?,
+                                ))
+                            },
+                        )
+                        .optional()?;
+                    if let Some((
+                        kind,
+                        content,
+                        centrality,
+                        trust,
+                        last_accessed,
+                        access_count,
+                        state,
+                    )) = row
+                    {
+                        seen.insert(dst.clone(), cands.len());
+                        cands.push(Cand {
+                            id: dst,
+                            kind,
+                            content,
+                            bm25: None,
+                            centrality,
+                            trust,
+                            last_accessed,
+                            access_count,
+                            state,
+                            link_strength: weight,
+                            via_hop: true,
+                        });
+                    }
+                }
+            }
+        }
+
+        // (d) Fuse the canonical recall variables. Lexical and centrality are min-max
+        // normalized within the candidate set (§9.3/§9.4).
+        let lex_raw: Vec<f64> = cands.iter().map(|c| c.bm25.map_or(0.0, |b| -b)).collect();
+        let (lex_lo, lex_hi) = cands
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.bm25.is_some())
+            .map(|(i, _)| lex_raw[i])
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+                (lo.min(v), hi.max(v))
+            });
+        let lex_span = lex_hi - lex_lo;
+        let (cen_lo, cen_hi) = cands
+            .iter()
+            .map(|c| c.centrality)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+                (lo.min(v), hi.max(v))
+            });
+        let cen_span = cen_hi - cen_lo;
+
+        let mut hits: Vec<MemoryHit> = cands
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let lexical = if c.bm25.is_none() {
+                    0.0
+                } else if lex_span > 0.0 {
+                    (lex_raw[i] - lex_lo) / lex_span
+                } else {
+                    0.5
+                };
+                let centrality_norm = if cen_span > 0.0 {
+                    (c.centrality - cen_lo) / cen_span
+                } else {
+                    0.0
+                };
+                let semantic = cosines.get(&c.id).map_or(0.0, |cos| (cos + 1.0) / 2.0);
+                let terms = crate::dream::RecallTerms {
+                    semantic,
+                    lexical,
+                    recency: crate::dream::recency_term(now_ms - c.last_accessed),
+                    access_freq: crate::dream::access_frequency(c.access_count),
+                    link_strength: c.link_strength,
+                    centrality: centrality_norm,
+                    source_trust: c.trust,
+                    lifecycle_bonus: crate::dream::lifecycle_bonus_signed(&c.state),
+                };
+                MemoryHit {
+                    memory_id: c.id.clone(),
+                    kind: c.kind.clone(),
+                    content: c.content.clone(),
+                    score: crate::dream::score_recall(&terms, semantic_available),
+                    via_hop: c.via_hop,
+                    link_strength: c.link_strength,
+                }
+            })
+            .collect();
+        // Deterministic order: score desc, then memory_id desc (last_accessed is folded
+        // into the score via the recency term).
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.memory_id.cmp(&a.memory_id))
+        });
+        hits.truncate(limit);
+
+        Ok(MemoryRecallResult {
+            hits,
+            degraded,
+            mode,
             compared,
         })
     }
@@ -1278,6 +1756,29 @@ pub struct RecallHit {
     pub kind: String,
     pub content: String,
     pub score: f64,
+}
+
+/// One ranked durable memory returned by [`Store::recall_memories`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryHit {
+    pub memory_id: String,
+    pub kind: String,
+    pub content: String,
+    pub score: f64,
+    /// True when this memory was reached only via a one-hop graph expansion.
+    pub via_hop: bool,
+    /// Strength of the link a hop-neighbor was reached by (0 for direct hits).
+    pub link_strength: f64,
+}
+
+/// Result of [`Store::recall_memories`] — the durable-memory + graph recall path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryRecallResult {
+    pub hits: Vec<MemoryHit>,
+    pub degraded: bool,
+    pub mode: &'static str,
+    /// Number of candidate memory vectors compared (semantic rerank); 0 when lexical.
+    pub compared: usize,
 }
 
 /// A claimed embed job — the unit a worker processes for one lease.
@@ -1904,6 +2405,24 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
         )?;
     }
 
+    let applied_0005 = tx
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [5],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+
+    if !applied_0005 {
+        tx.execute_batch(MIGRATION_0005)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (?1, ?2, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
+            (5, "0005_association_graph"),
+        )?;
+    }
+
     tx.commit()?;
     Ok(())
 }
@@ -2146,11 +2665,25 @@ pub struct DecayBatch {
     pub touched: usize,
 }
 
+/// Outcome of one [`Store::associate_pending`] pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AssociateBatch {
+    /// New link pairs created this run.
+    pub links_created: usize,
+    /// Existing link pairs reinforced this run.
+    pub links_reinforced: usize,
+    /// Directed link rows deleted (weak-floor + fan-out cap).
+    pub links_pruned: usize,
+    /// Memories that hold at least one link after this run.
+    pub nodes_associated: usize,
+}
+
 /// A dedup-cluster of raw_events sharing the same normalized text.
 struct Cluster {
     text: String,
     source: String,
     kind: String,
+    session: String,
     ids: Vec<i64>,
 }
 
@@ -2168,6 +2701,98 @@ fn raw_event_text(payload: &str) -> String {
         .unwrap_or_else(|| payload.to_string())
 }
 
+/// Cosine similarity of two vectors; 0 for a zero-norm vector. Compares the shared
+/// prefix when lengths differ (defensive — embeddings of one model share a dim).
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+    for i in 0..n {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+/// Insert (weight = `CO_OCCUR_BASE`) or reinforce (weight += `CO_OCCUR_REINFORCE`,
+/// capped at 1.0) one directed co-occurrence edge. Returns `true` on first creation.
+fn upsert_cooccur(
+    tx: &rusqlite::Transaction<'_>,
+    src: &str,
+    dst: &str,
+    now_ms: i64,
+) -> Result<bool, StoreError> {
+    let existing: Option<f64> = tx
+        .query_row(
+            "SELECT weight FROM memory_links
+             WHERE src_memory_id = ?1 AND dst_memory_id = ?2 AND link_type = 'co_occurrence'",
+            params![src, dst],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match existing {
+        None => {
+            tx.execute(
+                "INSERT INTO memory_links
+                    (id, src_memory_id, dst_memory_id, link_type, weight, last_reinforced_at)
+                 VALUES (lower(hex(randomblob(16))), ?1, ?2, 'co_occurrence', ?3, ?4)",
+                params![src, dst, CO_OCCUR_BASE, now_ms],
+            )?;
+            Ok(true)
+        }
+        Some(weight) => {
+            let reinforced = (weight + CO_OCCUR_REINFORCE).min(1.0);
+            tx.execute(
+                "UPDATE memory_links SET weight = ?1, last_reinforced_at = ?2
+                 WHERE src_memory_id = ?3 AND dst_memory_id = ?4 AND link_type = 'co_occurrence'",
+                params![reinforced, now_ms, src, dst],
+            )?;
+            Ok(false)
+        }
+    }
+}
+
+/// Insert or strengthen one directed `semantic` edge to `max(existing, weight)`.
+/// Returns `true` on first creation.
+fn upsert_semantic(
+    tx: &rusqlite::Transaction<'_>,
+    src: &str,
+    dst: &str,
+    weight: f64,
+    now_ms: i64,
+) -> Result<bool, StoreError> {
+    let existing: Option<f64> = tx
+        .query_row(
+            "SELECT weight FROM memory_links
+             WHERE src_memory_id = ?1 AND dst_memory_id = ?2 AND link_type = 'semantic'",
+            params![src, dst],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match existing {
+        None => {
+            tx.execute(
+                "INSERT INTO memory_links
+                    (id, src_memory_id, dst_memory_id, link_type, weight, last_reinforced_at)
+                 VALUES (lower(hex(randomblob(16))), ?1, ?2, 'semantic', ?3, ?4)",
+                params![src, dst, weight, now_ms],
+            )?;
+            Ok(true)
+        }
+        Some(old) => {
+            tx.execute(
+                "UPDATE memory_links SET weight = ?1, last_reinforced_at = ?2
+                 WHERE src_memory_id = ?3 AND dst_memory_id = ?4 AND link_type = 'semantic'",
+                params![old.max(weight), now_ms, src, dst],
+            )?;
+            Ok(false)
+        }
+    }
+}
+
 // Staging-dedup key for imported rows (ARCHITECTURE-PLAN s11.6). NULL for native
 // captures; the partial unique index makes re-import a no-op for seen content.
 const MIGRATION_0003: &str = r#"
@@ -2182,6 +2807,12 @@ ALTER TABLE memories ADD COLUMN decay_score REAL NOT NULL DEFAULT 1.0;
 ALTER TABLE memories ADD COLUMN decay_recomputed_at INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE raw_events ADD COLUMN consolidated_at INTEGER;
 CREATE INDEX raw_events_unconsolidated ON raw_events(id) WHERE consolidated_at IS NULL;
+"#;
+
+const MIGRATION_0005: &str = r#"
+ALTER TABLE memories ADD COLUMN centrality REAL NOT NULL DEFAULT 0.0;
+ALTER TABLE memories ADD COLUMN source_session TEXT;
+CREATE INDEX memories_session ON memories(source_session) WHERE source_session IS NOT NULL;
 "#;
 
 #[cfg(test)]
@@ -3643,11 +4274,12 @@ mod tests {
             touched, 2,
             "two distinct raw_events consolidate into two memories"
         );
-        // jobs_run counts batch operations, not rows: one consolidate batch, no decay
-        // batch (fresh memories are not yet due) -> distinct from memories_touched.
+        // jobs_run counts batch operations, not rows: one consolidate batch + one
+        // associate batch (both same-session memories link), no decay batch (fresh
+        // memories are not yet due) -> distinct from memories_touched.
         assert_eq!(
-            jobs_run, 1,
-            "jobs_run is the batch count, not the row count"
+            jobs_run, 2,
+            "jobs_run is the batch count (consolidate + associate), not the row count"
         );
         assert_eq!(status, "completed");
         assert!(finished.is_some(), "finished_at is stamped");
@@ -4203,5 +4835,424 @@ mod tests {
             let file = PathBuf::from(format!("{}{suffix}", path.display()));
             let _ = fs::remove_file(file);
         }
+    }
+
+    use crate::adapters::NullAdapter;
+
+    // Mirror of the dream-plane association constants for assertions (private to dream).
+    const CO_OCCUR_BASE_T: f64 = 0.30;
+    const CO_OCCUR_REINFORCE_T: f64 = 0.10;
+    const FANOUT_CAP_T: i64 = 32;
+
+    // ---- M7: association graph + one-hop recall ----
+
+    fn capture_in(store: &mut Store, session: &str, ts: i64, text: &str) -> i64 {
+        store
+            .capture_event(test_event_with_text(session, ts, text))
+            .expect("capture succeeds")
+            .raw_event_id
+    }
+
+    /// Seed a durable, recall-searchable memory directly (memories + memories_fts).
+    fn seed_mem(
+        store: &Store,
+        id: &str,
+        kind: &str,
+        content: &str,
+        session: Option<&str>,
+        state: &str,
+        now: i64,
+    ) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO memories
+                    (id, kind, content, lifecycle_state, relevance_score, last_accessed_at,
+                     access_count, decay_at, created_at, source_trust, decay_score,
+                     decay_recomputed_at, centrality, source_session)
+                 VALUES (?1, ?2, ?3, ?4, 0.5, ?5, 0, NULL, ?5, 0.5, 1.0, 0, 0.0, ?6)",
+                params![id, kind, content, state, now, session],
+            )
+            .expect("seed memory");
+        store
+            .conn
+            .execute(
+                "INSERT INTO memories_fts (memory_id, content) VALUES (?1, ?2)",
+                params![id, content],
+            )
+            .expect("seed fts");
+    }
+
+    fn seed_link(store: &Store, src: &str, dst: &str, link_type: &str, weight: f64, now: i64) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO memory_links
+                    (id, src_memory_id, dst_memory_id, link_type, weight, last_reinforced_at)
+                 VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5)",
+                params![src, dst, link_type, weight, now],
+            )
+            .expect("seed link");
+    }
+
+    fn link_count(store: &Store) -> i64 {
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_links", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn associate_co_occurrence_links_same_session() {
+        let path = temp_db_path("assoc-cooccur");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_mem(
+            &store,
+            "a",
+            "observation",
+            "wal busy timeout",
+            Some("s1"),
+            "active",
+            now,
+        );
+        seed_mem(
+            &store,
+            "b",
+            "observation",
+            "vacuum schedule",
+            Some("s1"),
+            "active",
+            now,
+        );
+
+        let batch = store
+            .associate_pending(&NullAdapter::new(), now, now)
+            .expect("associate runs");
+
+        assert_eq!(batch.links_created, 1, "one logical co-occurrence pair");
+        // Symmetric storage => two directed rows.
+        assert_eq!(link_count(&store), 2);
+        let (lt, w): (String, f64) = store
+            .conn
+            .query_row(
+                "SELECT link_type, weight FROM memory_links WHERE src_memory_id='a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lt, "co_occurrence");
+        assert!(
+            (w - CO_OCCUR_BASE_T).abs() < 1e-9,
+            "fresh weight = base, got {w}"
+        );
+        // Both nodes promoted active -> associated with non-zero centrality.
+        for id in ["a", "b"] {
+            let (state, cen): (String, f64) = store
+                .conn
+                .query_row(
+                    "SELECT lifecycle_state, centrality FROM memories WHERE id=?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(state, "associated", "node {id} associated");
+            assert!(cen > 0.0, "node {id} centrality > 0");
+        }
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn associate_reinforces_co_occurrence_on_rerun() {
+        let path = temp_db_path("assoc-reinforce");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_mem(
+            &store,
+            "a",
+            "observation",
+            "alpha text",
+            Some("s1"),
+            "active",
+            now,
+        );
+        seed_mem(
+            &store,
+            "b",
+            "observation",
+            "beta text",
+            Some("s1"),
+            "active",
+            now,
+        );
+
+        store
+            .associate_pending(&NullAdapter::new(), now, now)
+            .unwrap();
+        let later = now + 60_000;
+        let batch = store
+            .associate_pending(&NullAdapter::new(), later, later)
+            .expect("re-associate");
+
+        assert_eq!(
+            batch.links_reinforced, 1,
+            "existing pair reinforced, not recreated"
+        );
+        assert_eq!(link_count(&store), 2, "still one symmetric pair (UNIQUE)");
+        let (w, reinforced_at): (f64, i64) = store
+            .conn
+            .query_row(
+                "SELECT weight, last_reinforced_at FROM memory_links WHERE src_memory_id='a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            (w - (CO_OCCUR_BASE_T + CO_OCCUR_REINFORCE_T)).abs() < 1e-9,
+            "reinforced weight, got {w}"
+        );
+        assert_eq!(reinforced_at, later, "last_reinforced_at advanced");
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn associate_semantic_links_via_concept_adapter() {
+        let path = temp_db_path("assoc-semantic");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        // Same concept word ("database"/"sqlite" -> dim 1), DIFFERENT sessions so only
+        // the embedding-similarity path can link them.
+        seed_mem(
+            &store,
+            "a",
+            "observation",
+            "database schema design",
+            Some("s1"),
+            "active",
+            now,
+        );
+        seed_mem(
+            &store,
+            "b",
+            "observation",
+            "sqlite wal checkpoint",
+            Some("s2"),
+            "active",
+            now,
+        );
+
+        let batch = store
+            .associate_pending(&ConceptAdapter, now, now)
+            .expect("associate runs");
+
+        assert_eq!(
+            batch.links_created, 1,
+            "one semantic pair from shared concept"
+        );
+        let lt: String = store
+            .conn
+            .query_row(
+                "SELECT link_type FROM memory_links WHERE src_memory_id='a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(lt, "semantic");
+        // Memory embeddings were cached (reused by semantic recall rerank).
+        let mem_vecs: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM embeddings WHERE owner_type='memory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mem_vecs, 2);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn associate_fanout_cap_bounds_links() {
+        let path = temp_db_path("assoc-fanout");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        // 40 same-session memories: a complete co-occurrence graph would give each node
+        // 39 links; the fan-out cap must hold each node at <= ASSOCIATE_FANOUT_CAP.
+        for i in 0..40 {
+            seed_mem(
+                &store,
+                &format!("m{i:02}"),
+                "observation",
+                &format!("distinct memory body number {i}"),
+                Some("s1"),
+                "active",
+                now,
+            );
+        }
+        store
+            .associate_pending(&NullAdapter::new(), now, now)
+            .unwrap();
+
+        let max_degree: i64 = store
+            .conn
+            .query_row(
+                "SELECT MAX(c) FROM (SELECT COUNT(*) c FROM memory_links GROUP BY src_memory_id)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            max_degree <= FANOUT_CAP_T,
+            "per-node fan-out {max_degree} exceeds cap {FANOUT_CAP_T}"
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn associate_prunes_weak_links() {
+        let path = temp_db_path("assoc-weak");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        // Different sessions => associate creates no co-occurrence link; the pre-existing
+        // sub-floor link must be pruned.
+        seed_mem(
+            &store,
+            "a",
+            "observation",
+            "alpha",
+            Some("s1"),
+            "active",
+            now,
+        );
+        seed_mem(
+            &store,
+            "b",
+            "observation",
+            "beta",
+            Some("s2"),
+            "active",
+            now,
+        );
+        seed_link(&store, "a", "b", "co_occurrence", 0.05, now);
+        seed_link(&store, "b", "a", "co_occurrence", 0.05, now);
+        assert_eq!(link_count(&store), 2);
+
+        let batch = store
+            .associate_pending(&NullAdapter::new(), now, now)
+            .unwrap();
+
+        assert_eq!(link_count(&store), 0, "weak links pruned");
+        assert!(batch.links_pruned >= 2, "pruned count reported");
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn recall_memories_one_hop_surfaces_missed_neighbor() {
+        let path = temp_db_path("recall-onehop");
+        let store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        // memA matches the query; memB does not, but is linked to A.
+        seed_mem(
+            &store,
+            "a",
+            "observation",
+            "wal busy timeout fix",
+            Some("s1"),
+            "active",
+            now,
+        );
+        seed_mem(
+            &store,
+            "b",
+            "observation",
+            "vacuum schedule weekly",
+            Some("s1"),
+            "active",
+            now,
+        );
+        seed_link(&store, "a", "b", "co_occurrence", 0.5, now);
+        seed_link(&store, "b", "a", "co_occurrence", 0.5, now);
+        let adapter = NullAdapter::new();
+
+        let direct = store
+            .recall_memories("wal", 5, 0, &adapter, now)
+            .expect("hops=0");
+        assert_eq!(direct.mode, "memory");
+        let direct_ids: Vec<&str> = direct.hits.iter().map(|h| h.memory_id.as_str()).collect();
+        assert_eq!(
+            direct_ids,
+            vec!["a"],
+            "hops=0 returns only the lexical match"
+        );
+
+        let expanded = store
+            .recall_memories("wal", 5, 1, &adapter, now)
+            .expect("hops=1");
+        assert_eq!(expanded.mode, "memory+graph");
+        let ids: std::collections::HashSet<&str> =
+            expanded.hits.iter().map(|h| h.memory_id.as_str()).collect();
+        assert!(
+            ids.contains("a") && ids.contains("b"),
+            "one-hop surfaces the neighbor B"
+        );
+        let b_hit = expanded.hits.iter().find(|h| h.memory_id == "b").unwrap();
+        assert!(b_hit.via_hop, "B is flagged as reached via graph hop");
+        assert!((b_hit.link_strength - 0.5).abs() < 1e-9);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn recall_memories_empty_when_no_memory_matches() {
+        let path = temp_db_path("recall-empty");
+        let store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_mem(
+            &store,
+            "a",
+            "observation",
+            "vacuum schedule",
+            Some("s1"),
+            "active",
+            now,
+        );
+        let adapter = NullAdapter::new();
+        let result = store
+            .recall_memories("nonexistentterm", 5, 1, &adapter, now)
+            .unwrap();
+        assert!(
+            result.hits.is_empty(),
+            "no lexical match => empty (caller falls back)"
+        );
+        assert!(!result.degraded);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn dream_once_runs_associate_phase() {
+        use crate::dream::{DreamOptions, dream_once};
+        let path = temp_db_path("dream-associate");
+        let mut store = Store::open(&path).expect("store opens");
+        // Two distinct-text events in the same session -> two memories, then a co-occ link.
+        capture_in(&mut store, "s1", 1000, "wal busy timeout fix");
+        capture_in(&mut store, "s1", 1001, "vacuum schedule weekly");
+        let now = 2_000_000_000_000i64;
+        let opts = DreamOptions {
+            trigger: "manual",
+            budget_usd: 0.0,
+            max_seconds: 60,
+        };
+        let outcome = dream_once(
+            &mut store,
+            &NullAdapter::new(),
+            &crate::config::Caps::small(),
+            &opts,
+            &|| now,
+        )
+        .expect("dream runs");
+
+        assert_eq!(outcome.consolidated, 2);
+        assert_eq!(outcome.associated, 2, "both memories gain a link");
+        assert_eq!(link_count(&store), 2, "one symmetric co-occurrence pair");
+        cleanup_db_files(&path);
     }
 }

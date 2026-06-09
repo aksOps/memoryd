@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 use memoryd_core::config::{Config, DEFAULT_BIND};
-use memoryd_core::store::{CaptureAck, NewRawEvent, RecallResult, Store, StoreError};
+use memoryd_core::store::{
+    CaptureAck, MemoryRecallResult, NewRawEvent, RecallResult, Store, StoreError,
+};
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
@@ -157,14 +159,29 @@ fn dream(cli: Cli, args: DreamArgs) -> Result<(), CliError> {
 /// adapter ships today, and it self-degrades to lexical (`embeds_semantically`
 /// is false), so `--semantic` is safe by default; a configured non-`null` embedding
 /// provider (deferred M3 increment) activates real rerank with no caller change.
-fn recall_with_mode(store: &Store, args: &RecallArgs) -> Result<RecallResult, StoreError> {
-    if args.semantic {
-        let adapter = memoryd_core::adapters::NullAdapter::new();
-        let index = memoryd_core::vectorindex::BruteForce;
-        store.recall_semantic(&args.query, args.limit, &adapter, &index, unix_ms_now())
-    } else {
-        store.recall_events(&args.query, args.limit)
+fn recall_with_mode(store: &Store, args: &RecallArgs) -> Result<RecallOutput, StoreError> {
+    let adapter = memoryd_core::adapters::NullAdapter::new();
+    // Prefer durable memory + graph recall; fall back to raw-event recall when the
+    // memory corpus has no match (e.g. before any dream run) so M2 behavior is preserved.
+    let memory =
+        store.recall_memories(&args.query, args.limit, args.hops, &adapter, unix_ms_now())?;
+    if !memory.hits.is_empty() {
+        return Ok(RecallOutput::Memory(memory));
     }
+    let event = if args.semantic {
+        let index = memoryd_core::vectorindex::BruteForce;
+        store.recall_semantic(&args.query, args.limit, &adapter, &index, unix_ms_now())?
+    } else {
+        store.recall_events(&args.query, args.limit)?
+    };
+    Ok(RecallOutput::Event(event))
+}
+
+/// Recall returns either durable memories (with optional graph expansion) or raw
+/// events (the M2 degrade path) depending on whether the memory corpus matched.
+enum RecallOutput {
+    Memory(MemoryRecallResult),
+    Event(RecallResult),
 }
 
 fn serve(cli: Cli) -> Result<(), CliError> {
@@ -295,6 +312,8 @@ struct RecallArgs {
     query: String,
     limit: usize,
     semantic: bool,
+    /// One-hop graph expansion: 1 = expand over `memory_links` (default), 0 = direct only.
+    hops: u8,
 }
 
 impl Default for RecallArgs {
@@ -303,6 +322,7 @@ impl Default for RecallArgs {
             query: String::new(),
             limit: 5,
             semantic: false,
+            hops: 1,
         }
     }
 }
@@ -446,6 +466,13 @@ impl Cli {
                     };
                     recall.semantic = true;
                 }
+                "--hops" => {
+                    let Command::Recall(recall) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    let value = next_string(&mut args, "--hops")?;
+                    recall.hops = parse_hops(&value)?;
+                }
                 "--no-wait" => {
                     if !matches!(command, Command::Remember(_)) {
                         return Err(CliError::UnknownFlag(token));
@@ -533,6 +560,15 @@ fn parse_limit(flag: &'static str, value: &str) -> Result<usize, CliError> {
     Ok(limit)
 }
 
+/// Parse the `--hops` flag: only 0 (direct hits) or 1 (one-hop expansion) are valid.
+fn parse_hops(value: &str) -> Result<u8, CliError> {
+    match value {
+        "0" => Ok(0),
+        "1" => Ok(1),
+        _ => Err(CliError::InvalidNumberFlag("--hops", value.to_string())),
+    }
+}
+
 fn next_value(
     args: &mut impl Iterator<Item = OsString>,
     flag: &'static str,
@@ -576,7 +612,7 @@ fn print_help() {
             memoryd doctor [--db <path>] [--bind <addr:port>] [--token <token>]\n\
             memoryd stats  [--db <path>] [--bind <addr:port>] [--token <token>]\n\
             memoryd remember <content> [--kind <kind>] [--session <id>] [--source <source>] [--tags <a,b>] [--db <path>]\n\
-            memoryd recall <query> [--k <limit>] [--semantic] [--db <path>]\n\
+            memoryd recall <query> [--k <limit>] [--semantic] [--hops <0|1>] [--db <path>]\n\
             memoryd import --source jsonl --path <file> [--db <path>]\n\
             memoryd dream [--now] [--budget-usd <n>] [--max-seconds <n>] [--db <path>]\n\
             memoryd serve [--db <path>] [--bind <addr:port>] [--token <token>]\n\n\
@@ -679,6 +715,7 @@ fn dream_response_json(outcome: &memoryd_core::dream::DreamOutcome) -> Result<St
     Ok(serde_json::to_string(&serde_json::json!({
         "run_id": outcome.run_id,
         "consolidated": outcome.consolidated,
+        "associated": outcome.associated,
         "decayed": outcome.decayed,
         "tokens_used": outcome.tokens_used,
         "status": outcome.status,
@@ -707,33 +744,58 @@ fn remember_response_json(ack: &CaptureAck) -> Result<String, CliError> {
     }))?)
 }
 
-fn recall_response_json(result: &RecallResult) -> Result<String, CliError> {
+fn recall_response_json(result: &RecallOutput) -> Result<String, CliError> {
     Ok(serde_json::to_string(&recall_response_value(result))?)
 }
 
-fn recall_response_value(result: &RecallResult) -> serde_json::Value {
-    let hits = result
-        .hits
-        .iter()
-        .map(|hit| {
+fn recall_response_value(result: &RecallOutput) -> serde_json::Value {
+    match result {
+        RecallOutput::Memory(memory) => {
+            let hits = memory
+                .hits
+                .iter()
+                .map(|hit| {
+                    serde_json::json!({
+                        "memory_id": hit.memory_id,
+                        "kind": hit.kind,
+                        "content": hit.content,
+                        "score": hit.score,
+                        "via_hop": hit.via_hop,
+                        "link_strength": hit.link_strength,
+                    })
+                })
+                .collect::<Vec<_>>();
             serde_json::json!({
-                "raw_event_id": hit.raw_event_id,
-                "session_id": hit.session_id,
-                "ts_ms": hit.ts_ms,
-                "source": hit.source,
-                "kind": hit.kind,
-                "content": hit.content,
-                "score": hit.score,
+                "results": hits,
+                "degraded": memory.degraded,
+                "mode": memory.mode,
+                "compared": memory.compared,
             })
-        })
-        .collect::<Vec<_>>();
-
-    serde_json::json!({
-        "results": hits,
-        "degraded": result.degraded,
-        "mode": result.mode,
-        "compared": result.compared,
-    })
+        }
+        RecallOutput::Event(event) => {
+            let hits = event
+                .hits
+                .iter()
+                .map(|hit| {
+                    serde_json::json!({
+                        "raw_event_id": hit.raw_event_id,
+                        "session_id": hit.session_id,
+                        "ts_ms": hit.ts_ms,
+                        "source": hit.source,
+                        "kind": hit.kind,
+                        "content": hit.content,
+                        "score": hit.score,
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "results": hits,
+                "degraded": event.degraded,
+                "mode": event.mode,
+                "compared": event.compared,
+            })
+        }
+    }
 }
 
 fn handle_http_connection(
@@ -1007,11 +1069,21 @@ fn recall_request_from_json(value: serde_json::Value) -> Result<RecallArgs, &'st
         Some(value) => value.as_bool().ok_or("semantic must be a boolean")?,
         None => false,
     };
+    let hops = match object.get("hops") {
+        Some(value) if value.is_u64() => match value.as_u64() {
+            Some(0) => 0,
+            Some(1) => 1,
+            _ => return Err("hops must be 0 or 1"),
+        },
+        Some(_) => return Err("hops must be 0 or 1"),
+        None => 1,
+    };
 
     Ok(RecallArgs {
         query,
         limit,
         semantic,
+        hops,
     })
 }
 
@@ -1387,12 +1459,17 @@ mod tests {
             query: "wal timeout".to_string(),
             limit: 5,
             semantic: true,
+            hops: 1,
         };
         let result = recall_with_mode(&store, &args).expect("recall succeeds");
 
+        // No memory exists (no dream run), so recall falls back to raw-event recall.
         // The only shipped adapter is null, which self-degrades
         // (embeds_semantically=false), so `--semantic` returns lexical-shaped results
         // flagged degraded — no provider spend, no query embedding cached.
+        let RecallOutput::Event(result) = result else {
+            panic!("expected raw-event fallback when no memory matches");
+        };
         assert_eq!(result.mode, "lexical");
         assert!(result.degraded);
         assert_eq!(result.compared, 0);
@@ -2027,5 +2104,114 @@ mod tests {
                 "database files leaked secret bytes"
             );
         }
+    }
+
+    #[test]
+    fn parses_recall_with_hops() {
+        let cli = Cli::parse(["memoryd", "recall", "q", "--hops", "0"].map(OsString::from))
+            .expect("cli parses");
+        let Command::Recall(args) = cli.command else {
+            panic!("expected recall command");
+        };
+        assert_eq!(args.hops, 0, "--hops 0 disables expansion");
+
+        let default = Cli::parse(["memoryd", "recall", "q"].map(OsString::from)).expect("parses");
+        let Command::Recall(args) = default.command else {
+            panic!("expected recall command");
+        };
+        assert_eq!(args.hops, 1, "one-hop expansion is the default");
+
+        assert!(
+            Cli::parse(["memoryd", "recall", "q", "--hops", "2"].map(OsString::from)).is_err(),
+            "--hops only accepts 0 or 1"
+        );
+    }
+
+    #[test]
+    fn recall_command_one_hop_returns_linked_memory() {
+        let path = temp_db_path("recall-cli-onehop");
+        {
+            let mut store = Store::open(&path).expect("store opens");
+            for (i, text) in ["wal busy timeout fix", "vacuum schedule weekly"]
+                .iter()
+                .enumerate()
+            {
+                store
+                    .capture_event(NewRawEvent {
+                        session_id: "s1".to_string(),
+                        agent: "claude".to_string(),
+                        source: "tool_result".to_string(),
+                        kind: "observation".to_string(),
+                        payload: serde_json::json!({ "text": text }),
+                        provenance: serde_json::json!({}),
+                        ts_ms: 1000 + i as i64,
+                    })
+                    .expect("capture succeeds");
+            }
+        }
+        // Consolidate + associate via the dream CLI handler.
+        let cli = Cli::parse(
+            ["memoryd", "dream", "--now", "--db", path.to_str().unwrap()].map(OsString::from),
+        )
+        .expect("cli parses");
+        let Command::Dream(dargs) = cli.command.clone() else {
+            panic!("expected dream");
+        };
+        dream(cli, dargs).expect("dream succeeds");
+
+        let store = Store::open(&path).expect("store opens");
+        let args = RecallArgs {
+            query: "wal".to_string(),
+            limit: 5,
+            semantic: false,
+            hops: 1,
+        };
+        let RecallOutput::Memory(result) = recall_with_mode(&store, &args).expect("recall") else {
+            panic!("memory corpus exists, so recall should return memories");
+        };
+        assert_eq!(result.mode, "memory+graph");
+        let has_vacuum = result
+            .hits
+            .iter()
+            .any(|h| h.content.contains("vacuum") && h.via_hop);
+        assert!(
+            has_vacuum,
+            "the linked 'vacuum' memory surfaces via one hop"
+        );
+
+        // The JSON envelope is memory-shaped.
+        let json = recall_response_json(&RecallOutput::Memory(result)).expect("json");
+        assert!(json.contains("\"memory_id\""));
+        assert!(json.contains("\"via_hop\""));
+
+        // hops=0 does not surface the unrelated neighbor.
+        let args0 = RecallArgs {
+            query: "wal".to_string(),
+            limit: 5,
+            semantic: false,
+            hops: 0,
+        };
+        let RecallOutput::Memory(direct) = recall_with_mode(&store, &args0).expect("recall") else {
+            panic!("expected memories");
+        };
+        assert!(
+            !direct.hits.iter().any(|h| h.content.contains("vacuum")),
+            "hops=0 returns only the direct lexical match"
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn recall_request_from_json_parses_hops() {
+        let args = recall_request_from_json(serde_json::json!({"query": "wal", "hops": 0}))
+            .expect("parses");
+        assert_eq!(args.hops, 0);
+        let default =
+            recall_request_from_json(serde_json::json!({"query": "wal"})).expect("parses");
+        assert_eq!(default.hops, 1, "hops defaults to 1");
+        assert!(
+            recall_request_from_json(serde_json::json!({"query": "wal", "hops": 5})).is_err(),
+            "hops must be 0 or 1"
+        );
     }
 }
