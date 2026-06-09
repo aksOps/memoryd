@@ -534,6 +534,21 @@ fn handle_http_request(
     request: HttpRequest,
 ) -> HttpResponse {
     if !is_authorized(cfg, peer, &request.headers) {
+        let peer_loopback = peer.map(|addr| addr.ip().is_loopback());
+        let authorization_header_present =
+            header_value(&request.headers, "authorization").is_some();
+        if store
+            .record_auth_rejection(
+                &request.method,
+                &request.path,
+                peer_loopback,
+                authorization_header_present,
+                auth_rejection_reason(cfg, peer),
+            )
+            .is_err()
+        {
+            return HttpResponse::error(500, "store_error", "auth audit could not be persisted");
+        }
         return HttpResponse::error(401, "unauthorized", "authorization failed");
     }
 
@@ -798,6 +813,16 @@ fn is_authorized(cfg: &Config, peer: Option<SocketAddr>, headers: &[(String, Str
     }
 
     peer.map(|addr| addr.ip().is_loopback()).unwrap_or(false)
+}
+
+fn auth_rejection_reason(cfg: &Config, peer: Option<SocketAddr>) -> &'static str {
+    if cfg.bearer_token.is_some() {
+        "missing_or_invalid_bearer"
+    } else if peer.is_some() {
+        "non_loopback_peer"
+    } else {
+        "unknown_peer"
+    }
 }
 
 fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -1163,6 +1188,51 @@ mod tests {
     }
 
     #[test]
+    fn http_auth_rejection_records_safe_audit_row() {
+        let path = temp_db_path("http-auth-audit");
+        let mut cfg = Config::with_db_path(path.clone());
+        let configured_secret = "configuredsupersecretvalue";
+        let presented_secret = "presentedsupersecretvalue";
+        cfg.bearer_token = Some(configured_secret.to_string());
+        let mut store = Store::open(&path).expect("store opens");
+
+        let response = handle_http_request(
+            &mut store,
+            &cfg,
+            Some("127.0.0.1:65000".parse().expect("peer parses")),
+            HttpRequest {
+                method: "POST".to_string(),
+                path: format!("/v1/capture?token={presented_secret}"),
+                headers: vec![
+                    ("content-type".to_string(), "application/json".to_string()),
+                    (
+                        "authorization".to_string(),
+                        format!("Bearer {presented_secret}"),
+                    ),
+                ],
+                body: br#"{
+                    "session_id":"session-1",
+                    "agent":"claude",
+                    "source":"tool_result",
+                    "kind":"observation",
+                    "payload":{"text":"WAL timeout fixed"}
+                }"#
+                .to_vec(),
+            },
+        );
+
+        assert_eq!(response.status, 401);
+        let stats = store.table_stats().expect("table stats");
+        assert_eq!(table_rows(&stats, "raw_events"), 0);
+        assert_eq!(table_rows(&stats, "jobs"), 0);
+        assert_eq!(table_rows(&stats, "audit_log"), 1);
+        assert_db_files_do_not_contain(&path, configured_secret);
+        assert_db_files_do_not_contain(&path, presented_secret);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
     fn http_capture_accepts_configured_bearer_token() {
         let path = temp_db_path("http-auth-ok");
         let mut cfg = Config::with_db_path(path.clone());
@@ -1430,6 +1500,20 @@ mod tests {
         for suffix in ["", "-shm", "-wal"] {
             let file = PathBuf::from(format!("{}{suffix}", path.display()));
             let _ = fs::remove_file(file);
+        }
+    }
+
+    fn assert_db_files_do_not_contain(path: &Path, needle: &str) {
+        let needle = needle.as_bytes();
+        for suffix in ["", "-shm", "-wal"] {
+            let file = PathBuf::from(format!("{}{suffix}", path.display()));
+            let Ok(bytes) = fs::read(file) else {
+                continue;
+            };
+            assert!(
+                !bytes.windows(needle.len()).any(|window| window == needle),
+                "database files leaked secret bytes"
+            );
         }
     }
 }

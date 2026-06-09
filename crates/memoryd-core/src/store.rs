@@ -23,6 +23,7 @@ pub const CANONICAL_TABLES: [&str; 13] = [
 ];
 
 const REDACTED: &str = "[REDACTED]";
+const AUDIT_ACTOR: &str = "memoryd";
 const HIGH_ENTROPY_MIN_LEN: usize = 20;
 const HIGH_ENTROPY_MIN_BITS_PER_CHAR: f64 = 4.0;
 
@@ -62,17 +63,41 @@ impl Store {
             ts_ms,
         } = event;
 
-        let session_id = redact_inline_string(&session_id);
-        let agent = redact_inline_string(&agent);
-        let source = redact_inline_string(&source);
-        let kind = redact_inline_string(&kind);
+        let RedactedString {
+            value: session_id,
+            redactions: session_redactions,
+        } = redact_inline_string_with_count(&session_id);
+        let RedactedString {
+            value: agent,
+            redactions: agent_redactions,
+        } = redact_inline_string_with_count(&agent);
+        let RedactedString {
+            value: source,
+            redactions: source_redactions,
+        } = redact_inline_string_with_count(&source);
+        let RedactedString {
+            value: kind,
+            redactions: kind_redactions,
+        } = redact_inline_string_with_count(&kind);
         validate_capture_field("session_id", &session_id)?;
         validate_capture_field("agent", &agent)?;
         validate_capture_field("source", &source)?;
         validate_capture_field("kind", &kind)?;
 
-        let payload = redact_json_value(payload);
-        let provenance = redact_json_value(provenance);
+        let RedactedJson {
+            value: payload,
+            redactions: payload_redactions,
+        } = redact_json_value_with_count(payload);
+        let RedactedJson {
+            value: provenance,
+            redactions: provenance_redactions,
+        } = redact_json_value_with_count(provenance);
+        let redactions = session_redactions
+            + agent_redactions
+            + source_redactions
+            + kind_redactions
+            + payload_redactions
+            + provenance_redactions;
         let fts_content = capture_fts_content(&payload);
         let payload = serde_json::to_string(&payload)?;
         let provenance = serde_json::to_string(&provenance)?;
@@ -121,6 +146,40 @@ impl Store {
             params![job_payload.as_str(), scheduled_at],
         )?;
         let enqueued_job_id = tx.last_insert_rowid();
+        let raw_event_ref = raw_event_id.to_string();
+        let capture_detail = serde_json::to_string(&serde_json::json!({
+            "session_id": session_id,
+            "source": source,
+            "kind": kind,
+            "enqueued_job_id": enqueued_job_id,
+        }))?;
+        insert_audit_log(
+            &tx,
+            AUDIT_ACTOR,
+            "capture.append",
+            "raw_event",
+            Some(raw_event_ref.as_str()),
+            Some(capture_detail.as_str()),
+            scheduled_at,
+        )?;
+        if redactions > 0 {
+            let redaction_detail = serde_json::to_string(&serde_json::json!({
+                "redactions": redactions,
+                "replacement": REDACTED,
+                "metadata_redactions": session_redactions + agent_redactions + source_redactions + kind_redactions,
+                "payload_redactions": payload_redactions,
+                "provenance_redactions": provenance_redactions,
+            }))?;
+            insert_audit_log(
+                &tx,
+                AUDIT_ACTOR,
+                "redaction.apply",
+                "raw_event",
+                Some(raw_event_ref.as_str()),
+                Some(redaction_detail.as_str()),
+                scheduled_at,
+            )?;
+        }
         tx.commit()?;
 
         Ok(CaptureAck {
@@ -217,6 +276,33 @@ impl Store {
         })
     }
 
+    pub fn record_auth_rejection(
+        &self,
+        method: &str,
+        path: &str,
+        peer_loopback: Option<bool>,
+        authorization_header_present: bool,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        let detail = serde_json::to_string(&serde_json::json!({
+            "method": audit_http_method(method),
+            "path": audit_http_path(path),
+            "peer_present": peer_loopback.is_some(),
+            "peer_loopback": peer_loopback,
+            "authorization_header_present": authorization_header_present,
+            "reason": audit_auth_reason(reason),
+        }))?;
+        insert_audit_log(
+            &self.conn,
+            AUDIT_ACTOR,
+            "auth.reject",
+            "http_request",
+            None,
+            Some(detail.as_str()),
+            unix_ms_now(),
+        )
+    }
+
     pub fn schema_version(&self) -> Result<i64, StoreError> {
         self.conn
             .query_row(
@@ -305,6 +391,18 @@ pub struct TableStats {
     pub rows: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RedactedString {
+    value: String,
+    redactions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RedactedJson {
+    value: serde_json::Value,
+    redactions: usize,
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     Io(std::io::Error),
@@ -355,35 +453,85 @@ fn validate_capture_field(field: &'static str, value: &str) -> Result<(), StoreE
     Ok(())
 }
 
-fn redact_json_value(mut value: serde_json::Value) -> serde_json::Value {
-    redact_json_value_in_place(&mut value, None);
-    value
+fn insert_audit_log(
+    conn: &Connection,
+    actor: &str,
+    action: &str,
+    target_type: &str,
+    target_ref: Option<&str>,
+    detail: Option<&str>,
+    ts_ms: i64,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO audit_log (ts, actor, action, target_type, target_ref, detail)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![ts_ms, actor, action, target_type, target_ref, detail],
+    )?;
+    Ok(())
 }
 
-fn redact_json_value_in_place(value: &mut serde_json::Value, key: Option<&str>) {
+fn audit_http_method(method: &str) -> &'static str {
+    match method {
+        "DELETE" => "DELETE",
+        "GET" => "GET",
+        "HEAD" => "HEAD",
+        "OPTIONS" => "OPTIONS",
+        "PATCH" => "PATCH",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        _ => "other",
+    }
+}
+
+fn audit_http_path(path: &str) -> &'static str {
+    match path.split('?').next().unwrap_or(path) {
+        "/v1/capture" => "/v1/capture",
+        "/v1/recall" => "/v1/recall",
+        _ => "other",
+    }
+}
+
+fn audit_auth_reason(reason: &str) -> &'static str {
+    match reason {
+        "missing_or_invalid_bearer" => "missing_or_invalid_bearer",
+        "non_loopback_peer" => "non_loopback_peer",
+        "unknown_peer" => "unknown_peer",
+        _ => "other",
+    }
+}
+
+fn redact_json_value_with_count(mut value: serde_json::Value) -> RedactedJson {
+    let redactions = redact_json_value_in_place(&mut value, None);
+    RedactedJson { value, redactions }
+}
+
+fn redact_json_value_in_place(value: &mut serde_json::Value, key: Option<&str>) -> usize {
     if key.is_some_and(is_sensitive_key) {
-        *value = serde_json::Value::String(REDACTED.to_string());
-        return;
+        let was_redacted = value.as_str() == Some(REDACTED);
+        if !was_redacted {
+            *value = serde_json::Value::String(REDACTED.to_string());
+        }
+        return usize::from(!was_redacted);
     }
 
     match value {
-        serde_json::Value::Array(values) => {
-            for value in values {
-                redact_json_value_in_place(value, None);
-            }
-        }
-        serde_json::Value::Object(object) => {
-            for (key, value) in object {
-                redact_json_value_in_place(value, Some(key));
-            }
-        }
+        serde_json::Value::Array(values) => values
+            .iter_mut()
+            .map(|value| redact_json_value_in_place(value, None))
+            .sum(),
+        serde_json::Value::Object(object) => object
+            .iter_mut()
+            .map(|(key, value)| redact_json_value_in_place(value, Some(key)))
+            .sum(),
         serde_json::Value::String(text) => {
-            let redacted = redact_inline_string(text);
-            if redacted != *text {
-                *text = redacted;
+            let redacted = redact_inline_string_with_count(text);
+            let redactions = redacted.redactions;
+            if redactions > 0 {
+                *text = redacted.value;
             }
+            redactions
         }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => 0,
     }
 }
 
@@ -414,9 +562,13 @@ fn is_sensitive_key(key: &str) -> bool {
         || normalized.contains("privatekey")
 }
 
-fn redact_inline_string(input: &str) -> String {
+fn redact_inline_string_with_count(input: &str) -> RedactedString {
     if input.contains("-----BEGIN") && input.contains("PRIVATE KEY-----") {
-        return REDACTED.to_string();
+        let redactions = usize::from(input != REDACTED);
+        return RedactedString {
+            value: REDACTED.to_string(),
+            redactions,
+        };
     }
 
     let mut spans = Vec::new();
@@ -513,14 +665,18 @@ fn push_high_entropy_span(input: &str, start: usize, end: usize, spans: &mut Vec
     }
 }
 
-fn apply_redaction_spans(input: &str, mut spans: Vec<(usize, usize)>) -> String {
+fn apply_redaction_spans(input: &str, mut spans: Vec<(usize, usize)>) -> RedactedString {
     if spans.is_empty() {
-        return input.to_string();
+        return RedactedString {
+            value: input.to_string(),
+            redactions: 0,
+        };
     }
 
     spans.sort_unstable_by_key(|span| span.0);
     let mut output = String::with_capacity(input.len());
     let mut cursor = 0;
+    let mut redactions = 0;
     for (start, end) in spans {
         if start < cursor || start >= end || end > input.len() {
             continue;
@@ -528,9 +684,13 @@ fn apply_redaction_spans(input: &str, mut spans: Vec<(usize, usize)>) -> String 
         output.push_str(&input[cursor..start]);
         output.push_str(REDACTED);
         cursor = end;
+        redactions += 1;
     }
     output.push_str(&input[cursor..]);
-    output
+    RedactedString {
+        value: output,
+        redactions,
+    }
 }
 
 fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
@@ -1207,6 +1367,109 @@ mod tests {
             fts_content,
             "Deploy with Authorization: Bearer [REDACTED]; contact [REDACTED]"
         );
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn capture_records_audit_rows_for_capture_and_redaction() {
+        let path = temp_db_path("capture-audit");
+        let mut store = Store::open(&path).expect("store opens");
+        let secret = "leakycredentialvalue";
+
+        let ack = store
+            .capture_event(NewRawEvent {
+                session_id: "session-1".to_string(),
+                agent: "claude".to_string(),
+                source: "tool_result".to_string(),
+                kind: "observation".to_string(),
+                payload: serde_json::json!({
+                    "text": format!("Authorization: Bearer {secret}"),
+                }),
+                provenance: serde_json::json!({}),
+                ts_ms: 1234,
+            })
+            .expect("capture succeeds");
+
+        let audit_rows = store
+            .conn
+            .prepare(
+                "SELECT action, target_type, target_ref, detail
+                 FROM audit_log
+                 ORDER BY id",
+            )
+            .expect("audit query prepares")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .expect("audit query runs")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("audit rows collect");
+
+        let raw_event_id = ack.raw_event_id.to_string();
+        assert_eq!(audit_rows.len(), 2);
+        assert_eq!(audit_rows[0].0, "capture.append");
+        assert_eq!(audit_rows[0].1, "raw_event");
+        assert_eq!(audit_rows[0].2.as_deref(), Some(raw_event_id.as_str()));
+        assert_eq!(audit_rows[1].0, "redaction.apply");
+        assert_eq!(audit_rows[1].1, "raw_event");
+        assert_eq!(audit_rows[1].2.as_deref(), Some(raw_event_id.as_str()));
+
+        for (_, _, _, detail) in &audit_rows {
+            let detail = detail.as_deref().expect("audit detail exists");
+            assert!(!detail.contains(secret));
+        }
+        let redaction_detail: serde_json::Value =
+            serde_json::from_str(audit_rows[1].3.as_deref().expect("redaction detail exists"))
+                .expect("redaction detail is json");
+        assert_eq!(redaction_detail["redactions"], 1);
+        assert_eq!(redaction_detail["replacement"], REDACTED);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn auth_rejection_audit_row_uses_safe_request_classes() {
+        let path = temp_db_path("auth-rejection-audit");
+        let store = Store::open(&path).expect("store opens");
+        let secret = "presentedsupersecretvalue";
+
+        store
+            .record_auth_rejection(
+                secret,
+                &format!("/v1/capture?token={secret}"),
+                Some(false),
+                true,
+                &format!("bad-{secret}"),
+            )
+            .expect("auth rejection audit succeeds");
+
+        let (action, target_type, target_ref, detail): (String, String, Option<String>, String) =
+            store
+                .conn
+                .query_row(
+                    "SELECT action, target_type, target_ref, detail FROM audit_log",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("audit row exists");
+        assert_eq!(action, "auth.reject");
+        assert_eq!(target_type, "http_request");
+        assert_eq!(target_ref, None);
+        assert!(!detail.contains(secret));
+
+        let detail: serde_json::Value = serde_json::from_str(&detail).expect("detail is json");
+        assert_eq!(detail["method"], "other");
+        assert_eq!(detail["path"], "/v1/capture");
+        assert_eq!(detail["peer_present"], true);
+        assert_eq!(detail["peer_loopback"], false);
+        assert_eq!(detail["authorization_header_present"], true);
+        assert_eq!(detail["reason"], "other");
 
         cleanup_db_files(&path);
     }

@@ -50,6 +50,8 @@ Implemented now:
 - Recall is lexical-only over redacted captured raw events using SQLite FTS.
 - Deterministic best-effort redaction runs before metadata, payload, provenance,
   and recall index persistence.
+- `audit_log` rows are emitted for capture appends, redaction summaries, and
+  HTTP auth rejections without storing original secret or bearer-token material.
 - CI/security gates cover formatting, build, clippy, tests, dependency policy,
   advisory audit, and SBOM generation.
 - OpenSSF Best Practices evidence is complete and passing.
@@ -58,8 +60,8 @@ Still planned:
 
 - Background worker execution, governor admission, provider adapters, vector
   reranking, graph expansion, dreaming/consolidation, MCP and hook facades,
-  approval-gated profile facts, per-redaction `audit_log` entries, snapshots,
-  benchmark harness, and npm binary distribution.
+  approval-gated profile facts, broader worker/provider/profile audit coverage,
+  snapshots, benchmark harness, and npm binary distribution.
 
 Implementation notes that differ from the target design for now:
 
@@ -90,7 +92,7 @@ Implementation notes that differ from the target design for now:
 - Ships nothing that can mutate profile/identity (H6 risk = 0 by construction); MCP facade, graph recall, dedup, profile/approvals, scheduled dreaming, and HNSW are deferred behind seams already in place.
 
 **Top 3 risks.**
-1. **Privacy leakage to remote providers (Critical).** Coding sessions are dense with secrets; the background plane is the only thing that calls out. Mitigated by localhost-default bind, entitlement-first/local-preferred adapters, **on-by-default pre-send redaction**, and, in the target architecture, a full audit trail. Current implementation already redacts before persistence; per-redaction audit entries are still planned.
+1. **Privacy leakage to remote providers (Critical).** Coding sessions are dense with secrets; the background plane is the only thing that calls out. Mitigated by localhost-default bind, entitlement-first/local-preferred adapters, **on-by-default pre-send redaction**, and, in the target architecture, a full audit trail. Current implementation already redacts before persistence and emits safe audit rows for capture, redaction summaries, and auth rejection; broader provider/worker audit coverage remains planned.
 2. **Provider cost overrun (High).** Mitigated by a default **$0.00** per-window spend cap backed by the `provider_usage` ledger and enforced at governor admission; paid APIs are opt-in + budget-gated; on breach, LLM steps skip/re-queue while non-LLM maintenance completes.
 3. **Memory + SQLite-vector bloat/perf cliff (High).** Mitigated by governed `purge`/decay on indexed due-rows only (no scans), retention windows, the bounded prefilter-then-rerank recall, and the HNSW seam ready to swap in past ~50k active memories.
 
@@ -538,7 +540,7 @@ impl Redactor {
 }
 ```
 
-Current implementation: dependency-free best-effort masking for sensitive JSON keys, bearer-style credentials, common API-key prefixes, private-key markers, emails, and high-entropy token-like spans (>4.0 bits/char over ≥20 chars). It redacts metadata fields, payloads, provenance, and recall index text before the SQLite transaction. Planned next hardening: record per-redaction summaries in `audit_log` without storing the original secret. Cost budget: <1ms per event at 4KB payload.
+Current implementation: dependency-free best-effort masking for sensitive JSON keys, bearer-style credentials, common API-key prefixes, private-key markers, emails, and high-entropy token-like spans (>4.0 bits/char over ≥20 chars). It redacts metadata fields, payloads, provenance, and recall index text before the SQLite transaction. Captures write `capture.append` audit rows, and redacted captures write `redaction.apply` summary rows with counts and replacement marker only, without storing the original secret. Cost budget: <1ms per event at 4KB payload.
 
 - **Inputs:** `NewRawEvent`. **Outputs:** `CaptureAck`; rows in `raw_events`, `sessions`, `jobs`. **Depends on:** `store`, `queue`, `audit`.
 
@@ -773,7 +775,7 @@ pub enum Decision { Approve, Reject }
 
 ### 6.17 `audit` — audit/provenance log  *(module in `memoryd-core`)*  — **C**
 
-**Responsibility.** Target append-only accountability trail for every mutating/security-relevant action (H8/H9): captures, redactions, consolidations, decay/cleanup, profile decisions, provider calls, config changes. Provenance for `memories` is carried via `memory_versions` (`created_by_job`, `reason`); `audit_log` is the cross-cutting action ledger. Current implementation has the table but does not yet emit per-action audit rows.
+**Responsibility.** Target append-only accountability trail for every mutating/security-relevant action (H8/H9): captures, redactions, consolidations, decay/cleanup, profile decisions, provider calls, config changes. Provenance for `memories` is carried via `memory_versions` (`created_by_job`, `reason`); `audit_log` is the cross-cutting action ledger. Current implementation emits `capture.append`, `redaction.apply`, and `auth.reject` rows; broader worker/provider/profile/config coverage remains planned.
 
 ```rust
 pub struct Audit { store: Store }
@@ -853,7 +855,7 @@ pub trait ProviderAdapter: LlmAdapter + EmbeddingAdapter {}
 | `config` | core | C | — | no |
 | `store` | memoryd-store | C | all 13 | no |
 | `gateway` | core | **F** | raw_events, jobs (via capture) | no |
-| `capture` (+redact) | core | **F** | current: raw_events, sessions, jobs, raw_events_fts; target adds audit_log | no |
+| `capture` (+redact) | core | **F** | current: raw_events, sessions, jobs, raw_events_fts, audit_log | no |
 | `recall` | core | **F** | current: raw_events_fts/raw_events; target: memories, embeddings, memory_links | current: no; target: embed-only, cache-first |
 | `relevance` | core | **F**/W | memories (read) | no |
 | `queue` | core | W | jobs | no |
@@ -3848,8 +3850,9 @@ Every authenticated mutating request is attributed to `actor = "owner:<agent_lab
 Current implementation applies deterministic best-effort redaction at the
 **capture write-time** boundary before SQLite persistence, using `[REDACTED]` as
 the replacement text. It covers metadata fields, payloads, provenance, and recall
-index text. It does not yet emit redaction audit rows, scrub a structured logging
-layer, or implement export-time defense-in-depth.
+index text. It emits redaction summary audit rows without original secret
+material. It does not yet scrub a structured logging layer or implement
+export-time defense-in-depth.
 
 Target policy: redaction is applied at three boundaries, in this order of trust:
 **capture (write-time)**, **logs (emit-time)**, **export (read-out-time)**. The
@@ -3860,7 +3863,7 @@ no second implementation.
 
 | Boundary | When | Behavior |
 |----------|------|----------|
-| `capture.append()` | before the `raw_events` INSERT, on metadata, `payload`, `provenance`, and recall index text | current: matched spans replaced with `[REDACTED]`; original is **not** stored for matched content; target adds redaction summary provenance/audit metadata. Fast-path cost remains bounded and deterministic. |
+| `capture.append()` | before the `raw_events` INSERT, on metadata, `payload`, `provenance`, and recall index text | current: matched spans replaced with `[REDACTED]`; original is **not** stored for matched content; `redaction.apply` audit detail records counts and replacement marker only. Fast-path cost remains bounded and deterministic. |
 | structured logs (`tracing`) | at the subscriber layer | a `tracing` `Layer` scrubs field values before formatting; token, TLS key paths, and provider credentials are on a hard denylist and are never logged even at `trace`. |
 | `export` command | while serializing memories/events | re-runs the redactor as a defense-in-depth pass even though capture already redacted; `--include-raw` (opt-in, audited) bypasses only the re-pass, never the capture-time redaction. |
 
@@ -3908,7 +3911,7 @@ Provider credential rotation follows the same `setup --rotate-credential <adapte
 
 ### 17.6 Audit Logging (`audit_log`)
 
-Target behavior: every mutating or security-relevant action writes an append-only `audit_log` row in the **same SQLite transaction** as the mutation it records (so the audit trail cannot diverge from state). Current implementation creates the table but does not yet emit these rows. The table is append-only by convention and should be enforced by an `AFTER UPDATE`/`AFTER DELETE` trigger that raises on any modification.
+Target behavior: every mutating or security-relevant action writes an append-only `audit_log` row in the **same SQLite transaction** as the mutation it records (so the audit trail cannot diverge from state). Current implementation emits rows for capture appends, redaction summaries, and auth rejection; broader worker/provider/profile/config coverage remains planned. The table is append-only and enforced by update/delete triggers that raise on any modification.
 
 ```sql
 -- canonical audit_log (key per shared vocab): id, ts, actor, action, target_type, target_ref, detail

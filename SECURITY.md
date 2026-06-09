@@ -27,5 +27,7 @@ high-entropy token-like spans by replacing matched content with `[REDACTED]`.
 Do not treat redaction as a substitute for avoiding secrets in captured content;
 report any missed secret shape as a vulnerability or hardening issue.
 
-Planned hardening that is not implemented yet: per-redaction `audit_log` entries,
-provider-send redaction reports, and broader format-specific redaction fixtures.
+Capture/redaction/auth-rejection audit rows are implemented without storing
+original secret or bearer-token material. Planned hardening that is not
+implemented yet: provider-send redaction reports, broader format-specific
+redaction fixtures, and worker/provider/profile audit coverage.

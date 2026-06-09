@@ -44,6 +44,8 @@ Implemented now:
   server.
 - Deterministic best-effort redaction before metadata, payload, provenance, and
   recall index persistence.
+- Safe `audit_log` rows for capture appends, redaction summaries, and HTTP auth
+  rejections.
 - CI/security gates for format, build, clippy, tests, dependency policy,
   advisory audit, and SBOM generation.
 - OpenSSF Best Practices passing evidence.
@@ -52,7 +54,8 @@ Still planned:
 
 - Background workers, governor admission, provider adapters, vector reranking,
   dreaming/consolidation, MCP/hook facades, approval-gated profile facts,
-  per-redaction audit entries, portable snapshots, and npm binary distribution.
+  broader worker/provider/profile audit coverage, portable snapshots, and npm
+  binary distribution.
 
 ## Required Capabilities
 
@@ -214,8 +217,10 @@ Benchmark modes should include:
 - Auth required for non-loopback remote access.
 - Secret redaction before persistence is implemented; provider-send redaction
   reports remain planned with the provider worker path.
+- Capture/redaction/auth-rejection audit logging is implemented without storing
+  original secret or bearer-token material.
 - Secure provider credential storage.
-- Audit logging for writes, imports, dreams, approvals, deletes, and provider calls.
+- Audit logging for imports, dreams, approvals, deletes, and provider calls.
 - Dependency policy for Rust crates and npm wrapper packages.
 - CVE/advisory scanning in CI and release workflows.
 - Release gates blocking known unresolved critical/high vulnerabilities.
