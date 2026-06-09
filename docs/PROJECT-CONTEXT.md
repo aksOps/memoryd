@@ -54,6 +54,14 @@ Implemented now:
 - M1 capture latency fixtures are explicit ignored performance tests; latest
   local single-threaded p95 evidence is `2.226592ms` for core capture and
   `771.531µs` for HTTP-handler capture.
+- M2 lexical recall is provider-free over `raw_events_fts` and is the accepted M2
+  variant; durable `memories`/`memory_versions` recall is deferred to the
+  dream/consolidation plane (M6). An ignored recall-latency fixture over a 50,000
+  raw-event corpus (bounded ~200-row query) records p95 `87.664401ms` (p99
+  `94.877763ms`, median `491.151µs`) against the plan's `< 100 ms` recall SLO; the
+  p95/p99 tail varies with shared-host contention rather than recall cost, and the
+  median is the contention-robust algorithm cost. Latency scales with match-set
+  size since raw recall has no hard candidate cap (deferred to M6).
 - CI/security gates for format, build, clippy, tests, dependency policy,
   advisory audit, and SBOM generation.
 - OpenSSF Best Practices passing evidence.

@@ -5077,7 +5077,10 @@ S6/H7 (hot path proven cheap and non-blocking), H9 (localhost-default + bearer),
 Useful recall with **zero** provider dependency: FTS5 prefilter + metadata + scoring over the cheap variables. This is the degrade target every later milestone falls back to (A1/C4).
 
 #### Slice delivered
-`recall`: (a) FTS5 + indexed metadata prefilter to a bounded candidate set (cap 256); (b) score candidates over the *provider-free* subset of `scoring_variables` — `lexical_match, recency, access_frequency, decay_factor, source_trust, provenance_weight, lifecycle_bonus`; (c) return top-K `memories` with `memory_versions` provenance. Access-stat bump is **queued as a job**, not written inline. Adds a minimal `consolidate`-free path: `remember` can write a durable `memory` + `memory_versions` v1 directly (manual curation) so recall has data without the dream plane.
+
+**Accepted variant (decided 2026-06-09 — "keep raw recall").** The delivered, provider-free M2 recall runs lexical search over `raw_events_fts` (the FTS5 shadow over `raw_events`): FTS5 `MATCH` → `bm25` ranking → top-K raw events with their session/source/kind/timestamp provenance. No provider call; the read path writes nothing inline. It scores the full FTS match set (no hard candidate cap yet), so latency scales with match-set size. The `memories_fts` schema and `recall(&Query)` scoring sketch below describe the **deferred** durable-memory target: durable `memories`/`memory_versions` creation, recall over `memories_fts`, the 256-candidate prefilter, the multi-variable `ScoreBreakdown` over `scoring_variables`, and queued access-frequency bumps are deferred to the dream/consolidation plane (M6, §21.9) and are not part of the accepted M2 variant.
+
+Original durable-memory target (deferred to M6): `recall`: (a) FTS5 + indexed metadata prefilter to a bounded candidate set (cap 256); (b) score candidates over the *provider-free* subset of `scoring_variables` — `lexical_match, recency, access_frequency, decay_factor, source_trust, provenance_weight, lifecycle_bonus`; (c) return top-K `memories` with `memory_versions` provenance. Access-stat bump is **queued as a job**, not written inline. Adds a minimal `consolidate`-free path: `remember` can write a durable `memory` + `memory_versions` v1 directly (manual curation) so recall has data without the dream plane.
 
 ```sql
 CREATE VIRTUAL TABLE memories_fts USING fts5(content, content='memories', content_rowid='id');
@@ -5091,20 +5094,20 @@ pub fn recall(&self, q: &Query, k: usize) -> Vec<Scored>; // no provider call in
 #### Modules / tables / CLI added
 | Adds | Names |
 |------|-------|
-| Modules | `recall` (lexical), scoring submodule |
-| Tables | `memories_fts`; writes `memory_versions` via `remember` |
-| CLI | `recall`, `remember` (now produces durable memory + v1) |
+| Modules | `recall` (lexical over `raw_events_fts`) |
+| Tables | reads `raw_events_fts` (FTS5 shadow over `raw_events`); `memories_fts` is a deferred schema stub (M6) |
+| CLI | `recall`; `remember` appends a raw event via the capture path (durable `memory`/`memory_versions` deferred to M6) |
 
 #### Entry / Exit
 | Entry | Exit (evidence) |
 |------|------|
-| M1 capture live | `recall "<q>"` returns ranked memories with score breakdown and provenance; **no** full-table scan (EXPLAIN QUERY PLAN asserts index/FTS use) |
-| — | p99 recall < **100 ms** over 50k memories on the 1 vCPU baseline (bench fixture, A3) |
+| M1 capture live | `recall "<q>"` returns raw events ranked by `bm25` with provenance; **no** full-table scan — `EXPLAIN QUERY PLAN` test asserts `raw_events_fts` virtual-table index use (`recall_events_query_plan_uses_raw_events_fts`) |
+| — | recall over a 50k raw-event corpus (bounded ~200-row query): p95 `87.664401ms` (p99 `94.877763ms`), under the **100 ms** target but contention-sensitive on this shared host; median `491.151µs` is the contention-robust algorithm cost — ignored fixture `recall_50k_raw_events_median_latency_under_m2_target` (2026-06-09). No hard candidate cap yet (deferred, M6), so latency scales with match-set size and broad queries can exceed the target |
 | — | Provider explicitly disabled (`adapters=null`) → recall still returns results (degrade path is the *default* code path here) |
-| — | Access bump never blocks the read; appears as a `jobs` row |
+| — | Durable-memory access-frequency bump deferred to M6; the raw-event read path performs no inline writes |
 
 #### Risks retired
-A3 (sub-100ms recall at scale), C4/A1 (lexical degrade is real, not theoretical), H7 (no scans). Product is now independently useful end-to-end with no remote calls.
+C4/A1 (lexical degrade is real, not theoretical), H7 (no full-table scans). A3 (sub-100ms recall **at scale**) is only **provisionally** addressed: bounded queries meet the target, but raw recall has no hard candidate cap, so broad/at-scale queries are unbounded and can exceed it — A3 stays open until the deferred candidate cap (M6) lands. Product is now independently useful end-to-end with no remote calls.
 
 ---
 
