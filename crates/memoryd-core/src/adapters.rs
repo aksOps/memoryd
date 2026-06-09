@@ -19,6 +19,11 @@ pub trait ProviderAdapter {
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, AdapterError>;
     /// Whether the adapter can currently serve requests.
     fn reachable(&self) -> bool;
+    /// Whether this adapter's embeddings carry a usable semantic signal. The
+    /// `null` adapter's hash vectors do not, so recall must not rerank by them.
+    fn embeds_semantically(&self) -> bool {
+        true
+    }
 }
 
 /// Deterministic, dependency-free embedding adapter for the default no-spend profile.
@@ -60,6 +65,10 @@ impl ProviderAdapter for NullAdapter {
 
     fn reachable(&self) -> bool {
         true
+    }
+
+    fn embeds_semantically(&self) -> bool {
+        false
     }
 
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, AdapterError> {

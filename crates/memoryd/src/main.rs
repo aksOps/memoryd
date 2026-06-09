@@ -96,9 +96,23 @@ fn recall(cli: Cli, args: RecallArgs) -> Result<(), CliError> {
     cfg.validate()?;
 
     let store = Store::open(&cfg.db_path)?;
-    let result = store.recall_events(&args.query, args.limit)?;
+    let result = recall_with_mode(&store, &args)?;
     println!("{}", recall_response_json(&result)?);
     Ok(())
+}
+
+/// Run semantic recall when requested, else lexical. Only the no-spend `null`
+/// adapter ships today, and it self-degrades to lexical (`embeds_semantically`
+/// is false), so `--semantic` is safe by default; a configured non-`null` embedding
+/// provider (deferred M3 increment) activates real rerank with no caller change.
+fn recall_with_mode(store: &Store, args: &RecallArgs) -> Result<RecallResult, StoreError> {
+    if args.semantic {
+        let adapter = memoryd_core::adapters::NullAdapter::new();
+        let index = memoryd_core::vectorindex::BruteForce;
+        store.recall_semantic(&args.query, args.limit, &adapter, &index, unix_ms_now())
+    } else {
+        store.recall_events(&args.query, args.limit)
+    }
 }
 
 fn serve(cli: Cli) -> Result<(), CliError> {
@@ -191,6 +205,7 @@ impl Default for RememberArgs {
 struct RecallArgs {
     query: String,
     limit: usize,
+    semantic: bool,
 }
 
 impl Default for RecallArgs {
@@ -198,6 +213,7 @@ impl Default for RecallArgs {
         Self {
             query: String::new(),
             limit: 5,
+            semantic: false,
         }
     }
 }
@@ -279,6 +295,12 @@ impl Cli {
                     };
                     let value = next_string(&mut args, "--k")?;
                     recall.limit = parse_limit("--k", &value)?;
+                }
+                "--semantic" => {
+                    let Command::Recall(recall) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    recall.semantic = true;
                 }
                 "--no-wait" => {
                     if !matches!(command, Command::Remember(_)) {
@@ -410,7 +432,7 @@ fn print_help() {
             memoryd doctor [--db <path>] [--bind <addr:port>] [--token <token>]\n\
             memoryd stats  [--db <path>] [--bind <addr:port>] [--token <token>]\n\
             memoryd remember <content> [--kind <kind>] [--session <id>] [--source <source>] [--tags <a,b>] [--db <path>]\n\
-            memoryd recall <query> [--k <limit>] [--db <path>]\n\
+            memoryd recall <query> [--k <limit>] [--semantic] [--db <path>]\n\
             memoryd serve [--db <path>] [--bind <addr:port>] [--token <token>]\n\n\
           Defaults:\n\
             bind: {DEFAULT_BIND}\n\
@@ -542,6 +564,7 @@ fn recall_response_value(result: &RecallResult) -> serde_json::Value {
         "results": hits,
         "degraded": result.degraded,
         "mode": result.mode,
+        "compared": result.compared,
     })
 }
 
@@ -642,7 +665,7 @@ fn handle_http_recall(store: &Store, body: serde_json::Value) -> HttpResponse {
         Err(message) => return HttpResponse::error(422, "invalid_request", message),
     };
 
-    match store.recall_events(&args.query, args.limit) {
+    match recall_with_mode(store, &args) {
         Ok(result) => HttpResponse::json(200, "OK", recall_response_value(&result)),
         Err(StoreError::InvalidRecallQuery) => {
             HttpResponse::error(422, "invalid_request", "query must contain searchable text")
@@ -812,8 +835,16 @@ fn recall_request_from_json(value: serde_json::Value) -> Result<RecallArgs, &'st
     if limit == 0 {
         return Err("k must be a positive integer");
     }
+    let semantic = match object.get("semantic") {
+        Some(value) => value.as_bool().ok_or("semantic must be a boolean")?,
+        None => false,
+    };
 
-    Ok(RecallArgs { query, limit })
+    Ok(RecallArgs {
+        query,
+        limit,
+        semantic,
+    })
 }
 
 fn required_json_string(
