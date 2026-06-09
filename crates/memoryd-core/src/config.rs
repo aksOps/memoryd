@@ -37,6 +37,12 @@ impl Config {
             });
         }
 
+        if !matches!(self.caps.vector_index_kind.as_str(), "brute-force" | "hnsw") {
+            return Err(ConfigError::UnknownVectorIndex {
+                kind: self.caps.vector_index_kind.clone(),
+            });
+        }
+
         Ok(())
     }
 }
@@ -51,6 +57,9 @@ pub struct Caps {
     pub lease_visibility_secs: u64,
     pub job_max_attempts: u32,
     pub job_backoff_base_ms: u64,
+    /// Which `VectorIndex` implementation recall uses: "brute-force" (default, oracle)
+    /// or "hnsw" (ARCHITECTURE-PLAN §21.12).
+    pub vector_index_kind: String,
 }
 
 impl Caps {
@@ -64,6 +73,7 @@ impl Caps {
             lease_visibility_secs: 30,
             job_max_attempts: 5,
             job_backoff_base_ms: 500,
+            vector_index_kind: "brute-force".to_string(),
         }
     }
 }
@@ -87,6 +97,7 @@ impl Default for ProviderConfig {
 pub enum ConfigError {
     RemoteBindRequiresBearer { bind: SocketAddr },
     PaidProviderRequiresBudget { adapter: String },
+    UnknownVectorIndex { kind: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -99,6 +110,12 @@ impl fmt::Display for ConfigError {
                 f,
                 "provider adapter {adapter} is not allowed with a zero paid-spend budget"
             ),
+            Self::UnknownVectorIndex { kind } => {
+                write!(
+                    f,
+                    "unknown vector index kind: {kind} (expected brute-force or hnsw)"
+                )
+            }
         }
     }
 }
@@ -142,5 +159,18 @@ mod tests {
 
         cfg.bearer_token = Some("test-token".to_string());
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_vector_index_kind() {
+        let mut cfg = Config::with_db_path(std::path::PathBuf::from("/tmp/x.db"));
+        assert!(cfg.validate().is_ok(), "default brute-force validates");
+        cfg.caps.vector_index_kind = "hnsw".to_string();
+        assert!(cfg.validate().is_ok(), "hnsw validates");
+        cfg.caps.vector_index_kind = "bogus".to_string();
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::UnknownVectorIndex { .. })
+        ));
     }
 }

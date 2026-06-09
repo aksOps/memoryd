@@ -104,7 +104,16 @@ fn recall(cli: Cli, args: RecallArgs) -> Result<(), CliError> {
     cfg.validate()?;
 
     let store = Store::open(&cfg.db_path)?;
-    let result = recall_with_mode(&store, &args)?;
+    let index_kind = args
+        .index_kind
+        .clone()
+        .unwrap_or_else(|| cfg.caps.vector_index_kind.clone());
+    if !matches!(index_kind.as_str(), "brute-force" | "hnsw") {
+        return Err(CliError::Config(
+            memoryd_core::config::ConfigError::UnknownVectorIndex { kind: index_kind },
+        ));
+    }
+    let result = recall_with_mode(&store, &args, &index_kind)?;
     println!("{}", recall_response_json(&result)?);
     Ok(())
 }
@@ -225,7 +234,11 @@ fn approve_decision_json(id: &str, decision: &ApprovalDecision) -> Result<String
 /// adapter ships today, and it self-degrades to lexical (`embeds_semantically`
 /// is false), so `--semantic` is safe by default; a configured non-`null` embedding
 /// provider (deferred M3 increment) activates real rerank with no caller change.
-fn recall_with_mode(store: &Store, args: &RecallArgs) -> Result<RecallOutput, StoreError> {
+fn recall_with_mode(
+    store: &Store,
+    args: &RecallArgs,
+    index_kind: &str,
+) -> Result<RecallOutput, StoreError> {
     let adapter = memoryd_core::adapters::NullAdapter::new();
     // Prefer durable memory + graph recall; fall back to raw-event recall when the
     // memory corpus has no match (e.g. before any dream run) so M2 behavior is preserved.
@@ -235,8 +248,14 @@ fn recall_with_mode(store: &Store, args: &RecallArgs) -> Result<RecallOutput, St
         return Ok(RecallOutput::Memory(memory));
     }
     let event = if args.semantic {
-        let index = memoryd_core::vectorindex::BruteForce;
-        store.recall_semantic(&args.query, args.limit, &adapter, &index, unix_ms_now())?
+        let index = memoryd_core::vectorindex::from_kind(index_kind);
+        store.recall_semantic(
+            &args.query,
+            args.limit,
+            &adapter,
+            index.as_ref(),
+            unix_ms_now(),
+        )?
     } else {
         store.recall_events(&args.query, args.limit)?
     };
@@ -381,6 +400,8 @@ struct RecallArgs {
     semantic: bool,
     /// One-hop graph expansion: 1 = expand over `memory_links` (default), 0 = direct only.
     hops: u8,
+    /// Override the vector index for this recall ("brute-force" | "hnsw"); None = config default.
+    index_kind: Option<String>,
 }
 
 impl Default for RecallArgs {
@@ -389,6 +410,7 @@ impl Default for RecallArgs {
             query: String::new(),
             limit: 5,
             semantic: false,
+            index_kind: None,
             hops: 1,
         }
     }
@@ -573,6 +595,12 @@ impl Cli {
                     let value = next_string(&mut args, "--hops")?;
                     recall.hops = parse_hops(&value)?;
                 }
+                "--index" => {
+                    let Command::Recall(recall) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    recall.index_kind = Some(next_string(&mut args, "--index")?);
+                }
                 "--no-wait" => {
                     if !matches!(command, Command::Remember(_)) {
                         return Err(CliError::UnknownFlag(token));
@@ -712,7 +740,7 @@ fn print_help() {
             memoryd doctor [--db <path>] [--bind <addr:port>] [--token <token>]\n\
             memoryd stats  [--db <path>] [--bind <addr:port>] [--token <token>]\n\
             memoryd remember <content> [--kind <kind>] [--session <id>] [--source <source>] [--tags <a,b>] [--db <path>]\n\
-            memoryd recall <query> [--k <limit>] [--semantic] [--hops <0|1>] [--db <path>]\n\
+            memoryd recall <query> [--k <limit>] [--semantic] [--hops <0|1>] [--index <brute-force|hnsw>] [--db <path>]\n\
             memoryd import --source jsonl --path <file> [--db <path>]\n\
             memoryd dream [--now] [--budget-usd <n>] [--max-seconds <n>] [--db <path>]\n\
             memoryd approve [--list] [--id <id> --accept|--reject] [--db <path>]\n\
@@ -997,7 +1025,7 @@ fn handle_http_recall(store: &Store, body: serde_json::Value) -> HttpResponse {
         Err(message) => return HttpResponse::error(422, "invalid_request", message),
     };
 
-    match recall_with_mode(store, &args) {
+    match recall_with_mode(store, &args, "brute-force") {
         Ok(result) => HttpResponse::json(200, "OK", recall_response_value(&result)),
         Err(StoreError::InvalidRecallQuery) => {
             HttpResponse::error(422, "invalid_request", "query must contain searchable text")
@@ -1186,6 +1214,7 @@ fn recall_request_from_json(value: serde_json::Value) -> Result<RecallArgs, &'st
         limit,
         semantic,
         hops,
+        index_kind: None,
     })
 }
 
@@ -1562,8 +1591,9 @@ mod tests {
             limit: 5,
             semantic: true,
             hops: 1,
+            index_kind: None,
         };
-        let result = recall_with_mode(&store, &args).expect("recall succeeds");
+        let result = recall_with_mode(&store, &args, "brute-force").expect("recall succeeds");
 
         // No memory exists (no dream run), so recall falls back to raw-event recall.
         // The only shipped adapter is null, which self-degrades
@@ -2267,8 +2297,11 @@ mod tests {
             limit: 5,
             semantic: false,
             hops: 1,
+            index_kind: None,
         };
-        let RecallOutput::Memory(result) = recall_with_mode(&store, &args).expect("recall") else {
+        let RecallOutput::Memory(result) =
+            recall_with_mode(&store, &args, "brute-force").expect("recall")
+        else {
             panic!("memory corpus exists, so recall should return memories");
         };
         assert_eq!(result.mode, "memory+graph");
@@ -2292,8 +2325,11 @@ mod tests {
             limit: 5,
             semantic: false,
             hops: 0,
+            index_kind: None,
         };
-        let RecallOutput::Memory(direct) = recall_with_mode(&store, &args0).expect("recall") else {
+        let RecallOutput::Memory(direct) =
+            recall_with_mode(&store, &args0, "brute-force").expect("recall")
+        else {
             panic!("expected memories");
         };
         assert!(
@@ -2425,6 +2461,44 @@ mod tests {
         assert!(
             store.list_pending_approvals(10).expect("list").is_empty(),
             "the approval is no longer pending after the decision"
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn parses_recall_with_index_flag() {
+        let cli = Cli::parse(
+            ["memoryd", "recall", "q", "--semantic", "--index", "hnsw"].map(OsString::from),
+        )
+        .expect("parses");
+        let Command::Recall(args) = cli.command else {
+            panic!("expected recall")
+        };
+        assert_eq!(args.index_kind.as_deref(), Some("hnsw"));
+    }
+
+    #[test]
+    fn recall_rejects_unknown_index_kind() {
+        let path = temp_db_path("recall-bad-index");
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "recall",
+                "q",
+                "--index",
+                "bogus",
+                "--db",
+                path.to_str().unwrap(),
+            ]
+            .map(OsString::from),
+        )
+        .expect("parses");
+        let Command::Recall(args) = cli.command.clone() else {
+            panic!("expected recall")
+        };
+        assert!(
+            recall(cli, args).is_err(),
+            "unknown --index value is rejected"
         );
         cleanup_db_files(&path);
     }

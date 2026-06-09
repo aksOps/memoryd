@@ -68,6 +68,297 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     dot / (norm_a.sqrt() * norm_b.sqrt())
 }
 
+/// Select a `VectorIndex` by config kind. Unknown kinds fall back to the safe default
+/// (`BruteForce`); `Config::validate` rejects unknown kinds up front so this is only a
+/// defensive backstop.
+pub fn from_kind(kind: &str) -> Box<dyn VectorIndex> {
+    match kind {
+        "hnsw" => Box::new(Hnsw::default()),
+        _ => Box::new(BruteForce),
+    }
+}
+
+/// In-process HNSW (Hierarchical Navigable Small World) index — a dependency-free,
+/// deterministic, `unsafe`-free second `VectorIndex` implementation (ARCHITECTURE-PLAN
+/// §21.12). Works in cosine-similarity space ("closer" = higher cosine).
+///
+/// The `VectorIndex` trait is stateless (candidates are handed in per call), so the
+/// graph is built per `search` call. Over the small FTS-prefiltered shortlist the
+/// current recall pipeline passes (≤ `RECALL_CANDIDATE_CAP`), that build cost makes
+/// HNSW *slower* than `BruteForce` — so `BruteForce` stays the default and the
+/// correctness oracle. HNSW's latency win needs a persistent full-corpus index, which
+/// is deferred; this milestone lands the algorithm, the config seam, and recall@10
+/// parity with the oracle.
+#[derive(Debug, Clone, Copy)]
+pub struct Hnsw {
+    /// Max neighbors per node per upper layer (`2*m` at layer 0).
+    m: usize,
+    /// Dynamic candidate list size during graph construction.
+    ef_construction: usize,
+    /// Dynamic candidate list size during query.
+    ef_search: usize,
+}
+
+impl Default for Hnsw {
+    fn default() -> Self {
+        Self {
+            m: 16,
+            ef_construction: 64,
+            ef_search: 64,
+        }
+    }
+}
+
+impl VectorIndex for Hnsw {
+    fn search(&self, query: &[f32], candidates: &[Candidate], k: usize) -> Vec<Scored> {
+        if candidates.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        // Small shortlists: the graph build is not worth it and degenerate graphs hurt
+        // recall — score exactly (identical to BruteForce).
+        if candidates.len() <= self.m {
+            return BruteForce.search(query, candidates, k);
+        }
+        let graph = HnswGraph::build(candidates, self.m, self.ef_construction);
+        let found = graph.query(query, self.ef_search.max(k));
+        // Rank the found set exactly as BruteForce does (sim desc, id DESC) so the only
+        // possible difference from the oracle is *which* candidates were found, not order.
+        let mut scored: Vec<Scored> = found
+            .into_iter()
+            .map(|nb| Scored {
+                id: candidates[nb.node].id,
+                score: nb.sim,
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.id.cmp(&a.id))
+        });
+        scored.truncate(k);
+        scored
+    }
+}
+
+/// A (node, similarity) pair with a total order: similarity, then node index. Lets a
+/// `BinaryHeap` act as a max-heap on similarity with deterministic tie-breaks.
+#[derive(Debug, Clone, Copy)]
+struct Neighbor {
+    sim: f32,
+    node: usize,
+}
+
+impl PartialEq for Neighbor {
+    fn eq(&self, other: &Self) -> bool {
+        self.node == other.node && self.sim.to_bits() == other.sim.to_bits()
+    }
+}
+impl Eq for Neighbor {}
+impl Ord for Neighbor {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.sim
+            .total_cmp(&other.sim)
+            .then(self.node.cmp(&other.node))
+    }
+}
+impl PartialOrd for Neighbor {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// A built HNSW graph over a candidate slice (borrowed for the lifetime of one search).
+struct HnswGraph<'a> {
+    vectors: Vec<&'a [f32]>,
+    /// `links[node][layer]` = neighbor node indices at that layer.
+    links: Vec<Vec<Vec<usize>>>,
+    entry: usize,
+    max_layer: usize,
+    m: usize,
+    ef_construction: usize,
+}
+
+impl<'a> HnswGraph<'a> {
+    fn build(candidates: &'a [Candidate], m: usize, ef_construction: usize) -> Self {
+        let n = candidates.len();
+        let vectors: Vec<&[f32]> = candidates.iter().map(|c| c.vector.as_slice()).collect();
+        let m_l = 1.0 / (m as f64).ln();
+        let levels: Vec<usize> = (0..n).map(|i| level_for(i, m_l)).collect();
+
+        let mut graph = HnswGraph {
+            vectors,
+            links: (0..n).map(|i| vec![Vec::new(); levels[i] + 1]).collect(),
+            entry: 0,
+            max_layer: levels[0],
+            m,
+            ef_construction,
+        };
+
+        for (node, &level) in levels.iter().enumerate().skip(1) {
+            graph.insert(node, level);
+        }
+        graph
+    }
+
+    fn cap(&self, layer: usize) -> usize {
+        if layer == 0 { self.m * 2 } else { self.m }
+    }
+
+    fn insert(&mut self, node: usize, level: usize) {
+        // Phase 1: greedy-descend from the entry point through layers above `level`.
+        let mut ep = self.entry;
+        let mut lc = self.max_layer;
+        while lc > level {
+            let found = self.search_layer(self.vectors[node], &[ep], 1, lc);
+            if let Some(best) = found.first() {
+                ep = best.node;
+            }
+            lc -= 1;
+        }
+
+        // Phase 2: connect at each layer from min(level, max_layer) down to 0.
+        let top = level.min(self.max_layer);
+        let mut entry_points = vec![ep];
+        for layer in (0..=top).rev() {
+            let found = self.search_layer(
+                self.vectors[node],
+                &entry_points,
+                self.ef_construction,
+                layer,
+            );
+            let cap = self.cap(layer);
+            let selected = select_neighbors(&self.vectors, node, &found, cap);
+            for &nbr in &selected {
+                self.links[node][layer].push(nbr);
+                self.links[nbr][layer].push(node);
+                if self.links[nbr][layer].len() > self.cap(layer) {
+                    let pruned = select_neighbors_ids(
+                        &self.vectors,
+                        nbr,
+                        &self.links[nbr][layer].clone(),
+                        self.cap(layer),
+                    );
+                    self.links[nbr][layer] = pruned;
+                }
+            }
+            entry_points = found.iter().map(|nb| nb.node).collect();
+            if entry_points.is_empty() {
+                entry_points = vec![ep];
+            }
+        }
+
+        if level > self.max_layer {
+            self.max_layer = level;
+            self.entry = node;
+        }
+    }
+
+    /// Greedy best-first search within one layer; returns up to `ef` neighbors sorted
+    /// by descending similarity. Deterministic (total-ordered heaps, id tie-breaks).
+    fn search_layer(
+        &self,
+        query: &[f32],
+        entry_points: &[usize],
+        ef: usize,
+        layer: usize,
+    ) -> Vec<Neighbor> {
+        use std::cmp::Reverse;
+        use std::collections::{BinaryHeap, HashSet};
+
+        let mut visited: HashSet<usize> = HashSet::new();
+        let mut candidates: BinaryHeap<Neighbor> = BinaryHeap::new();
+        let mut result: BinaryHeap<Reverse<Neighbor>> = BinaryHeap::new();
+
+        for &ep in entry_points {
+            if visited.insert(ep) {
+                let sim = cosine(query, self.vectors[ep]);
+                let nb = Neighbor { sim, node: ep };
+                candidates.push(nb);
+                result.push(Reverse(nb));
+            }
+        }
+
+        while let Some(current) = candidates.pop() {
+            let worst = result.peek().map(|r| r.0.sim);
+            if let Some(worst) = worst
+                && result.len() >= ef
+                && current.sim < worst
+            {
+                break;
+            }
+            if layer >= self.links[current.node].len() {
+                continue;
+            }
+            for &nbr in &self.links[current.node][layer] {
+                if visited.insert(nbr) {
+                    let sim = cosine(query, self.vectors[nbr]);
+                    let worst = result.peek().map(|r| r.0.sim);
+                    if result.len() < ef || worst.is_none_or(|w| sim > w) {
+                        let nb = Neighbor { sim, node: nbr };
+                        candidates.push(nb);
+                        result.push(Reverse(nb));
+                        if result.len() > ef {
+                            result.pop();
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut out: Vec<Neighbor> = result.into_iter().map(|r| r.0).collect();
+        out.sort_by(|a, b| b.cmp(a));
+        out
+    }
+
+    fn query(&self, query: &[f32], ef: usize) -> Vec<Neighbor> {
+        let mut ep = self.entry;
+        let mut lc = self.max_layer;
+        while lc >= 1 {
+            let found = self.search_layer(query, &[ep], 1, lc);
+            if let Some(best) = found.first() {
+                ep = best.node;
+            }
+            lc -= 1;
+        }
+        self.search_layer(query, &[ep], ef, 0)
+    }
+}
+
+/// Deterministic geometric level for a node, hash-seeded (no `rand` dependency):
+/// `floor(-ln(u) * m_l)` with `u` a stable uniform in `(0, 1)` derived from the index.
+fn level_for(index: usize, m_l: f64) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (index as u64).hash(&mut hasher);
+    0x9E37_79B9_7F4A_7C15u64.hash(&mut hasher);
+    let raw = hasher.finish();
+    // 53-bit mantissa mapped to (0, 1): never 0 (so -ln is finite), never 1.
+    let u = ((raw >> 11) as f64 + 1.0) / (((1u64 << 53) as f64) + 1.0);
+    (-u.ln() * m_l).floor() as usize
+}
+
+/// Pick the `m` candidates (from `found`) closest to `target` — simple heuristic, by
+/// cosine then node index (deterministic). Excludes `target` itself.
+fn select_neighbors(vectors: &[&[f32]], target: usize, found: &[Neighbor], m: usize) -> Vec<usize> {
+    let ids: Vec<usize> = found.iter().map(|nb| nb.node).collect();
+    select_neighbors_ids(vectors, target, &ids, m)
+}
+
+fn select_neighbors_ids(vectors: &[&[f32]], target: usize, ids: &[usize], m: usize) -> Vec<usize> {
+    let mut scored: Vec<Neighbor> = ids
+        .iter()
+        .filter(|&&id| id != target)
+        .map(|&id| Neighbor {
+            sim: cosine(vectors[target], vectors[id]),
+            node: id,
+        })
+        .collect();
+    scored.sort_by(|a, b| b.cmp(a));
+    scored.truncate(m);
+    scored.into_iter().map(|nb| nb.node).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +403,126 @@ mod tests {
     #[test]
     fn brute_force_empty_candidates_is_empty() {
         assert!(BruteForce.search(&[1.0], &[], 5).is_empty());
+    }
+
+    use std::hash::{Hash, Hasher};
+
+    /// Deterministic fixture vectors (no `rand`): each component is a stable hash of
+    /// (id, dim) mapped into [-1, 1].
+    fn fixture(n: usize, dim: usize) -> Vec<Candidate> {
+        (0..n)
+            .map(|i| {
+                let vector = (0..dim)
+                    .map(|j| {
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        (i as u64).hash(&mut h);
+                        (j as u64).hash(&mut h);
+                        0xA5A5_5A5A_u64.hash(&mut h);
+                        let raw = h.finish();
+                        (((raw >> 11) as f64 / ((1u64 << 53) as f64)) * 2.0 - 1.0) as f32
+                    })
+                    .collect();
+                Candidate {
+                    id: i as i64,
+                    vector,
+                }
+            })
+            .collect()
+    }
+
+    fn ids(scored: &[Scored]) -> Vec<i64> {
+        scored.iter().map(|s| s.id).collect()
+    }
+
+    #[test]
+    fn hnsw_matches_brute_force_top1_exact() {
+        let candidates = fixture(300, 16);
+        // Query = a fixture vector with a tiny deterministic perturbation -> #42 is clearly nearest.
+        let mut query = candidates[42].vector.clone();
+        query[0] += 0.01;
+        let bf = BruteForce.search(&query, &candidates, 10);
+        let hnsw = Hnsw::default().search(&query, &candidates, 10);
+        assert_eq!(hnsw[0].id, bf[0].id, "HNSW top-1 matches the oracle");
+        assert_eq!(bf[0].id, 42, "the perturbed vector's own id is nearest");
+    }
+
+    #[test]
+    fn hnsw_recall_at_10_within_epsilon() {
+        let candidates = fixture(400, 24);
+        let query = candidates[123].vector.clone();
+        let bf = ids(&BruteForce.search(&query, &candidates, 10));
+        let hnsw = ids(&Hnsw::default().search(&query, &candidates, 10));
+        let bf_set: std::collections::HashSet<i64> = bf.iter().copied().collect();
+        let overlap = hnsw.iter().filter(|id| bf_set.contains(id)).count();
+        assert!(
+            overlap >= 9,
+            "recall@10 within epsilon: overlap {overlap}/10\n  bf={bf:?}\n  hnsw={hnsw:?}"
+        );
+        assert_eq!(hnsw.len(), 10, "returns exactly k results");
+    }
+
+    #[test]
+    fn hnsw_small_n_is_exact_like_brute_force() {
+        // N <= M -> exact (BruteForce fallback), identical ordering.
+        let candidates = fixture(8, 4);
+        let query = candidates[3].vector.clone();
+        let bf = BruteForce.search(&query, &candidates, 5);
+        let hnsw = Hnsw::default().search(&query, &candidates, 5);
+        assert_eq!(ids(&hnsw), ids(&bf));
+    }
+
+    #[test]
+    fn hnsw_empty_and_k_zero() {
+        let candidates = fixture(50, 8);
+        assert!(
+            Hnsw::default()
+                .search(&candidates[0].vector, &[], 5)
+                .is_empty()
+        );
+        assert!(
+            Hnsw::default()
+                .search(&candidates[0].vector, &candidates, 0)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn hnsw_is_deterministic() {
+        let candidates = fixture(200, 12);
+        let query = candidates[7].vector.clone();
+        let a = Hnsw::default().search(&query, &candidates, 10);
+        let b = Hnsw::default().search(&query, &candidates, 10);
+        assert_eq!(a, b, "same input -> identical output");
+    }
+
+    #[test]
+    fn hnsw_handles_mismatched_dims_without_panic() {
+        let mut candidates = fixture(100, 16);
+        // Inject a wrong-dim candidate: cosine() returns 0, so it must not outrank real hits.
+        candidates.push(Candidate {
+            id: 9999,
+            vector: vec![1.0, 2.0, 3.0],
+        });
+        let query = candidates[10].vector.clone();
+        let hnsw = Hnsw::default().search(&query, &candidates, 10);
+        assert!(
+            !hnsw.iter().any(|s| s.id == 9999),
+            "zero-similarity dim-mismatch not in top-10"
+        );
+    }
+
+    #[test]
+    fn from_kind_selects_implementation() {
+        // Both implement the trait; on a fixture they agree on the top hit.
+        let candidates = fixture(120, 16);
+        let query = candidates[5].vector.clone();
+        let brute = from_kind("brute-force").search(&query, &candidates, 5);
+        let hnsw = from_kind("hnsw").search(&query, &candidates, 5);
+        let unknown = from_kind("nonsense").search(&query, &candidates, 5);
+        assert_eq!(brute[0].id, hnsw[0].id);
+        assert_eq!(
+            unknown[0].id, brute[0].id,
+            "unknown kind falls back to brute-force"
+        );
     }
 }

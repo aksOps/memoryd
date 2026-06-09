@@ -104,6 +104,13 @@ Implemented now:
   extraction stubbed (deterministic kind-based, optional gated `summarize`). Migration
   0006 adds a pending-approvals target index. `remember` yields observations, so profile
   extraction targets typed captures (e.g. HTTP capture with `kind:"preference"`).
+- M9 in-process HNSW behind the `VectorIndex` trait (perf seam, no API change): a
+  dependency-free, deterministic, unsafe-free second implementation selectable via
+  `Caps.vector_index_kind` + `recall --index <brute-force|hnsw>`, with `BruteForce` the
+  default and correctness oracle. recall@10 within epsilon of BruteForce on a fixture.
+  The trait is stateless so HNSW builds per call — not yet a latency win over the ≤256
+  shortlist; the persistent full-corpus index (the real win) and a large perf fixture
+  are deferred to M10.
 - CI/security gates for format, build, clippy, tests, dependency policy,
   advisory audit, and SBOM generation.
 - OpenSSF Best Practices passing evidence.
