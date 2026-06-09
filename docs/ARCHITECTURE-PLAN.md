@@ -5153,18 +5153,18 @@ enum Worker { Triage, Embed, Consolidate, Decay, Associate, Dedup, ExtractProfil
 |------|-------|
 | Modules | `queue`, `governor`, `workers` (Embed only), `adapters` |
 | Tables | writes `embeddings`, `provider_usage`; uses `jobs` |
-| CLI | `setup` (provider config + reachability test), `bench` gains a queue-throughput fixture |
+| CLI | `setup` (provider config + reachability test) and the `bench` queue-throughput fixture — **deferred to a later M3 increment** |
 
 #### Entry / Exit
 | Entry | Exit (evidence) |
 |------|------|
-| M2 live | Job leasing is exactly-once under concurrency (property test: N workers, no double-process) |
-| — | Governor refuses admission past `queue_depth`; over-cap enqueue → backpressure, never OOM (test caps mem and asserts steady RSS) |
-| — | `setup` selects entitlement provider first; primary-unreachable → failover to next; all-unreachable → `null` (no spend) |
-| — | Every embed call writes a `provider_usage` row; default `spend_window_usd=0` blocks paid calls unless opted in (C3/H5) |
+| M2 live | Job leasing is exactly-once under concurrency (property test: N workers, no double-process) — **met** (`embed_lease_is_exactly_once_under_concurrent_workers`, 4 workers / 200 jobs) |
+| — | Governor refuses admission past `queue_depth` → backpressure (no enqueue past the cap) — **met**; the bounded-memory/steady-RSS test is **deferred** |
+| — | `setup` selects entitlement provider first; failover; all-unreachable → `null` — **deferred** with the remote adapters (single `null` adapter this slice) |
+| — | Every embed call writes a `provider_usage` row — **met**; paid calls are blocked at config validation when the default adapter is non-`null` at a zero spend cap — **met**; the runtime ledger ceiling is **deferred** (C3/H5) |
 
 #### Risks retired
-C1/C3 (governance + caps proven on a trivial worker before risky ones), H4/H5 (provider seam + entitlement-first + spend ledger), backpressure under bounded memory.
+This slice retires C1/C3 (caps + bounded-queue backpressure proven on the trivial `embed` worker) and H4 (the `ProviderAdapter` seam). **Not yet retired:** H5's runtime spend ledger, entitlement-first selection + failover, and steady-RSS bounding under a memory cap — all deferred with the remote adapters.
 
 ---
 

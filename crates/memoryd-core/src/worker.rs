@@ -36,18 +36,32 @@ pub fn tick_embed<A: ProviderAdapter>(
 
     for job in leased {
         match adapter.embed(std::slice::from_ref(&job.content)) {
-            Ok(vectors) => {
-                let vector = vectors.first().map(Vec::as_slice).unwrap_or_default();
-                store.complete_embed_job(
-                    job.job_id,
-                    job.raw_event_id,
-                    adapter.model_id(),
-                    vector,
-                    prompt_token_estimate(&job.content),
-                    now_ms,
-                )?;
-                report.completed += 1;
-            }
+            Ok(vectors) => match vectors.into_iter().next() {
+                Some(vector) if !vector.is_empty() => {
+                    store.complete_embed_job(
+                        job.job_id,
+                        job.raw_event_id,
+                        adapter.model_id(),
+                        &vector,
+                        prompt_token_estimate(&job.content),
+                        now_ms,
+                    )?;
+                    report.completed += 1;
+                }
+                _ => {
+                    // An adapter that returns no usable vector must not silently
+                    // persist a zero-dim embedding and mark the job done.
+                    store.fail_job(
+                        job.job_id,
+                        job.attempts,
+                        "adapter returned no embedding vector",
+                        now_ms,
+                        caps.job_max_attempts,
+                        caps.job_backoff_base_ms,
+                    )?;
+                    report.failed += 1;
+                }
+            },
             Err(AdapterError::Embed(message)) => {
                 store.fail_job(
                     job.job_id,
@@ -143,6 +157,47 @@ mod tests {
 
         let report = tick_embed(&mut store, &adapter, &caps, 9_000_000_000_000).expect("tick runs");
         assert_eq!(report, TickReport::default());
+
+        cleanup_db_files(&path);
+    }
+
+    fn job_state(path: &Path) -> String {
+        let conn = rusqlite::Connection::open(path).expect("open db for state");
+        conn.query_row("SELECT state FROM jobs LIMIT 1", [], |row| row.get(0))
+            .expect("job state")
+    }
+
+    struct FailingAdapter;
+
+    impl ProviderAdapter for FailingAdapter {
+        fn id(&self) -> &'static str {
+            "null"
+        }
+        fn model_id(&self) -> &str {
+            "failing"
+        }
+        fn reachable(&self) -> bool {
+            true
+        }
+        fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, AdapterError> {
+            Err(AdapterError::Embed("synthetic adapter failure".to_string()))
+        }
+    }
+
+    #[test]
+    fn tick_defers_job_when_adapter_fails() {
+        let path = temp_db_path("worker-fail");
+        let mut store = Store::open(&path).expect("store opens");
+        capture_text(&mut store, "s1", 1000, "will fail to embed");
+
+        let caps = Caps::small();
+        let report =
+            tick_embed(&mut store, &FailingAdapter, &caps, 9_000_000_000_000).expect("tick runs");
+        assert_eq!(report.leased, 1);
+        assert_eq!(report.completed, 0);
+        assert_eq!(report.failed, 1);
+        assert_eq!(embeddings_count(&path), 0);
+        assert_eq!(job_state(&path), "deferred");
 
         cleanup_db_files(&path);
     }

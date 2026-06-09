@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -289,6 +289,11 @@ impl Store {
     /// "Ready" = `pending`/`deferred` whose `scheduled_at` has arrived, OR `running`
     /// jobs whose lease expired (`started_at <= now - visibility_ms`). SQLite serializes
     /// writers, so two workers can never claim the same row.
+    ///
+    /// Priority then `scheduled_at` (then `id`) governs which jobs are selected; the
+    /// returned batch itself is in `id` order, not priority order (`UPDATE ... RETURNING`
+    /// does not preserve the subquery ordering). The worker processes the whole batch,
+    /// so intra-batch order does not matter.
     pub fn lease_embed_jobs(
         &mut self,
         limit: usize,
@@ -296,7 +301,9 @@ impl Store {
         visibility_ms: i64,
     ) -> Result<Vec<LeasedJob>, StoreError> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let claimed: Vec<(i64, String, i64)> = {
             let mut stmt = tx.prepare(
                 "UPDATE jobs SET state = 'running', started_at = ?1, attempts = attempts + 1
@@ -348,6 +355,10 @@ impl Store {
 
     /// Persist an embedding, its `provider_usage` ledger row, and mark the job done —
     /// all in one transaction so a crash never leaves a done job without its embedding.
+    ///
+    /// Precondition: invoked by the worker holding the current lease. The `embeddings`
+    /// write is an idempotent upsert, so a reclaimed (re-processed) job is harmless;
+    /// full lease-epoch fencing is deferred with the remote adapters.
     pub fn complete_embed_job(
         &mut self,
         job_id: i64,
@@ -364,7 +375,9 @@ impl Store {
         }
         let owner_id = raw_event_id.to_string();
 
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO embeddings (id, owner_type, owner_id, model_id, dim, vector, created_at)
              VALUES (lower(hex(randomblob(16))), 'raw_event', ?1, ?2, ?3, ?4, ?5)
@@ -389,6 +402,11 @@ impl Store {
 
     /// Defer a failed job with exponential backoff, or dead-letter it once it has
     /// reached `max_attempts`. `attempts` is the job's post-lease attempt count.
+    ///
+    /// Precondition: the caller holds the current lease (the worker invokes this right
+    /// after a failed embed, while the job is `running`). Fencing a stale caller whose
+    /// lease already expired and was reclaimed needs a lease epoch; that is deferred
+    /// until adapters that can outlast the visibility window (the remote providers) land.
     pub fn fail_job(
         &mut self,
         job_id: i64,
@@ -2243,16 +2261,33 @@ mod tests {
     }
 
     #[test]
-    fn lease_respects_limit_and_priority_order() {
+    fn lease_respects_limit_and_priority_then_scheduled_at_order() {
         let path = temp_db_path("lease-order");
         let mut store = Store::open(&path).expect("store opens");
         let (job1, _) = seed_embed_job(&mut store, 100, 1000, "first");
         let (job2, _) = seed_embed_job(&mut store, 200, 1001, "second");
-        let (_job3, _) = seed_embed_job(&mut store, 300, 1002, "third");
+        let (job3, _) = seed_embed_job(&mut store, 300, 1002, "third");
+        // job3 was enqueued last and scheduled latest, but a lower priority number
+        // wins outright over the scheduled_at tiebreak.
+        store
+            .conn
+            .execute("UPDATE jobs SET priority = 10 WHERE id = ?1", params![job3])
+            .expect("raise job3 priority");
 
         let leased = store.lease_embed_jobs(2, 10_000, 60_000).expect("lease");
-        let ids: Vec<i64> = leased.iter().map(|job| job.job_id).collect();
-        assert_eq!(ids, vec![job1, job2]);
+        // The selection respects priority then scheduled_at: job3 (priority 10) wins
+        // over its late scheduled_at, and job1 beats job2 on the scheduled_at tiebreak,
+        // so job2 is left behind. (UPDATE ... RETURNING yields the claimed rows in id
+        // order, not the ORDER BY order, so compare the selected set.)
+        let mut ids: Vec<i64> = leased.iter().map(|job| job.job_id).collect();
+        ids.sort_unstable();
+        let mut expected = vec![job1, job3];
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+        assert!(
+            !ids.contains(&job2),
+            "lower-priority job2 must be left behind"
+        );
 
         cleanup_db_files(&path);
     }

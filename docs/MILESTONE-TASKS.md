@@ -153,8 +153,9 @@ increment behind the in-place `ProviderAdapter` seam.
   double-claim).
 - `[~]` Governor caps: `queue_depth_max` (admission) and `worker_concurrency`
   (per-tick lease bound) are enforced now; `worker_mem_mb`, CPU share,
-  `dream_wallclock_secs`, and the spend window are config-present and bind once the
-  planes that consume them land.
+  `dream_wallclock_secs`, and the *runtime* spend-ledger ceiling (`paid_spend_cap_usd`,
+  the plan's `spend_window_usd`) are config-present and bind once the planes that
+  consume them land.
 - `[x]` Over-cap admission backpressure without OOM (capture degrades without
   enqueue at the cap; covered by existing regression tests).
 - `[x]` Add fixed worker with `Embed` active first (the only active worker this slice).
@@ -165,9 +166,10 @@ increment behind the in-place `ProviderAdapter` seam.
   adapter this slice.)
 - `[x]` Write `embeddings` rows from the `Embed` worker.
 - `[x]` Write `provider_usage` rows for every embed provider call.
-- `[x]` Enforce default `spend_window_usd = 0` so paid calls are blocked unless
-  opted in (config validation rejects a non-`null` default adapter at zero budget;
-  the `null` adapter records `est_cost = 0`).
+- `[x]` Block paid calls at the default zero spend cap (config validation rejects a
+  non-`null` default adapter when `paid_spend_cap_usd == 0`; the `null` adapter records
+  `est_cost = 0`). The *runtime* ledger-based spend ceiling is deferred (see the caps
+  line above).
 - `[ ]` Add `setup` or equivalent provider config/reachability command. (Deferred
   with the remote adapters.)
 
@@ -175,7 +177,8 @@ increment behind the in-place `ProviderAdapter` seam.
 
 - `embed_lease_is_exactly_once_under_concurrent_workers`: 4 worker connections drain
   200 seeded jobs; every job is claimed exactly once (200 unique ids) and all reach
-  `done`.
+  `done`. (Exactly-once under concurrency; at-least-once across lease expiry, made safe
+  by the idempotent embedding upsert in `complete_embed_job`.)
 - `lease_then_complete_writes_embedding_and_provider_usage`: a leased job writes a
   32-dim `embeddings` row (128-byte little-endian vector) plus a `provider_usage`
   row (`adapter='null'`, `op='embed'`, `est_cost=0`), and the job reaches `done`.
@@ -191,7 +194,11 @@ increment behind the in-place `ProviderAdapter` seam.
 
 `openai_compat`/`ollama`/`opencode` adapters, the reachability probe + failover
 order, and the `setup` CLI. The `ProviderAdapter` seam is already in place so these
-land without touching the queue/worker/ledger code.
+land without touching the queue/worker/ledger code. Also deferred: the runtime
+spend-ledger ceiling, a bounded-memory/steady-RSS test, lease-epoch fencing for
+adapters that can outlast the visibility window, consolidating the worker onto the
+planned single-writer actor (it currently uses its own connection), and an
+integration test of the `serve` worker thread (the tick is unit-tested directly).
 
 ## M4 — Vector Rerank In Recall
 
