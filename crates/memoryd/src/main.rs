@@ -1004,6 +1004,50 @@ mod tests {
     }
 
     #[test]
+    fn remember_command_redacts_secret_text_before_recall_indexing() {
+        let path = temp_db_path("remember-redacts-before-recall");
+        let bearer = "leakycredentialvalue";
+        let email = "ops@example.test";
+        let content = format!("Deploy with Authorization: Bearer {bearer}; contact {email}");
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "remember",
+                content.as_str(),
+                "--db",
+                path.to_str().expect("path is UTF-8"),
+            ]
+            .map(OsString::from),
+        )
+        .expect("cli parses");
+        let Command::Remember(args) = cli.command.clone() else {
+            panic!("expected remember command");
+        };
+
+        remember(cli, args).expect("remember succeeds");
+
+        let store = Store::open(&path).expect("store opens");
+        let result = store.recall_events("redacted", 5).expect("recall succeeds");
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(
+            result.hits[0].content,
+            "Deploy with Authorization: Bearer [REDACTED]; contact [REDACTED]"
+        );
+        assert!(!result.hits[0].content.contains(bearer));
+        assert!(!result.hits[0].content.contains(email));
+        assert_eq!(
+            store
+                .recall_events("leakycredentialvalue", 5)
+                .expect("secret recall succeeds")
+                .hits
+                .len(),
+            0
+        );
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
     fn recall_command_reads_lexical_capture_without_provider_usage() {
         let path = temp_db_path("recall-command");
         {
@@ -1250,6 +1294,87 @@ mod tests {
         assert_eq!(response.body["results"][0]["content"], "WAL timeout fixed");
         let stats = store.table_stats().expect("table stats");
         assert_eq!(table_rows(&stats, "provider_usage"), 0);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn http_capture_redacts_secret_payload_before_recall_returns_it() {
+        let path = temp_db_path("http-redacts-before-recall");
+        let cfg = Config::with_db_path(path.clone());
+        let mut store = Store::open(&path).expect("store opens");
+        let bearer = "leakycredentialvalue";
+        let api_key = "structuredapikeyvalue";
+        let email = "ops@example.test";
+        let body = format!(
+            r#"{{
+                "session_id":"session-1",
+                "agent":"claude",
+                "source":"tool_result",
+                "kind":"observation",
+                "payload":{{
+                    "text":"HTTP Authorization: Bearer {bearer}; contact {email}",
+                    "api_key":"{api_key}"
+                }}
+            }}"#
+        );
+
+        let capture_response = handle_http_request(
+            &mut store,
+            &cfg,
+            Some("127.0.0.1:65000".parse().expect("peer parses")),
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/v1/capture".to_string(),
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: body.into_bytes(),
+            },
+        );
+        assert_eq!(capture_response.status, 202);
+
+        let recall_response = handle_http_request(
+            &mut store,
+            &cfg,
+            Some("127.0.0.1:65000".parse().expect("peer parses")),
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/v1/recall".to_string(),
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: br#"{"query":"redacted","k":5}"#.to_vec(),
+            },
+        );
+
+        assert_eq!(recall_response.status, 200);
+        let content = recall_response.body["results"][0]["content"]
+            .as_str()
+            .expect("content is string");
+        assert_eq!(
+            content,
+            "HTTP Authorization: Bearer [REDACTED]; contact [REDACTED]"
+        );
+        assert!(!content.contains(bearer));
+        assert!(!content.contains(api_key));
+        assert!(!content.contains(email));
+
+        let secret_response = handle_http_request(
+            &mut store,
+            &cfg,
+            Some("127.0.0.1:65000".parse().expect("peer parses")),
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/v1/recall".to_string(),
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: br#"{"query":"leakycredentialvalue","k":5}"#.to_vec(),
+            },
+        );
+        assert_eq!(secret_response.status, 200);
+        assert_eq!(
+            secret_response.body["results"]
+                .as_array()
+                .expect("results is array")
+                .len(),
+            0
+        );
 
         cleanup_db_files(&path);
     }

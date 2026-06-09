@@ -22,6 +22,10 @@ pub const CANONICAL_TABLES: [&str; 13] = [
     "provider_usage",
 ];
 
+const REDACTED: &str = "[REDACTED]";
+const HIGH_ENTROPY_MIN_LEN: usize = 20;
+const HIGH_ENTROPY_MIN_BITS_PER_CHAR: f64 = 4.0;
+
 pub struct Store {
     conn: Connection,
     path: PathBuf,
@@ -48,18 +52,30 @@ impl Store {
     }
 
     pub fn capture_event(&mut self, event: NewRawEvent) -> Result<CaptureAck, StoreError> {
-        validate_capture_field("session_id", &event.session_id)?;
-        validate_capture_field("agent", &event.agent)?;
-        validate_capture_field("source", &event.source)?;
-        validate_capture_field("kind", &event.kind)?;
+        let NewRawEvent {
+            session_id,
+            agent,
+            source,
+            kind,
+            payload,
+            provenance,
+            ts_ms,
+        } = event;
 
-        let session_id = event.session_id;
-        let agent = event.agent;
-        let source = event.source;
-        let kind = event.kind;
-        let fts_content = capture_fts_content(&event.payload);
-        let payload = serde_json::to_string(&event.payload)?;
-        let provenance = serde_json::to_string(&event.provenance)?;
+        let session_id = redact_inline_string(&session_id);
+        let agent = redact_inline_string(&agent);
+        let source = redact_inline_string(&source);
+        let kind = redact_inline_string(&kind);
+        validate_capture_field("session_id", &session_id)?;
+        validate_capture_field("agent", &agent)?;
+        validate_capture_field("source", &source)?;
+        validate_capture_field("kind", &kind)?;
+
+        let payload = redact_json_value(payload);
+        let provenance = redact_json_value(provenance);
+        let fts_content = capture_fts_content(&payload);
+        let payload = serde_json::to_string(&payload)?;
+        let provenance = serde_json::to_string(&provenance)?;
         let scheduled_at = unix_ms_now();
 
         let tx = self.conn.transaction()?;
@@ -72,14 +88,14 @@ impl Store {
                     ELSE sessions.started_at
                 END,
                 event_count = sessions.event_count + 1",
-            params![session_id.as_str(), agent.as_str(), event.ts_ms],
+            params![session_id.as_str(), agent.as_str(), ts_ms],
         )?;
         tx.execute(
             "INSERT INTO raw_events (session_id, ts, source, kind, payload, provenance)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 session_id.as_str(),
-                event.ts_ms,
+                ts_ms,
                 source.as_str(),
                 kind.as_str(),
                 payload.as_str(),
@@ -337,6 +353,266 @@ fn validate_capture_field(field: &'static str, value: &str) -> Result<(), StoreE
         return Err(StoreError::InvalidCaptureField(field));
     }
     Ok(())
+}
+
+fn redact_json_value(mut value: serde_json::Value) -> serde_json::Value {
+    redact_json_value_in_place(&mut value, None);
+    value
+}
+
+fn redact_json_value_in_place(value: &mut serde_json::Value, key: Option<&str>) {
+    if key.is_some_and(is_sensitive_key) {
+        *value = serde_json::Value::String(REDACTED.to_string());
+        return;
+    }
+
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_json_value_in_place(value, None);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                redact_json_value_in_place(value, Some(key));
+            }
+        }
+        serde_json::Value::String(text) => {
+            let redacted = redact_inline_string(text);
+            if redacted != *text {
+                *text = redacted;
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect::<String>();
+
+    matches!(
+        normalized.as_str(),
+        "authorization"
+            | "auth"
+            | "password"
+            | "passwd"
+            | "pwd"
+            | "token"
+            | "apikey"
+            | "credential"
+            | "credentials"
+            | "privatekey"
+    ) || normalized.ends_with("token")
+        || normalized.contains("secret")
+        || normalized.contains("password")
+        || normalized.contains("apikey")
+        || normalized.contains("credential")
+        || normalized.contains("privatekey")
+}
+
+fn redact_inline_string(input: &str) -> String {
+    if input.contains("-----BEGIN") && input.contains("PRIVATE KEY-----") {
+        return REDACTED.to_string();
+    }
+
+    let mut spans = Vec::new();
+    collect_bearer_spans(input, &mut spans);
+    collect_known_secret_prefix_spans(input, &mut spans);
+    collect_email_spans(input, &mut spans);
+    collect_high_entropy_spans(input, &mut spans);
+    apply_redaction_spans(input, spans)
+}
+
+fn collect_bearer_spans(input: &str, spans: &mut Vec<(usize, usize)>) {
+    let mut offset = 0;
+    while let Some(relative) = find_ascii_case_insensitive(&input[offset..], "bearer ") {
+        let secret_start = offset + relative + "bearer ".len();
+        let secret_end = find_secret_end(input, secret_start);
+        if secret_end > secret_start {
+            spans.push((secret_start, secret_end));
+        }
+        offset = secret_end.max(secret_start + 1);
+    }
+}
+
+fn collect_known_secret_prefix_spans(input: &str, spans: &mut Vec<(usize, usize)>) {
+    for prefix in [
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "sk_live_",
+        "sk_test_",
+        "sk-",
+        "AKIA",
+        "ASIA",
+    ] {
+        let mut offset = 0;
+        while let Some(relative) = input[offset..].find(prefix) {
+            let start = offset + relative;
+            let end = find_secret_end(input, start);
+            let min_len = if matches!(prefix, "AKIA" | "ASIA") {
+                20
+            } else {
+                prefix.len() + 8
+            };
+            if end.saturating_sub(start) >= min_len {
+                spans.push((start, end));
+            }
+            offset = end.max(start + prefix.len());
+        }
+    }
+}
+
+fn collect_email_spans(input: &str, spans: &mut Vec<(usize, usize)>) {
+    for (at, ch) in input.char_indices() {
+        if ch != '@' {
+            continue;
+        }
+
+        let start = find_email_start(input, at);
+        let end = find_email_end(input, at + ch.len_utf8());
+        if start < at && end > at + ch.len_utf8() && looks_like_email(&input[start..end]) {
+            spans.push((start, end));
+        }
+    }
+}
+
+fn collect_high_entropy_spans(input: &str, spans: &mut Vec<(usize, usize)>) {
+    let mut start = None;
+    for (index, ch) in input.char_indices() {
+        if is_token_char(ch) {
+            start.get_or_insert(index);
+            continue;
+        }
+
+        if let Some(token_start) = start.take() {
+            push_high_entropy_span(input, token_start, index, spans);
+        }
+    }
+
+    if let Some(token_start) = start {
+        push_high_entropy_span(input, token_start, input.len(), spans);
+    }
+}
+
+fn push_high_entropy_span(input: &str, start: usize, end: usize, spans: &mut Vec<(usize, usize)>) {
+    let candidate = &input[start..end];
+    if candidate.len() >= HIGH_ENTROPY_MIN_LEN
+        && candidate.bytes().any(|byte| byte.is_ascii_alphabetic())
+        && candidate.bytes().any(|byte| byte.is_ascii_digit())
+        && shannon_entropy(candidate) >= HIGH_ENTROPY_MIN_BITS_PER_CHAR
+    {
+        spans.push((start, end));
+    }
+}
+
+fn apply_redaction_spans(input: &str, mut spans: Vec<(usize, usize)>) -> String {
+    if spans.is_empty() {
+        return input.to_string();
+    }
+
+    spans.sort_unstable_by_key(|span| span.0);
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    for (start, end) in spans {
+        if start < cursor || start >= end || end > input.len() {
+            continue;
+        }
+        output.push_str(&input[cursor..start]);
+        output.push_str(REDACTED);
+        cursor = end;
+    }
+    output.push_str(&input[cursor..]);
+    output
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+fn find_secret_end(input: &str, start: usize) -> usize {
+    input[start..]
+        .char_indices()
+        .find_map(|(relative, ch)| is_secret_terminator(ch).then_some(start + relative))
+        .unwrap_or(input.len())
+}
+
+fn find_email_start(input: &str, at: usize) -> usize {
+    input[..at]
+        .char_indices()
+        .filter_map(|(index, ch)| is_email_boundary(ch).then_some(index + ch.len_utf8()))
+        .next_back()
+        .unwrap_or(0)
+}
+
+fn find_email_end(input: &str, after_at: usize) -> usize {
+    input[after_at..]
+        .char_indices()
+        .find_map(|(relative, ch)| is_email_boundary(ch).then_some(after_at + relative))
+        .unwrap_or(input.len())
+}
+
+fn looks_like_email(candidate: &str) -> bool {
+    let Some((local, domain)) = candidate.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && domain.contains('.')
+        && domain.len() >= 3
+        && candidate
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '%' | '+' | '-' | '@'))
+}
+
+fn shannon_entropy(candidate: &str) -> f64 {
+    let mut counts = [0usize; 128];
+    let mut len = 0usize;
+    for byte in candidate.bytes().filter(|byte| byte.is_ascii()) {
+        counts[usize::from(byte)] += 1;
+        len += 1;
+    }
+    if len == 0 {
+        return 0.0;
+    }
+
+    counts
+        .into_iter()
+        .filter(|count| *count > 0)
+        .map(|count| {
+            let probability = count as f64 / len as f64;
+            -probability * probability.log2()
+        })
+        .sum()
+}
+
+fn is_secret_terminator(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            ',' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\'' | '`'
+        )
+}
+
+fn is_email_boundary(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '`' | ',' | ';' | ':'
+        )
+}
+
+fn is_token_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '=' | '+')
 }
 
 fn capture_fts_content(payload: &serde_json::Value) -> String {
@@ -864,6 +1140,134 @@ mod tests {
             .expect("job count");
         assert_eq!(event_rows, 2);
         assert_eq!(job_rows, 2);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn capture_redacts_payload_provenance_and_fts_before_persistence() {
+        let path = temp_db_path("capture-redacts-before-persistence");
+        let mut store = Store::open(&path).expect("store opens");
+        let api_key = "structuredapikeyvalue";
+        let bearer = "leakycredentialvalue";
+        let password = "correct-horse-battery-staple";
+        let email = "ops@example.test";
+        let provenance_token = "provenancesecretvalue";
+
+        store
+            .capture_event(NewRawEvent {
+                session_id: "session-1".to_string(),
+                agent: "claude".to_string(),
+                source: "tool_result".to_string(),
+                kind: "observation".to_string(),
+                payload: serde_json::json!({
+                    "text": format!("Deploy with Authorization: Bearer {bearer}; contact {email}"),
+                    "api_key": api_key,
+                    "nested": {"password": password},
+                }),
+                provenance: serde_json::json!({"token": provenance_token}),
+                ts_ms: 1234,
+            })
+            .expect("capture succeeds");
+
+        let (payload, provenance): (String, String) = store
+            .conn
+            .query_row(
+                "SELECT payload, provenance FROM raw_events WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("raw event row exists");
+        let fts_content: String = store
+            .conn
+            .query_row(
+                "SELECT content FROM raw_events_fts WHERE raw_event_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fts row exists");
+
+        for stored in [&payload, &provenance, &fts_content] {
+            for secret in [api_key, bearer, password, email, provenance_token] {
+                assert!(!stored.contains(secret), "stored value leaked {secret}");
+            }
+        }
+
+        let payload: serde_json::Value = serde_json::from_str(&payload).expect("payload is JSON");
+        let provenance: serde_json::Value =
+            serde_json::from_str(&provenance).expect("provenance is JSON");
+        assert_eq!(payload["api_key"], "[REDACTED]");
+        assert_eq!(payload["nested"]["password"], "[REDACTED]");
+        assert_eq!(provenance["token"], "[REDACTED]");
+        assert_eq!(
+            payload["text"],
+            "Deploy with Authorization: Bearer [REDACTED]; contact [REDACTED]"
+        );
+        assert_eq!(
+            fts_content,
+            "Deploy with Authorization: Bearer [REDACTED]; contact [REDACTED]"
+        );
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn capture_redacts_metadata_fields_before_persistence() {
+        let path = temp_db_path("capture-redacts-metadata");
+        let mut store = Store::open(&path).expect("store opens");
+        let session_secret = "sessioncredentialvalue";
+        let agent_secret = "agentcredentialvalue";
+        let source_secret = "sourcecredentialvalue";
+        let kind_secret = "kindcredentialvalue";
+
+        let ack = store
+            .capture_event(NewRawEvent {
+                session_id: format!("Bearer {session_secret}"),
+                agent: format!("Authorization: Bearer {agent_secret}"),
+                source: format!("source bearer {source_secret}"),
+                kind: format!("kind bearer {kind_secret}"),
+                payload: serde_json::json!({"text": "metadata redaction"}),
+                provenance: serde_json::json!({}),
+                ts_ms: 1234,
+            })
+            .expect("capture succeeds");
+
+        let (session_id, agent, source, kind, job_payload): (
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = store
+            .conn
+            .query_row(
+                "SELECT s.id, s.agent, r.source, r.kind, j.payload
+                 FROM sessions AS s
+                 JOIN raw_events AS r ON r.session_id = s.id
+                 JOIN jobs AS j ON j.id = ?1",
+                [ack.enqueued_job_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("stored rows exist");
+
+        assert_eq!(ack.session_id, "Bearer [REDACTED]");
+        assert_eq!(session_id, "Bearer [REDACTED]");
+        assert_eq!(agent, "Authorization: Bearer [REDACTED]");
+        assert_eq!(source, "source bearer [REDACTED]");
+        assert_eq!(kind, "kind bearer [REDACTED]");
+        for stored in [session_id, agent, source, kind, job_payload] {
+            for secret in [session_secret, agent_secret, source_secret, kind_secret] {
+                assert!(!stored.contains(secret), "stored metadata leaked {secret}");
+            }
+        }
 
         cleanup_db_files(&path);
     }
