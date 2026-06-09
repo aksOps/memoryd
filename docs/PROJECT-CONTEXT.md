@@ -51,6 +51,9 @@ Implemented now:
 - Bounded capture admission using the configured queue-depth cap; saturated
   captures persist the raw event and return degraded without enqueueing an embed
   job.
+- M1 capture latency fixtures are explicit ignored performance tests; latest
+  local single-threaded p95 evidence is `2.226592ms` for core capture and
+  `771.531µs` for HTTP-handler capture.
 - CI/security gates for format, build, clippy, tests, dependency policy,
   advisory audit, and SBOM generation.
 - OpenSSF Best Practices passing evidence.

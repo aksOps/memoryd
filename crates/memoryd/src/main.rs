@@ -939,6 +939,7 @@ mod tests {
     use memoryd_core::store::TableStats;
     use std::fs;
     use std::path::Path;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn parses_doctor_with_db_path() {
@@ -1193,6 +1194,55 @@ mod tests {
         assert_eq!(table_rows(&stats, "raw_events"), 1);
         assert_eq!(table_rows(&stats, "sessions"), 1);
         assert_eq!(table_rows(&stats, "jobs"), 0);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    #[ignore = "performance evidence fixture; run explicitly on an idle host"]
+    fn http_capture_100_sequential_requests_p95_stays_under_m1_target() {
+        let path = temp_db_path("http-capture-latency");
+        let cfg = Config::with_db_path(path.clone());
+        let mut store = Store::open(&path).expect("store opens");
+        let mut durations = Vec::with_capacity(100);
+
+        for index in 0..100 {
+            let body = format!(
+                r#"{{
+                    "session_id":"session-1",
+                    "agent":"claude",
+                    "source":"tool_result",
+                    "kind":"observation",
+                    "payload":{{"text":"WAL timeout fixed {index}"}},
+                    "ts_ms":{}
+                }}"#,
+                1_000 + index
+            )
+            .into_bytes();
+            let started = Instant::now();
+            let response = handle_http_request(
+                &mut store,
+                &cfg,
+                Some("127.0.0.1:65000".parse().expect("peer parses")),
+                HttpRequest {
+                    method: "POST".to_string(),
+                    path: "/v1/capture".to_string(),
+                    headers: vec![("content-type".to_string(), "application/json".to_string())],
+                    body,
+                },
+            );
+            durations.push(started.elapsed());
+            assert_eq!(response.status, 202);
+            assert_eq!(response.body["degraded"], false);
+        }
+
+        durations.sort_unstable();
+        let p95 = durations[94];
+        eprintln!("http_capture_100_seq_p95={p95:?}");
+        assert!(
+            p95 < Duration::from_millis(8),
+            "HTTP capture p95 {p95:?} exceeded M1 target"
+        );
 
         cleanup_db_files(&path);
     }
