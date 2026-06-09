@@ -76,6 +76,11 @@ Implemented now:
   no semantic signal is available. Gated on `ProviderAdapter::embeds_semantically`, so the
   default `null` adapter (hash, no signal) keeps recall lexical; production semantic recall
   activates with a real embedding provider. Uplift proven with a deterministic test double.
+- M5 historic import: `import --source jsonl --path <p>` stages each line as a
+  `kind='import'` raw event through the same capture path (sessions, FTS, embed queue).
+  Idempotent by a `content_hash` partial-unique index (migration 0003; FNV-1a, not BLAKE3),
+  resumable, and governor-bounded (pauses when the embed queue is full). Source-specific
+  importers and distillation into `memories` are deferred to M6.
 - CI/security gates for format, build, clippy, tests, dependency policy,
   advisory audit, and SBOM generation.
 - OpenSSF Best Practices passing evidence.
