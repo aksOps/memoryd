@@ -106,10 +106,38 @@ fn serve(cli: Cli) -> Result<(), CliError> {
     cfg.validate()?;
 
     let mut store = Store::open(&cfg.db_path)?;
+
+    let worker_db = cfg.db_path.clone();
+    let worker_caps = cfg.caps.clone();
+    std::thread::spawn(move || {
+        let adapter = memoryd_core::adapters::NullAdapter::new();
+        let mut worker_store = match Store::open(&worker_db) {
+            Ok(store) => store,
+            Err(err) => {
+                eprintln!("memoryd: worker store open failed: {err}");
+                return;
+            }
+        };
+        loop {
+            let now = unix_ms_now();
+            match memoryd_core::worker::tick_embed(&mut worker_store, &adapter, &worker_caps, now) {
+                Ok(report) if report.leased == 0 => {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    eprintln!("memoryd: worker tick failed: {err}");
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        }
+    });
+
     let listener = TcpListener::bind(cfg.bind)?;
     println!("memoryd serve");
     println!("bind: {}", cfg.bind);
     println!("db_path: {}", cfg.db_path.display());
+    println!("worker: embed (null adapter)");
 
     for stream in listener.incoming() {
         match stream {
