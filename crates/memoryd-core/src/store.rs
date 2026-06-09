@@ -1,6 +1,11 @@
+use crate::adapters::{ProviderAdapter, prompt_token_estimate};
+use crate::vectorindex::{Candidate, VectorIndex};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -262,6 +267,16 @@ impl Store {
     pub fn recall_events(&self, query: &str, limit: usize) -> Result<RecallResult, StoreError> {
         let fts_query = lexical_query(query).ok_or(StoreError::InvalidRecallQuery)?;
         let limit = i64::try_from(limit.clamp(1, 50)).unwrap_or(50);
+        let hits = self.lexical_hits(&fts_query, limit)?;
+        Ok(RecallResult {
+            hits,
+            degraded: false,
+            mode: "lexical",
+            compared: 0,
+        })
+    }
+
+    fn lexical_hits(&self, fts_query: &str, limit: i64) -> Result<Vec<RecallHit>, StoreError> {
         let mut stmt = self.conn.prepare(RECALL_EVENTS_SQL)?;
         let hits = stmt
             .query_map(params![fts_query, limit], |row| {
@@ -276,12 +291,197 @@ impl Store {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        Ok(hits)
+    }
+
+    /// Semantic recall: rerank the bounded FTS shortlist by cosine over cached
+    /// `embeddings`, fused with the lexical score. Degrades to lexical (same shape)
+    /// when the adapter offers no usable semantic signal or the query embedding
+    /// cannot be obtained. Only FTS-prefiltered candidates are ever compared (at
+    /// most `RECALL_CANDIDATE_CAP` vectors).
+    pub fn recall_semantic(
+        &self,
+        query: &str,
+        limit: usize,
+        adapter: &dyn ProviderAdapter,
+        index: &dyn VectorIndex,
+        now_ms: i64,
+    ) -> Result<RecallResult, StoreError> {
+        let fts_query = lexical_query(query).ok_or(StoreError::InvalidRecallQuery)?;
+        let limit = i64::try_from(limit.clamp(1, 50)).unwrap_or(50);
+
+        if !adapter.reachable() || !adapter.embeds_semantically() {
+            let hits = self.lexical_hits(&fts_query, limit)?;
+            return Ok(RecallResult {
+                hits,
+                degraded: true,
+                mode: "lexical",
+                compared: 0,
+            });
+        }
+
+        let candidates = self.lexical_hits(&fts_query, RECALL_CANDIDATE_CAP)?;
+        if candidates.is_empty() {
+            return Ok(RecallResult {
+                hits: Vec::new(),
+                degraded: false,
+                mode: "semantic",
+                compared: 0,
+            });
+        }
+
+        let query_vec = match self.query_embedding(query, adapter, now_ms)? {
+            Some(vector) => vector,
+            None => {
+                let hits = self.lexical_hits(&fts_query, limit)?;
+                return Ok(RecallResult {
+                    hits,
+                    degraded: true,
+                    mode: "lexical",
+                    compared: 0,
+                });
+            }
+        };
+
+        let model_id = adapter.model_id();
+        let mut vectors: Vec<Candidate> = Vec::with_capacity(candidates.len());
+        for hit in &candidates {
+            if let Some(vector) =
+                self.embedding_vector("raw_event", &hit.raw_event_id.to_string(), model_id)?
+            {
+                vectors.push(Candidate {
+                    id: hit.raw_event_id,
+                    vector,
+                });
+            }
+        }
+        let compared = vectors.len();
+        if compared == 0 {
+            let hits = self.lexical_hits(&fts_query, limit)?;
+            return Ok(RecallResult {
+                hits,
+                degraded: false,
+                mode: "lexical",
+                compared: 0,
+            });
+        }
+
+        let scored = index.search(&query_vec, &vectors, vectors.len());
+        let cosine: HashMap<i64, f32> = scored.into_iter().map(|s| (s.id, s.score)).collect();
+
+        // Lexical term: -bm25 (more negative bm25 = better match) min-max normalized.
+        let lex_raw: Vec<f32> = candidates.iter().map(|hit| -(hit.score as f32)).collect();
+        let (lo, hi) = lex_raw
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| {
+                (lo.min(v), hi.max(v))
+            });
+        let span = hi - lo;
+
+        let mut fused: Vec<RecallHit> = candidates
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut hit)| {
+                let lex = if span > 0.0 {
+                    (lex_raw[i] - lo) / span
+                } else {
+                    0.5
+                };
+                let sem = cosine
+                    .get(&hit.raw_event_id)
+                    .map_or(0.0, |c| (c + 1.0) / 2.0);
+                hit.score = f64::from(RECALL_W_SEM * sem + RECALL_W_LEX * lex);
+                hit
+            })
+            .collect();
+        fused.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.ts_ms.cmp(&a.ts_ms))
+                .then(b.raw_event_id.cmp(&a.raw_event_id))
+        });
+        fused.truncate(limit as usize);
 
         Ok(RecallResult {
-            hits,
+            hits: fused,
             degraded: false,
-            mode: "lexical",
+            mode: "semantic",
+            compared,
         })
+    }
+
+    /// Fetch or compute+cache the query embedding. `None` => provider returned no
+    /// usable vector (caller degrades to lexical). A cache hit makes no provider
+    /// call and writes no ledger row.
+    fn query_embedding(
+        &self,
+        query: &str,
+        adapter: &dyn ProviderAdapter,
+        now_ms: i64,
+    ) -> Result<Option<Vec<f32>>, StoreError> {
+        let model_id = adapter.model_id();
+        let owner_id = query_cache_id(query);
+        if let Some(vector) = self.embedding_vector("query", &owner_id, model_id)? {
+            return Ok(Some(vector));
+        }
+        let vectors = match adapter.embed(std::slice::from_ref(&query.to_string())) {
+            Ok(vectors) => vectors,
+            Err(_) => return Ok(None),
+        };
+        let Some(vector) = vectors.into_iter().next().filter(|v| !v.is_empty()) else {
+            return Ok(None);
+        };
+        self.store_embedding("query", &owner_id, model_id, &vector, now_ms)?;
+        self.conn.execute(
+            "INSERT INTO provider_usage
+                (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
+             VALUES (?1, ?2, ?3, 'embed', ?4, 0, 0.0, NULL)",
+            params![now_ms, adapter.id(), model_id, prompt_token_estimate(query)],
+        )?;
+        Ok(Some(vector))
+    }
+
+    fn embedding_vector(
+        &self,
+        owner_type: &str,
+        owner_id: &str,
+        model_id: &str,
+    ) -> Result<Option<Vec<f32>>, StoreError> {
+        let bytes: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT vector FROM embeddings
+                 WHERE owner_type = ?1 AND owner_id = ?2 AND model_id = ?3",
+                params![owner_type, owner_id, model_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(bytes.map(|bytes| decode_f32(&bytes)))
+    }
+
+    fn store_embedding(
+        &self,
+        owner_type: &str,
+        owner_id: &str,
+        model_id: &str,
+        vector: &[f32],
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let dim = i64::try_from(vector.len()).unwrap_or(0);
+        let mut bytes = Vec::with_capacity(vector.len() * 4);
+        for value in vector {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        self.conn.execute(
+            "INSERT INTO embeddings (id, owner_type, owner_id, model_id, dim, vector, created_at)
+             VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(owner_type, owner_id, model_id)
+             DO UPDATE SET dim = excluded.dim, vector = excluded.vector,
+                           created_at = excluded.created_at",
+            params![owner_type, owner_id, model_id, dim, bytes, now_ms],
+        )?;
+        Ok(())
     }
 
     /// Atomically claim up to `limit` ready embed jobs.
@@ -511,6 +711,8 @@ pub struct RecallResult {
     pub hits: Vec<RecallHit>,
     pub degraded: bool,
     pub mode: &'static str,
+    /// Number of candidate vectors compared (semantic recall); 0 for lexical.
+    pub compared: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -979,6 +1181,13 @@ const RECALL_EVENTS_SQL: &str = "SELECT r.id, r.session_id, r.ts, r.source, r.ki
      ORDER BY score, r.ts DESC
      LIMIT ?2";
 
+/// Hard cap on vectors compared per semantic recall (H7: never the whole table).
+const RECALL_CANDIDATE_CAP: i64 = 256;
+/// Recall fusion weights (ARCHITECTURE-PLAN s9.4 defaults; M4 uses the two active
+/// signals — semantic + lexical — since durable-memory signals arrive in M6+).
+const RECALL_W_SEM: f32 = 0.34;
+const RECALL_W_LEX: f32 = 0.18;
+
 fn lexical_query(query: &str) -> Option<String> {
     let tokens = query
         .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
@@ -990,6 +1199,19 @@ fn lexical_query(query: &str) -> Option<String> {
         return None;
     }
     Some(tokens.join(" OR "))
+}
+
+fn decode_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+fn query_cache_id(query: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    query.hash(&mut hasher);
+    format!("q-{:016x}", hasher.finish())
 }
 
 fn unix_ms_now() -> i64 {
@@ -2288,6 +2510,268 @@ mod tests {
             !ids.contains(&job2),
             "lower-priority job2 must be left behind"
         );
+
+        cleanup_db_files(&path);
+    }
+
+    // Concept-clustering test double: maps related words to a shared dimension so
+    // it carries a real semantic signal (unlike the production hash `null` adapter),
+    // letting fixtures prove semantic rerank beats lexical without a real provider.
+    struct ConceptAdapter;
+
+    impl ConceptAdapter {
+        fn vector(text: &str) -> Vec<f32> {
+            let mut v = vec![0.0f32; 3];
+            for word in text
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| !w.is_empty())
+            {
+                let dim = match word.to_lowercase().as_str() {
+                    "lock" | "mutex" | "contention" | "deadlock" => Some(0),
+                    "database" | "schema" | "wal" | "sqlite" | "db" => Some(1),
+                    "report" | "dashboard" | "ui" | "view" => Some(2),
+                    _ => None,
+                };
+                if let Some(dim) = dim {
+                    v[dim] += 1.0;
+                }
+            }
+            v
+        }
+    }
+
+    impl ProviderAdapter for ConceptAdapter {
+        fn id(&self) -> &'static str {
+            "null"
+        }
+        fn model_id(&self) -> &str {
+            "concept-3"
+        }
+        fn reachable(&self) -> bool {
+            true
+        }
+        fn embeds_semantically(&self) -> bool {
+            true
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, crate::adapters::AdapterError> {
+            Ok(texts.iter().map(|t| Self::vector(t)).collect())
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingConceptAdapter {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingConceptAdapter {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl ProviderAdapter for CountingConceptAdapter {
+        fn id(&self) -> &'static str {
+            "null"
+        }
+        fn model_id(&self) -> &str {
+            "concept-3"
+        }
+        fn reachable(&self) -> bool {
+            true
+        }
+        fn embeds_semantically(&self) -> bool {
+            true
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, crate::adapters::AdapterError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ConceptAdapter.embed(texts)
+        }
+    }
+
+    fn capture_id(store: &mut Store, ts: i64, text: &str) -> i64 {
+        store
+            .capture_event(test_event_with_text("s", ts, text))
+            .expect("capture succeeds")
+            .raw_event_id
+    }
+
+    #[test]
+    fn semantic_recall_outranks_lexical_on_labeled_fixture() {
+        use crate::vectorindex::BruteForce;
+        let path = temp_db_path("recall-semantic-uplift");
+        let mut store = Store::open(&path).expect("store opens");
+        let adapter = ConceptAdapter;
+
+        // All three share the token "lock" (so all enter the FTS shortlist); the
+        // query "lock deadlock" matches only "lock" in each (none contain "deadlock"),
+        // so the lexical scores tie and fall back to ts DESC.
+        let a = capture_id(&mut store, 1000, "lock mutex contention"); // pure locking
+        let _b = capture_id(&mut store, 1001, "lock database schema");
+        let c = capture_id(&mut store, 1002, "lock report dashboard"); // newest
+        for (id, text) in [
+            (a, "lock mutex contention"),
+            (_b, "lock database schema"),
+            (c, "lock report dashboard"),
+        ] {
+            let v = adapter.embed(&[text.to_string()]).expect("embed");
+            store
+                .store_embedding(
+                    "raw_event",
+                    &id.to_string(),
+                    adapter.model_id(),
+                    &v[0],
+                    1000,
+                )
+                .expect("store embedding");
+        }
+
+        let lexical = store
+            .recall_events("lock deadlock", 1)
+            .expect("lexical recall");
+        assert_eq!(lexical.mode, "lexical");
+        assert_ne!(
+            lexical.hits[0].raw_event_id, a,
+            "lexical alone should not surface the true match first"
+        );
+
+        let semantic = store
+            .recall_semantic("lock deadlock", 1, &adapter, &BruteForce, 2000)
+            .expect("semantic recall");
+        assert_eq!(semantic.mode, "semantic");
+        assert_eq!(
+            semantic.hits[0].raw_event_id, a,
+            "semantic rerank surfaces the concept-relevant match"
+        );
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn query_embedding_is_cached_with_no_second_provider_call() {
+        use crate::vectorindex::BruteForce;
+        let path = temp_db_path("recall-semantic-cache");
+        let mut store = Store::open(&path).expect("store opens");
+        let id = capture_id(&mut store, 1000, "lock mutex");
+        let seed = ConceptAdapter
+            .embed(&["lock mutex".to_string()])
+            .expect("embed");
+        store
+            .store_embedding("raw_event", &id.to_string(), "concept-3", &seed[0], 1000)
+            .expect("store embedding");
+
+        let adapter = CountingConceptAdapter::default();
+        assert_eq!(adapter.calls(), 0);
+        store
+            .recall_semantic("lock", 5, &adapter, &BruteForce, 2000)
+            .expect("first recall");
+        assert_eq!(
+            adapter.calls(),
+            1,
+            "cache miss computes the query embedding once"
+        );
+        store
+            .recall_semantic("lock", 5, &adapter, &BruteForce, 2001)
+            .expect("second recall");
+        assert_eq!(adapter.calls(), 1, "cache hit makes no provider call");
+
+        let query_usage: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM provider_usage WHERE job_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("usage count");
+        assert_eq!(query_usage, 1, "exactly one query-embed ledger row");
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn null_provider_degrades_semantic_to_lexical_same_shape() {
+        use crate::adapters::NullAdapter;
+        use crate::vectorindex::BruteForce;
+        let path = temp_db_path("recall-semantic-degrade");
+        let mut store = Store::open(&path).expect("store opens");
+        capture_id(&mut store, 1000, "lock mutex");
+        capture_id(&mut store, 1001, "lock schema");
+
+        let lexical = store.recall_events("lock", 5).expect("lexical recall");
+        let semantic = store
+            .recall_semantic("lock", 5, &NullAdapter::new(), &BruteForce, 2000)
+            .expect("semantic recall");
+
+        assert_eq!(semantic.mode, "lexical");
+        assert!(semantic.degraded);
+        assert_eq!(semantic.compared, 0);
+        let lex_ids: Vec<i64> = lexical.hits.iter().map(|h| h.raw_event_id).collect();
+        let sem_ids: Vec<i64> = semantic.hits.iter().map(|h| h.raw_event_id).collect();
+        assert_eq!(lex_ids, sem_ids, "degraded semantic matches lexical order");
+
+        let query_rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM embeddings WHERE owner_type = 'query'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query embedding count");
+        assert_eq!(query_rows, 0, "degrade path makes no provider call");
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn semantic_recall_compares_at_most_candidate_cap() {
+        use crate::vectorindex::BruteForce;
+        let path = temp_db_path("recall-semantic-cap");
+        let mut store = Store::open(&path).expect("store opens");
+        // Bulk-seed 300 raw events that all match "lock", each with an embedding.
+        {
+            let tx = store.conn.transaction().expect("seed tx");
+            tx.execute(
+                "INSERT INTO sessions (id, agent, started_at, event_count, status)
+                 VALUES ('seed', 'claude', 1000, 300, 'open')",
+                [],
+            )
+            .expect("seed session");
+            let mut bytes = Vec::new();
+            for f in [1.0f32, 0.0, 0.0] {
+                bytes.extend_from_slice(&f.to_le_bytes());
+            }
+            for i in 0..300i64 {
+                tx.execute(
+                    "INSERT INTO raw_events (session_id, ts, source, kind, payload, provenance)
+                     VALUES ('seed', ?1, 'tool_result', 'observation', ?2, '{}')",
+                    params![1000 + i, format!("{{\"text\":\"lock item{i}\"}}")],
+                )
+                .expect("seed raw_event");
+                let rid = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO raw_events_fts (raw_event_id, content) VALUES (?1, ?2)",
+                    params![rid, format!("lock item{i}")],
+                )
+                .expect("seed fts");
+                tx.execute(
+                    "INSERT INTO embeddings (id, owner_type, owner_id, model_id, dim, vector, created_at)
+                     VALUES (lower(hex(randomblob(16))), 'raw_event', ?1, 'concept-3', 3, ?2, 1000)",
+                    params![rid.to_string(), bytes],
+                )
+                .expect("seed embedding");
+            }
+            tx.commit().expect("seed commits");
+        }
+
+        let result = store
+            .recall_semantic("lock", 5, &ConceptAdapter, &BruteForce, 2000)
+            .expect("semantic recall");
+        assert_eq!(result.mode, "semantic");
+        assert_eq!(
+            result.compared, 256,
+            "candidate comparison is capped at RECALL_CANDIDATE_CAP"
+        );
+        assert_eq!(result.hits.len(), 5);
 
         cleanup_db_files(&path);
     }
