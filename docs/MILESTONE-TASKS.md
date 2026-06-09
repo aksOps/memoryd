@@ -14,13 +14,12 @@ Status legend:
 ## Current Position
 
 - `[~]` M0 is mostly complete.
-- `[~]` M1 is mostly implemented but missing latency evidence.
+- `[x]` M1 is complete against this checklist.
 - `[~]` M2 has provider-free lexical recall, but not the full durable-memory
   recall path from the plan.
 - `[ ]` M3 and later are not started beyond schema stubs and queued `embed` jobs.
 
-Next implementation target: add M1 capture latency evidence, then close the M2
-gaps that do not require providers.
+Next implementation target: close the M2 gaps that do not require providers.
 
 ## M0 — Store Skeleton, Config, CLI Shell, Security Gate
 
@@ -47,7 +46,7 @@ Status: `[~]` Mostly complete.
 
 ## M1 — Fast Capture Path
 
-Status: `[~]` Mostly implemented, not complete.
+Status: `[x]` Complete against this checklist.
 
 - `[x]` `serve` command starts local HTTP server.
 - `[x]` Default bind is `127.0.0.1:7077`.
@@ -67,8 +66,15 @@ Status: `[~]` Mostly implemented, not complete.
 - `[x]` Return `accepted-degraded` instead of blocking or 5xx when capture is
   saturated.
 - `[x]` Add saturation tests for the degraded capture path.
-- `[ ]` Add a capture latency fixture or benchmark for 100 sequential inserts.
-- `[ ]` Record p95 capture latency evidence against the `< 8 ms` M1 target.
+- `[x]` Add a capture latency fixture or benchmark for 100 sequential inserts.
+- `[x]` Record p95 capture latency evidence against the `< 8 ms` M1 target.
+
+Evidence from 2026-06-09 local ignored performance-fixture run with
+`--test-threads=1`:
+
+- `capture_100_sequential_inserts_p95_stays_under_m1_target`: p95 `2.226592ms`.
+- `http_capture_100_sequential_requests_p95_stays_under_m1_target`: p95
+  `771.531µs`.
 
 ## M2 — Lexical Recall, Provider-Free
 
@@ -237,8 +243,8 @@ Status: `[ ]` Not started.
 
 ## Immediate Next Queue
 
-1. Add capture latency fixture and evidence.
-2. Decide M2 raw-event recall versus planned durable-memory recall.
-3. Close chosen M2 recall gaps with tests and docs.
-4. Start M3 queue leasing and governor caps.
-5. Add provider-free queue/degraded-path regression tests as M3 grows.
+1. Decide M2 raw-event recall versus planned durable-memory recall.
+2. Close chosen M2 recall gaps with tests and docs.
+3. Start M3 queue leasing and governor caps.
+4. Add provider-free queue/degraded-path regression tests as M3 grows.
+5. Add M0 release-build/disk-free evidence if those plan requirements remain.

@@ -1122,7 +1122,7 @@ CREATE VIRTUAL TABLE raw_events_fts USING fts5(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn open_creates_schema_and_wal_pragmas() {
@@ -1363,6 +1363,32 @@ mod tests {
             .expect("job count");
         assert_eq!(event_rows, 2);
         assert_eq!(job_rows, 2);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    #[ignore = "performance evidence fixture; run explicitly on an idle host"]
+    fn capture_100_sequential_inserts_p95_stays_under_m1_target() {
+        let path = temp_db_path("capture-latency");
+        let mut store = Store::open(&path).expect("store opens");
+        let mut durations = Vec::with_capacity(100);
+
+        for index in 0..100 {
+            let started = Instant::now();
+            store
+                .capture_event(test_event("session-1", 1_000 + index))
+                .expect("capture succeeds");
+            durations.push(started.elapsed());
+        }
+
+        durations.sort_unstable();
+        let p95 = durations[94];
+        eprintln!("capture_100_seq_p95={p95:?}");
+        assert!(
+            p95 < Duration::from_millis(8),
+            "capture p95 {p95:?} exceeded M1 target"
+        );
 
         cleanup_db_files(&path);
     }
