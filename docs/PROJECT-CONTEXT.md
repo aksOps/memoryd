@@ -62,6 +62,14 @@ Implemented now:
   p95/p99 tail varies with shared-host contention rather than recall cost, and the
   median is the contention-robust algorithm cost. Latency scales with match-set
   size since raw recall has no hard candidate cap (deferred to M6).
+- M3 background plane: the `jobs` queue is leased exactly-once (atomic
+  `UPDATE ... RETURNING`, visibility timeout, attempt accounting); a governor bounds
+  admission (`queue_depth_max`) and per-tick worker batch size (`worker_concurrency`).
+  The embed worker runs inside `serve` over a second WAL connection, embedding
+  captured raw events via the deterministic `null` adapter and writing `embeddings`
+  and `provider_usage` rows (`est_cost = 0`; paid adapters are blocked at the default
+  zero spend cap). Remote adapters (`openai_compat`/`ollama`) and the `setup` command
+  are deferred behind the in-place `ProviderAdapter` seam.
 - CI/security gates for format, build, clippy, tests, dependency policy,
   advisory audit, and SBOM generation.
 - OpenSSF Best Practices passing evidence.

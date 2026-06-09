@@ -5113,6 +5113,20 @@ C4/A1 (lexical degrade is real, not theoretical), H7 (no full-table scans). A3 (
 
 ### 21.6 M3 — Queue, governor, workers(embed), provider adapters
 
+> **Status (2026-06-09): core plane delivered.** Exactly-once `jobs` leasing
+> (atomic `UPDATE ... RETURNING`, visibility timeout, attempt accounting), the
+> governor's queue-depth and worker-concurrency caps, the `embed` worker, and the
+> deterministic `null` adapter are implemented and gated; the worker writes
+> `embeddings` + `provider_usage` and runs inside `serve` over a second WAL
+> connection. **Deferred to a later M3 increment:** the
+> `openai_compat`/`ollama`/`opencode` adapters, the reachability probe + failover
+> order, and the `setup` CLI — all behind the in-place `ProviderAdapter` seam. The
+> non-queue caps (`per_worker_mem_mb`, `cpu_share`, `dream_wallclock_s`,
+> `spend_window_usd`) are config-present and bind once their consuming planes exist.
+> Implementation note: the queue uses the existing `running` state as the lease
+> (`started_at` + visibility timeout), not a separate `leased` state as the prose
+> below sketches.
+
 #### Goal
 Stand up the **entire governed background plane** with exactly one cheap worker (`embed`) and the `ProviderAdapter` seam — proving caps, backpressure, leasing, and provider failover before any costly LLM work exists.
 
