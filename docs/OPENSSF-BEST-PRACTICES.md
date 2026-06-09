@@ -36,7 +36,7 @@ badge at https://www.bestpractices.dev/en/projects/13135.
 | Test policy | `CONTRIBUTING.md` |
 | Warning/lint policy | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
 | Static analysis | clippy, cargo-audit, cargo-deny in CI |
-| Vulnerability and license checks | `deny.toml`, `scripts/bootstrap-security-tools.sh`, CI |
+| Vulnerability and license checks | `deny.toml`, `scripts/bootstrap-security-tools.sh`, `.github/dependabot.yml`, CI |
 | SBOM | CI `cargo-cyclonedx` step |
 
 ## Passing Badge Answer Sheet
