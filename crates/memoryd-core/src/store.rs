@@ -1307,6 +1307,149 @@ impl Store {
         Ok(batch)
     }
 
+    /// Induce recurring decision principles ("how the owner thinks") from a
+    /// bounded window of recent `decision` and `session_summary` memories and
+    /// propose them as `heuristic.*` facts into `approvals(pending)` — never
+    /// writing `profile_facts` directly (H6: the owner's approve/reject IS the
+    /// training signal). Strictly LLM-only; inert under `null`/`local`.
+    /// Incremental: only memories newer than the latest prior `heuristic.*`
+    /// proposal are considered, so the phase never rescans the corpus.
+    pub(crate) fn extract_heuristics_pending<A: ProviderAdapter>(
+        &mut self,
+        adapter: &A,
+        budget_usd: f64,
+        window_spend: &mut f64,
+        policy: &HeuristicPolicy,
+        now_ms: i64,
+    ) -> Result<HeuristicBatch, StoreError> {
+        let mut batch = HeuristicBatch::default();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let since: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(requested_at), 0) FROM approvals
+                 WHERE target_type = 'profile_fact' AND target_ref LIKE 'heuristic.%'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+
+        let input_cap = i64::try_from(policy.input_cap).unwrap_or(i64::MAX);
+        let inputs: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT content FROM memories
+                 WHERE kind IN ('decision', 'session_summary')
+                   AND created_at > ?1
+                   AND lifecycle_state IN ('active', 'associated', 'decaying', 'dormant')
+                 ORDER BY created_at DESC, id DESC LIMIT ?2",
+            )?;
+            let mapped =
+                stmt.query_map(params![since, input_cap], |row| row.get::<_, String>(0))?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        if inputs.len() < policy.min_inputs {
+            // Patterns need evidence; no provider call, no spend.
+            tx.commit()?;
+            return Ok(batch);
+        }
+
+        let price = adapter.usd_per_1k_prompt_tokens();
+        let tokens_est: i64 = inputs.iter().map(|text| prompt_token_estimate(text)).sum();
+        if price > 0.0 {
+            let est_cost = tokens_est as f64 / 1000.0 * price;
+            if *window_spend + est_cost > budget_usd {
+                batch.budget_hit = true;
+                tx.commit()?;
+                return Ok(batch);
+            }
+        }
+        let Some(induced) = adapter.induce_heuristics(&inputs)? else {
+            tx.commit()?;
+            return Ok(batch);
+        };
+        if price > 0.0 {
+            let est_cost = tokens_est as f64 / 1000.0 * price;
+            tx.execute(
+                "INSERT INTO provider_usage
+                    (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
+                 VALUES (?1, ?2, ?3, 'complete', ?4, 0, ?5, NULL)",
+                params![
+                    now_ms,
+                    adapter.id(),
+                    adapter.model_id(),
+                    tokens_est,
+                    est_cost
+                ],
+            )?;
+            *window_spend += est_cost;
+            batch.tokens += tokens_est;
+        }
+
+        // Evidence-scaled confidence: a fuller input window means stronger support.
+        let confidence = (inputs.len() as f64 / policy.input_cap.max(1) as f64).clamp(0.25, 0.90);
+        for line in induced
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .take(policy.max_proposals)
+        {
+            // Defense in depth: provider output must not introduce a secret.
+            let principle = redact_inline_string_with_count(line).value;
+            let fact_key = format!("heuristic.{}", heuristic_slug(&principle));
+            let already_proposed: bool = tx
+                .query_row(
+                    "SELECT 1 FROM approvals
+                     WHERE target_type = 'profile_fact' AND target_ref = ?1 LIMIT 1",
+                    params![fact_key],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            let already_active: bool = tx
+                .query_row(
+                    "SELECT 1 FROM profile_facts WHERE fact_key = ?1 AND state = 'active' LIMIT 1",
+                    params![fact_key],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if already_proposed || already_active {
+                // A rejected heuristic is also signal: its key never re-proposes.
+                batch.skipped += 1;
+                continue;
+            }
+            let proposed_change = serde_json::to_string(&serde_json::json!({
+                "fact_key": fact_key,
+                "fact_value": principle,
+                "confidence": confidence,
+                "evidence_count": inputs.len(),
+            }))?;
+            let approval_id: String =
+                tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+            tx.execute(
+                "INSERT INTO approvals
+                    (id, target_type, target_ref, proposed_change, state, requested_at)
+                 VALUES (?1, 'profile_fact', ?2, ?3, 'pending', ?4)",
+                params![approval_id, fact_key, proposed_change, now_ms],
+            )?;
+            insert_audit_log(
+                &tx,
+                AUDIT_ACTOR,
+                "propose_heuristic",
+                "approval",
+                Some(approval_id.as_str()),
+                Some(proposed_change.as_str()),
+                now_ms,
+            )?;
+            batch.proposed += 1;
+        }
+        tx.commit()?;
+        Ok(batch)
+    }
+
     /// List pending approvals oldest-first (uses the `approvals_pending` index, no scan).
     pub fn list_pending_approvals(&self, limit: usize) -> Result<Vec<ApprovalRow>, StoreError> {
         let limit_i = i64::try_from(limit).unwrap_or(i64::MAX);
@@ -3313,6 +3456,48 @@ pub struct DistillBatch {
     pub sessions_closed: usize,
     pub tokens: i64,
     pub budget_hit: bool,
+}
+
+/// Selection policy for one heuristic-induction batch (production values are
+/// the `HEURISTIC_*` constants in `dream.rs`).
+#[derive(Debug, Clone, Copy)]
+pub struct HeuristicPolicy {
+    /// Newest decision/session_summary memories fed to the induction prompt.
+    pub input_cap: usize,
+    /// Below this much evidence, no provider call is made at all.
+    pub min_inputs: usize,
+    /// Upper bound on proposals accepted from one induction reply.
+    pub max_proposals: usize,
+}
+
+/// Counts from one heuristic-induction batch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HeuristicBatch {
+    pub proposed: usize,
+    pub skipped: usize,
+    pub tokens: i64,
+    pub budget_hit: bool,
+}
+
+/// Stable, readable key fragment for a heuristic principle: lowercase
+/// alphanumeric words joined by hyphens, capped to keep keys scannable.
+fn heuristic_slug(principle: &str) -> String {
+    let mut slug = String::new();
+    for word in principle
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .take(6)
+    {
+        if !slug.is_empty() {
+            slug.push('-');
+        }
+        slug.push_str(&word.to_ascii_lowercase());
+    }
+    if slug.is_empty() {
+        slug.push_str("unnamed");
+    }
+    slug.truncate(48);
+    slug
 }
 
 /// Counts from one decay batch.
@@ -5620,6 +5805,265 @@ mod tests {
             min_memories: 3,
             member_cap: 20,
         }
+    }
+
+    fn test_heuristic_policy() -> HeuristicPolicy {
+        HeuristicPolicy {
+            input_cap: 20,
+            min_inputs: 5,
+            max_proposals: 3,
+        }
+    }
+
+    /// Metered LLM double whose heuristic induction returns fixed principles.
+    struct InducingAdapter;
+    impl crate::adapters::ProviderAdapter for InducingAdapter {
+        fn id(&self) -> &'static str {
+            "openai_compat"
+        }
+        fn model_id(&self) -> &str {
+            "stub-llm"
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, crate::adapters::AdapterError> {
+            Ok(texts.iter().map(|_| vec![0.0f32]).collect())
+        }
+        fn reachable(&self) -> bool {
+            true
+        }
+        fn induce_heuristics(
+            &self,
+            _texts: &[String],
+        ) -> Result<Option<String>, crate::adapters::AdapterError> {
+            Ok(Some(
+                "Prefer reversible choices under uncertainty\nAsk about failure modes first\n"
+                    .to_string(),
+            ))
+        }
+        fn usd_per_1k_prompt_tokens(&self) -> f64 {
+            1.0
+        }
+    }
+
+    fn seed_decision_memories(store: &Store, n: usize, created_at: i64) {
+        for index in 0..n {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO memories
+                        (id, kind, content, lifecycle_state, relevance_score, last_accessed_at,
+                         access_count, decay_at, created_at, source_trust, decay_score,
+                         decay_recomputed_at)
+                     VALUES (?1, 'decision', ?2, 'active', 0.5, ?3, 0, NULL, ?3, 0.7, 1.0, ?3)",
+                    params![
+                        format!("dec-{index}-{created_at}"),
+                        format!("chose option {index} because it is reversible"),
+                        created_at
+                    ],
+                )
+                .expect("seed decision");
+        }
+    }
+
+    #[test]
+    fn heuristics_propose_into_approvals_never_profile_facts() {
+        let path = temp_db_path("heuristics-propose");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_decision_memories(&store, 5, now - 1_000);
+
+        let mut spend = 0.0;
+        let batch = store
+            .extract_heuristics_pending(
+                &InducingAdapter,
+                100.0,
+                &mut spend,
+                &test_heuristic_policy(),
+                now,
+            )
+            .expect("induction succeeds");
+
+        assert_eq!(batch.proposed, 2);
+        assert!(batch.tokens > 0, "provider call metered");
+        let mut stmt = store
+            .conn
+            .prepare("SELECT target_ref FROM approvals WHERE state = 'pending' ORDER BY target_ref")
+            .expect("stmt");
+        let keys: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("keys");
+        drop(stmt);
+        assert_eq!(keys.len(), 2);
+        assert!(
+            keys.iter().all(|key| key.starts_with("heuristic.")),
+            "{keys:?}"
+        );
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM profile_facts"),
+            0,
+            "H6: nothing writes profile_facts without an approval decision"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'propose_heuristic'"
+            ),
+            2
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn heuristics_below_min_inputs_make_no_provider_call() {
+        struct PanickingAdapter;
+        impl crate::adapters::ProviderAdapter for PanickingAdapter {
+            fn id(&self) -> &'static str {
+                "openai_compat"
+            }
+            fn model_id(&self) -> &str {
+                "stub"
+            }
+            fn embed(
+                &self,
+                texts: &[String],
+            ) -> Result<Vec<Vec<f32>>, crate::adapters::AdapterError> {
+                Ok(texts.iter().map(|_| vec![0.0f32]).collect())
+            }
+            fn reachable(&self) -> bool {
+                true
+            }
+            fn induce_heuristics(
+                &self,
+                _texts: &[String],
+            ) -> Result<Option<String>, crate::adapters::AdapterError> {
+                panic!("must not be called below min_inputs");
+            }
+        }
+
+        let path = temp_db_path("heuristics-min");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_decision_memories(&store, 4, now - 1_000);
+
+        let mut spend = 0.0;
+        let batch = store
+            .extract_heuristics_pending(
+                &PanickingAdapter,
+                100.0,
+                &mut spend,
+                &test_heuristic_policy(),
+                now,
+            )
+            .expect("phase skips quietly");
+        assert_eq!(batch.proposed, 0);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM approvals"), 0);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn heuristics_do_not_reprocess_old_evidence_or_duplicate_keys() {
+        let path = temp_db_path("heuristics-dedup");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_decision_memories(&store, 5, now - 1_000);
+
+        let mut spend = 0.0;
+        let first = store
+            .extract_heuristics_pending(
+                &InducingAdapter,
+                100.0,
+                &mut spend,
+                &test_heuristic_policy(),
+                now,
+            )
+            .expect("first run");
+        assert_eq!(first.proposed, 2);
+
+        // Second run, same evidence: everything predates the last proposal, so
+        // no inputs qualify and no provider call is made.
+        let second = store
+            .extract_heuristics_pending(
+                &InducingAdapter,
+                100.0,
+                &mut spend,
+                &test_heuristic_policy(),
+                now + 1,
+            )
+            .expect("second run");
+        assert_eq!(second.proposed, 0);
+        assert_eq!(second.tokens, 0, "no new evidence, no spend");
+
+        // New evidence but identical induced principles: keys dedup as skips.
+        seed_decision_memories(&store, 5, now + 10);
+        let third = store
+            .extract_heuristics_pending(
+                &InducingAdapter,
+                100.0,
+                &mut spend,
+                &test_heuristic_policy(),
+                now + 20,
+            )
+            .expect("third run");
+        assert_eq!(third.proposed, 0);
+        assert_eq!(third.skipped, 2, "existing keys never re-propose");
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM approvals"), 2);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn heuristics_budget_cap_skips_without_spend() {
+        let path = temp_db_path("heuristics-budget");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_decision_memories(&store, 5, now - 1_000);
+
+        let mut spend = 0.0;
+        let batch = store
+            .extract_heuristics_pending(
+                &InducingAdapter,
+                0.0,
+                &mut spend,
+                &test_heuristic_policy(),
+                now,
+            )
+            .expect("phase skips");
+        assert!(batch.budget_hit);
+        assert_eq!(batch.proposed, 0);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM provider_usage"), 0);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn heuristics_inert_without_chat_adapter() {
+        let path = temp_db_path("heuristics-null");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_decision_memories(&store, 5, now - 1_000);
+
+        let mut spend = 0.0;
+        let batch = store
+            .extract_heuristics_pending(
+                &NullAdapter::new(),
+                0.0,
+                &mut spend,
+                &test_heuristic_policy(),
+                now,
+            )
+            .expect("phase inert");
+        assert_eq!(batch.proposed, 0);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM approvals"), 0);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn heuristic_slug_is_stable_and_bounded() {
+        assert_eq!(
+            heuristic_slug("Prefer reversible choices under uncertainty!"),
+            "prefer-reversible-choices-under-uncertainty"
+        );
+        assert_eq!(heuristic_slug("!!!"), "unnamed");
+        assert!(heuristic_slug(&"word ".repeat(40)).len() <= 48);
     }
 
     /// Capture `n` distinct events into `session` ending at `last_ts`, then

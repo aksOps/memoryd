@@ -40,6 +40,13 @@ pub(crate) const DISTILL_MEMBER_CAP: usize = 20;
 /// Weight of the `temporal` link from a session summary to each member.
 pub const DISTILL_LINK_WEIGHT: f64 = 0.30;
 
+// Heuristic induction (secondary-brain slice A2): recurring decision
+// principles proposed into approvals (H6). One bounded provider call per
+// pass at most; incremental over memories newer than the last proposal.
+pub(crate) const HEURISTIC_INPUT_CAP: usize = 20;
+pub(crate) const HEURISTIC_MIN_INPUTS: usize = 5;
+pub(crate) const HEURISTIC_MAX_PROPOSALS: usize = 3;
+
 // M7 association graph (ARCHITECTURE-PLAN §9.3/§9.4, §21.10).
 /// Degree-strength saturation for `centrality = clamp(Σ weight / SAT, 0, 1)` (§9.4).
 pub const CENTRALITY_SAT: f64 = 8.0;
@@ -405,6 +412,29 @@ pub fn dream_once<A: ProviderAdapter>(
         tokens += extract.tokens;
         budget_hit |= extract.budget_hit;
         if extract.proposed + extract.skipped > 0 {
+            jobs_run += 1;
+        }
+    }
+
+    // Heuristic-induction phase (secondary-brain A2): propose recurring decision
+    // principles from recent decisions + session summaries into approvals(pending).
+    // Shares the run's spend window; strictly LLM-only (inert under null/local).
+    if !partial && clock() - start < max_ms {
+        let heuristics = store.extract_heuristics_pending(
+            adapter,
+            opts.budget_usd,
+            &mut window_spend,
+            &crate::store::HeuristicPolicy {
+                input_cap: HEURISTIC_INPUT_CAP,
+                min_inputs: HEURISTIC_MIN_INPUTS,
+                max_proposals: HEURISTIC_MAX_PROPOSALS,
+            },
+            clock(),
+        )?;
+        proposed += heuristics.proposed;
+        tokens += heuristics.tokens;
+        budget_hit |= heuristics.budget_hit;
+        if heuristics.proposed + heuristics.skipped > 0 {
             jobs_run += 1;
         }
     }

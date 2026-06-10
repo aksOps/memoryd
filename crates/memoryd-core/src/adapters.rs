@@ -47,6 +47,14 @@ pub trait ProviderAdapter {
     fn distill(&self, texts: &[String]) -> Result<Option<String>, AdapterError> {
         self.summarize(texts)
     }
+    /// Induce up to a few recurring, field-agnostic decision principles from a
+    /// window of decisions and session narratives (one principle per output
+    /// line). Strictly LLM-only — pattern induction across episodes has no
+    /// deterministic fallback, so the default is `None` and the heuristic
+    /// phase is inert without a chat-capable adapter.
+    fn induce_heuristics(&self, _texts: &[String]) -> Result<Option<String>, AdapterError> {
+        Ok(None)
+    }
     /// Price signal used to gate LLM summarization against the dream spend cap. `0.0`
     /// (the default, and `null`) means free, so the spend cap never binds.
     fn usd_per_1k_prompt_tokens(&self) -> f64 {
@@ -257,6 +265,14 @@ impl ProviderAdapter for AdapterKind {
             Self::Null(a) => a.distill(texts),
             Self::Local(a) => a.distill(texts),
             Self::OpenAiCompat(a) => a.distill(texts),
+        }
+    }
+
+    fn induce_heuristics(&self, texts: &[String]) -> Result<Option<String>, AdapterError> {
+        match self {
+            Self::Null(a) => a.induce_heuristics(texts),
+            Self::Local(a) => a.induce_heuristics(texts),
+            Self::OpenAiCompat(a) => a.induce_heuristics(texts),
         }
     }
 
