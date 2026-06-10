@@ -105,6 +105,11 @@ fn tokenizer() -> Result<&'static Tokenizer, String> {
 
 fn plan_for(bucket: usize) -> Result<Arc<TypedSimplePlan>, String> {
     let cache = PLANS.get_or_init(|| Mutex::new(HashMap::new()));
+    // The lock is deliberately held across build_plan: on the small target VM,
+    // letting concurrent threads compile the same multi-second plan in parallel
+    // (double-checked locking) costs more CPU and peak memory than briefly
+    // serializing cold-start. The cache is bounded (5 fixed buckets), so the
+    // contention window only exists until the working buckets are warm.
     let mut guard = cache
         .lock()
         .map_err(|_| "plan cache poisoned".to_string())?;

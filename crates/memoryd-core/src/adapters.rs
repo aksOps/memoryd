@@ -154,14 +154,21 @@ pub enum AdapterKind {
 }
 
 impl AdapterKind {
-    /// Resolve the configured default adapter. Unknown names fall back to `null`
-    /// (config validation rejects them before this point; the fallback keeps this
-    /// constructor total). Remote adapters are not built yet and also resolve to
-    /// `null`, degrading exactly like the pre-local behavior.
+    /// Resolve the configured default adapter. Remote adapter names
+    /// (`openai_compat`/`ollama`/`opencode`) pass config validation when a budget is
+    /// set but are not implemented yet — they degrade to `null` (lexical-only recall)
+    /// with a stderr warning so the degradation is never silent.
     pub fn from_default_adapter(name: &str) -> Self {
         match name {
             "local" => Self::Local(LocalAdapter),
-            _ => Self::Null(NullAdapter::new()),
+            "null" => Self::Null(NullAdapter::new()),
+            other => {
+                eprintln!(
+                    "memoryd: provider adapter '{other}' is not implemented yet; \
+                     falling back to 'null' (lexical-only recall)"
+                );
+                Self::Null(NullAdapter::new())
+            }
         }
     }
 }

@@ -9,8 +9,9 @@ build = "build.rs"
 [dependencies]
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 serde_json = { version = "1.0.150", default-features = false, features = ["std"] }
-# In-process embedding (ARCHITECTURE-PLAN local-adapter callout): pure-Rust ONNX
-# inference + tokenizer. No C/FFI backends (no ort, no onig).
+# In-process embedding (ARCHITECTURE-PLAN local-adapter callout): Rust ONNX
+# inference + tokenizer. No C/C++ *runtime* deps (no ort, no onig); tract-linalg
+# does assemble SIMD kernels via `cc`, so a C toolchain is required at build time.
 tract-onnx = "0.23"
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 
