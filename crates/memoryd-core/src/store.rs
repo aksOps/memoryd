@@ -1,8 +1,9 @@
 use crate::adapters::{AdapterError, ProviderAdapter, prompt_token_estimate};
 use crate::dream::{
     ARCHIVE_GRACE_MS, ASSOCIATE_FANOUT_CAP, CO_OCCUR_BASE, CO_OCCUR_GROUP_CAP, CO_OCCUR_REINFORCE,
-    SEM_LINK_THRESHOLD, WEAK_LINK_FLOOR, centrality_for, decay_score, half_life_ms, lifecycle_for,
-    memory_kind_for, next_decay_at, normalize, score_base, trust_for_source,
+    DISTILL_LINK_WEIGHT, SEM_LINK_THRESHOLD, WEAK_LINK_FLOOR, centrality_for, decay_score,
+    half_life_ms, lifecycle_for, memory_kind_for, next_decay_at, normalize, score_base,
+    trust_for_source,
 };
 use crate::import::{ImportError, ImportSummary, ImportUnit, content_hash, parse_jsonl};
 use crate::vectorindex::{Candidate, VectorIndex};
@@ -701,6 +702,180 @@ impl Store {
             tokens,
             budget_hit,
         })
+    }
+
+    /// Distill idle, fully-consolidated sessions into one `session_summary`
+    /// memory each (the secondary-brain raw material: what was done, decided,
+    /// and why). Bounded per pass; LLM-only — without a chat adapter, rich
+    /// sessions stay `open` so a later configured provider can distill them.
+    /// Idle sessions below `min_memories` are swept to `closed` so the
+    /// sessions table reflects reality even with no LLM configured.
+    pub(crate) fn distill_sessions<A: ProviderAdapter>(
+        &mut self,
+        adapter: &A,
+        budget_usd: f64,
+        window_spend: &mut f64,
+        run_id: &str,
+        policy: &DistillPolicy,
+        now_ms: i64,
+    ) -> Result<DistillBatch, StoreError> {
+        let mut batch = DistillBatch::default();
+        let idle_cutoff = now_ms.saturating_sub(policy.idle_ms);
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Close-sweep: idle, fully consolidated, but too small to distill.
+        // Deterministic and adapter-independent (covers roadmap item D3).
+        batch.sessions_closed = tx.execute(
+            "UPDATE sessions SET status = 'closed', ended_at = ?1
+             WHERE id IN (
+                SELECT s.id FROM sessions s
+                WHERE s.status = 'open'
+                  AND (SELECT MAX(r.ts) FROM raw_events r WHERE r.session_id = s.id) <= ?2
+                  AND NOT EXISTS (
+                      SELECT 1 FROM raw_events r2
+                      WHERE r2.session_id = s.id AND r2.consolidated_at IS NULL)
+                  AND (SELECT COUNT(*) FROM memories m
+                       WHERE m.source_session = s.id
+                         AND m.kind <> 'session_summary') < ?3
+                LIMIT 64)",
+            params![now_ms, idle_cutoff, policy.min_memories],
+        )?;
+
+        let limit_i = i64::try_from(policy.sessions_per_pass).unwrap_or(i64::MAX);
+        let candidates: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT s.id FROM sessions s
+                 WHERE s.status = 'open'
+                   AND (SELECT MAX(r.ts) FROM raw_events r WHERE r.session_id = s.id) <= ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM raw_events r2
+                       WHERE r2.session_id = s.id AND r2.consolidated_at IS NULL)
+                   AND (SELECT COUNT(*) FROM memories m
+                        WHERE m.source_session = s.id
+                          AND m.kind <> 'session_summary') >= ?2
+                 ORDER BY s.started_at ASC, s.id ASC LIMIT ?3",
+            )?;
+            let mapped = stmt
+                .query_map(params![idle_cutoff, policy.min_memories, limit_i], |row| {
+                    row.get::<_, String>(0)
+                })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let member_cap_i = i64::try_from(policy.member_cap).unwrap_or(i64::MAX);
+        let price = adapter.usd_per_1k_prompt_tokens();
+        for session_id in candidates {
+            let members: Vec<(String, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, content FROM memories
+                     WHERE source_session = ?1 AND kind <> 'session_summary'
+                       AND lifecycle_state IN ('active', 'associated', 'decaying', 'dormant')
+                     ORDER BY created_at DESC, id DESC LIMIT ?2",
+                )?;
+                let mapped = stmt.query_map(params![session_id, member_cap_i], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                mapped.collect::<Result<Vec<_>, _>>()?
+            };
+            if members.is_empty() {
+                continue;
+            }
+            let texts: Vec<String> = members.iter().map(|(_, content)| content.clone()).collect();
+            let tokens_est: i64 = texts.iter().map(|text| prompt_token_estimate(text)).sum();
+            if price > 0.0 {
+                let est_cost = tokens_est as f64 / 1000.0 * price;
+                if *window_spend + est_cost > budget_usd {
+                    // Spend cap binds: leave this and later sessions open for
+                    // the next pass instead of degrading to junk summaries.
+                    batch.budget_hit = true;
+                    break;
+                }
+            }
+            let Some(summary) = adapter.distill(&texts)? else {
+                // No chat capability: nothing in this phase can progress.
+                break;
+            };
+            if price > 0.0 {
+                let est_cost = tokens_est as f64 / 1000.0 * price;
+                tx.execute(
+                    "INSERT INTO provider_usage
+                        (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
+                     VALUES (?1, ?2, ?3, 'complete', ?4, 0, ?5, NULL)",
+                    params![now_ms, adapter.id(), adapter.model_id(), tokens_est, est_cost],
+                )?;
+                *window_spend += est_cost;
+                batch.tokens += tokens_est;
+            }
+            // Defense in depth: provider output must not introduce a secret.
+            let summary = redact_inline_string_with_count(&summary).value;
+
+            let trust = 0.70;
+            let decay_at = half_life_ms("session_summary").map(|hl| now_ms + hl);
+            let base = score_base(1.0, 0, trust, "active", 0.0);
+            let mem_id: String =
+                tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+            let ver_id: String =
+                tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+            tx.execute(
+                "INSERT INTO memories
+                    (id, current_version_id, kind, content, lifecycle_state, relevance_score,
+                     last_accessed_at, access_count, decay_at, created_at,
+                     source_trust, decay_score, decay_recomputed_at, source_session)
+                 VALUES (?1, ?2, 'session_summary', ?3, 'active', ?4, ?5, 0, ?6, ?5, ?7, 1.0, ?5, ?8)",
+                params![mem_id, ver_id, summary, base, now_ms, decay_at, trust, session_id],
+            )?;
+            tx.execute(
+                "INSERT INTO memories_fts (memory_id, content) VALUES (?1, ?2)",
+                params![mem_id, summary],
+            )?;
+            let reason = format!("distill:session={session_id} members={}", members.len());
+            tx.execute(
+                "INSERT INTO memory_versions
+                    (id, memory_id, version_no, content, reason, created_by_job, created_at)
+                 VALUES (?1, ?2, 1, ?3, ?4, NULL, ?5)",
+                params![ver_id, mem_id, summary, reason, now_ms],
+            )?;
+            for (member_id, _) in &members {
+                for (src, dst) in [(&mem_id, member_id), (member_id, &mem_id)] {
+                    let link_id: String =
+                        tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+                    tx.execute(
+                        "INSERT INTO memory_links
+                            (id, src_memory_id, dst_memory_id, link_type, weight, last_reinforced_at)
+                         VALUES (?1, ?2, ?3, 'temporal', ?4, ?5)
+                         ON CONFLICT(src_memory_id, dst_memory_id, link_type) DO UPDATE SET
+                            weight = MAX(weight, excluded.weight),
+                            last_reinforced_at = excluded.last_reinforced_at",
+                        params![link_id, src, dst, DISTILL_LINK_WEIGHT, now_ms],
+                    )?;
+                }
+            }
+            tx.execute(
+                "UPDATE sessions SET status = 'consolidated', summary = ?1, ended_at = ?2
+                 WHERE id = ?3",
+                params![summary, now_ms, session_id],
+            )?;
+            let detail = serde_json::to_string(&serde_json::json!({
+                "dream_run": run_id,
+                "session_id": session_id,
+                "members": members.len(),
+            }))?;
+            insert_audit_log(
+                &tx,
+                AUDIT_ACTOR,
+                "dream.distill",
+                "memory",
+                Some(mem_id.as_str()),
+                Some(detail.as_str()),
+                now_ms,
+            )?;
+            batch.sessions_distilled += 1;
+        }
+        tx.commit()?;
+        Ok(batch)
     }
 
     /// Recompute decay + lifecycle for up to `limit` *due* memories (those whose
@@ -3121,6 +3296,25 @@ pub struct ConsolidateBatch {
     pub budget_hit: bool,
 }
 
+/// Selection policy for one session-distillation batch (see the
+/// `DISTILL_*` constants in `dream.rs` for production values).
+#[derive(Debug, Clone, Copy)]
+pub struct DistillPolicy {
+    pub sessions_per_pass: usize,
+    pub idle_ms: i64,
+    pub min_memories: i64,
+    pub member_cap: usize,
+}
+
+/// Counts from one session-distillation batch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DistillBatch {
+    pub sessions_distilled: usize,
+    pub sessions_closed: usize,
+    pub tokens: i64,
+    pub budget_hit: bool,
+}
+
 /// Counts from one decay batch.
 pub struct DecayBatch {
     pub touched: usize,
@@ -4817,15 +5011,69 @@ mod tests {
             touched, 2,
             "two distinct raw_events consolidate into two memories"
         );
-        // jobs_run counts batch operations, not rows: one consolidate batch + one
-        // associate batch (both same-session memories link), no decay batch (fresh
-        // memories are not yet due) -> distinct from memories_touched.
+        // jobs_run counts batch operations, not rows: one consolidate batch, one
+        // distill batch (the idle 2-memory session is below DISTILL_MIN_MEMORIES,
+        // so it is close-swept), one associate batch (same-session memories link),
+        // no decay batch (fresh memories are not yet due).
         assert_eq!(
-            jobs_run, 2,
-            "jobs_run is the batch count (consolidate + associate), not the row count"
+            jobs_run, 3,
+            "jobs_run is the batch count (consolidate + distill sweep + associate)"
         );
         assert_eq!(status, "completed");
         assert!(finished.is_some(), "finished_at is stamped");
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn dream_once_runs_distill_phase_end_to_end() {
+        use crate::config::Caps;
+        use crate::dream::{DreamOptions, dream_once};
+        let path = temp_db_path("dream-distill");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 2_000_000_000_000i64;
+        // Three distinct events in one session, all idle (older than 30 min).
+        for index in 0..3 {
+            store
+                .capture_event(test_event_with_text(
+                    "s-narrative",
+                    now - 3_600_000 + index,
+                    &format!("distinct narrative event {index}"),
+                ))
+                .expect("capture succeeds");
+        }
+        let opts = DreamOptions {
+            trigger: "manual",
+            budget_usd: 100.0,
+            max_seconds: 60,
+        };
+        // Same pass: consolidate creates the member memories, distill (running
+        // after consolidate) summarizes the now-idle session.
+        let outcome = dream_once(
+            &mut store,
+            &SummarizingAdapter,
+            &Caps::small(),
+            &opts,
+            &|| now,
+        )
+        .expect("dream succeeds");
+
+        assert_eq!(outcome.distilled, 1, "idle session distilled in-pass");
+        let status: String = store
+            .conn
+            .query_row(
+                "SELECT status FROM sessions WHERE id = 's-narrative'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("session row");
+        assert_eq!(status, "consolidated");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM memories WHERE kind = 'session_summary'"
+            ),
+            1
+        );
         cleanup_db_files(&path);
     }
 
@@ -5363,6 +5611,323 @@ mod tests {
             provenance: serde_json::json!({}),
             ts_ms,
         }
+    }
+
+    fn test_distill_policy() -> DistillPolicy {
+        DistillPolicy {
+            sessions_per_pass: 3,
+            idle_ms: 30 * 60 * 1000,
+            min_memories: 3,
+            member_cap: 20,
+        }
+    }
+
+    /// Capture `n` distinct events into `session` ending at `last_ts`, then
+    /// consolidate them so the session is distill-eligible (modulo idleness).
+    fn seed_consolidated_session(store: &mut Store, session: &str, n: usize, last_ts: i64) {
+        for index in 0..n {
+            store
+                .capture_event(test_event_with_text(
+                    session,
+                    last_ts - (n as i64 - 1 - index as i64),
+                    &format!("{session} event {index} unique body"),
+                ))
+                .expect("capture succeeds");
+        }
+        let mut spend = 0.0;
+        store
+            .consolidate_pending(
+                &NullAdapter::new(),
+                0.0,
+                &mut spend,
+                "run-seed",
+                1000,
+                last_ts,
+            )
+            .expect("consolidate succeeds");
+    }
+
+    #[test]
+    fn distill_creates_summary_links_members_and_consolidates_session() {
+        let path = temp_db_path("distill-happy");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_consolidated_session(&mut store, "s-rich", 3, now - 3_600_000);
+
+        let mut spend = 0.0;
+        let batch = store
+            .distill_sessions(
+                &SummarizingAdapter,
+                100.0,
+                &mut spend,
+                "run-1",
+                &test_distill_policy(),
+                now,
+            )
+            .expect("distill succeeds");
+
+        assert_eq!(batch.sessions_distilled, 1);
+        assert!(batch.tokens > 0, "metered adapter recorded tokens");
+        let (summary_id, content): (String, String) = store
+            .conn
+            .query_row(
+                "SELECT id, content FROM memories WHERE kind = 'session_summary'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("summary memory exists");
+        assert!(content.starts_with("summary:"), "LLM output stored");
+        let links: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_links
+                 WHERE link_type = 'temporal' AND (src_memory_id = ?1 OR dst_memory_id = ?1)",
+                params![summary_id],
+                |r| r.get(0),
+            )
+            .expect("links counted");
+        assert_eq!(links, 6, "symmetric temporal links to all 3 members");
+        let (status, session_summary): (String, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT status, summary FROM sessions WHERE id = 's-rich'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("session row");
+        assert_eq!(status, "consolidated");
+        assert!(
+            session_summary
+                .expect("summary set")
+                .starts_with("summary:")
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'dream.distill'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM provider_usage WHERE op = 'complete'"
+            ),
+            1
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn distill_skips_fresh_and_unconsolidated_sessions() {
+        let path = temp_db_path("distill-skips");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        // Fresh session: consolidated but not idle.
+        seed_consolidated_session(&mut store, "s-fresh", 3, now - 1_000);
+        // Idle but with unconsolidated events.
+        for index in 0..3 {
+            store
+                .capture_event(test_event_with_text(
+                    "s-pending",
+                    now - 3_600_000,
+                    &format!("pending {index}"),
+                ))
+                .expect("capture succeeds");
+        }
+
+        let mut spend = 0.0;
+        let batch = store
+            .distill_sessions(
+                &SummarizingAdapter,
+                100.0,
+                &mut spend,
+                "run-1",
+                &test_distill_policy(),
+                now,
+            )
+            .expect("distill succeeds");
+
+        assert_eq!(batch.sessions_distilled, 0);
+        assert_eq!(batch.sessions_closed, 0, "neither session swept");
+        for session in ["s-fresh", "s-pending"] {
+            let status: String = store
+                .conn
+                .query_row(
+                    "SELECT status FROM sessions WHERE id = ?1",
+                    params![session],
+                    |r| r.get(0),
+                )
+                .expect("session row");
+            assert_eq!(status, "open", "{session} stays open");
+        }
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn distill_close_sweeps_trivial_idle_sessions() {
+        let path = temp_db_path("distill-sweep");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_consolidated_session(&mut store, "s-trivial", 1, now - 3_600_000);
+
+        let mut spend = 0.0;
+        let batch = store
+            .distill_sessions(
+                &NullAdapter::new(),
+                0.0,
+                &mut spend,
+                "run-1",
+                &test_distill_policy(),
+                now,
+            )
+            .expect("distill succeeds");
+
+        assert_eq!(batch.sessions_closed, 1);
+        let (status, ended_at): (String, Option<i64>) = store
+            .conn
+            .query_row(
+                "SELECT status, ended_at FROM sessions WHERE id = 's-trivial'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("session row");
+        assert_eq!(status, "closed");
+        assert_eq!(ended_at, Some(now));
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn distill_budget_cap_leaves_session_open() {
+        let path = temp_db_path("distill-budget");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_consolidated_session(&mut store, "s-capped", 3, now - 3_600_000);
+
+        let mut spend = 0.0;
+        let batch = store
+            .distill_sessions(
+                &SummarizingAdapter,
+                0.0,
+                &mut spend,
+                "run-1",
+                &test_distill_policy(),
+                now,
+            )
+            .expect("distill succeeds");
+
+        assert!(batch.budget_hit);
+        assert_eq!(batch.sessions_distilled, 0);
+        let status: String = store
+            .conn
+            .query_row(
+                "SELECT status FROM sessions WHERE id = 's-capped'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("session row");
+        assert_eq!(status, "open", "retried next pass instead of degrading");
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM provider_usage"), 0);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn distill_without_chat_adapter_leaves_rich_sessions_open() {
+        let path = temp_db_path("distill-no-llm");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_consolidated_session(&mut store, "s-rich", 3, now - 3_600_000);
+
+        let mut spend = 0.0;
+        let batch = store
+            .distill_sessions(
+                &NullAdapter::new(),
+                0.0,
+                &mut spend,
+                "run-1",
+                &test_distill_policy(),
+                now,
+            )
+            .expect("distill succeeds");
+
+        assert_eq!(batch.sessions_distilled, 0);
+        let status: String = store
+            .conn
+            .query_row("SELECT status FROM sessions WHERE id = 's-rich'", [], |r| {
+                r.get(0)
+            })
+            .expect("session row");
+        assert_eq!(
+            status, "open",
+            "distillable later when an LLM is configured"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM memories WHERE kind = 'session_summary'"
+            ),
+            0
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn distill_redacts_provider_output() {
+        struct LeakyAdapter;
+        impl crate::adapters::ProviderAdapter for LeakyAdapter {
+            fn id(&self) -> &'static str {
+                "openai_compat"
+            }
+            fn model_id(&self) -> &str {
+                "leaky"
+            }
+            fn embed(
+                &self,
+                texts: &[String],
+            ) -> Result<Vec<Vec<f32>>, crate::adapters::AdapterError> {
+                Ok(texts.iter().map(|_| vec![0.0f32]).collect())
+            }
+            fn reachable(&self) -> bool {
+                true
+            }
+            fn summarize(
+                &self,
+                _texts: &[String],
+            ) -> Result<Option<String>, crate::adapters::AdapterError> {
+                Ok(Some(
+                    "did work with ghp_abcdefghijklmnopqrstuvwxyz123456 token".to_string(),
+                ))
+            }
+        }
+
+        let path = temp_db_path("distill-redact");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_consolidated_session(&mut store, "s-leak", 3, now - 3_600_000);
+
+        let mut spend = 0.0;
+        store
+            .distill_sessions(
+                &LeakyAdapter,
+                0.0,
+                &mut spend,
+                "run-1",
+                &test_distill_policy(),
+                now,
+            )
+            .expect("distill succeeds");
+
+        let content: String = store
+            .conn
+            .query_row(
+                "SELECT content FROM memories WHERE kind = 'session_summary'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("summary exists");
+        assert!(content.contains(REDACTED));
+        assert!(!content.contains("ghp_abcdefghijklmnopqrstuvwxyz123456"));
+        cleanup_db_files(&path);
     }
 
     fn temp_db_path(name: &str) -> PathBuf {

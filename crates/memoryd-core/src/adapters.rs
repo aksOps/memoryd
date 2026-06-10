@@ -40,6 +40,13 @@ pub trait ProviderAdapter {
     fn summarize(&self, _texts: &[String]) -> Result<Option<String>, AdapterError> {
         Ok(None)
     }
+    /// Distill one work session's memories into a short narrative (what was done,
+    /// decided, and why). Defaults to [`ProviderAdapter::summarize`]; chat-capable
+    /// adapters override with a narrative-shaped prompt. `None` = no LLM, so the
+    /// distill phase skips (sessions stay open for a later configured provider).
+    fn distill(&self, texts: &[String]) -> Result<Option<String>, AdapterError> {
+        self.summarize(texts)
+    }
     /// Price signal used to gate LLM summarization against the dream spend cap. `0.0`
     /// (the default, and `null`) means free, so the spend cap never binds.
     fn usd_per_1k_prompt_tokens(&self) -> f64 {
@@ -242,6 +249,14 @@ impl ProviderAdapter for AdapterKind {
             Self::Null(a) => a.summarize(texts),
             Self::Local(a) => a.summarize(texts),
             Self::OpenAiCompat(a) => a.summarize(texts),
+        }
+    }
+
+    fn distill(&self, texts: &[String]) -> Result<Option<String>, AdapterError> {
+        match self {
+            Self::Null(a) => a.distill(texts),
+            Self::Local(a) => a.distill(texts),
+            Self::OpenAiCompat(a) => a.distill(texts),
         }
     }
 

@@ -26,6 +26,20 @@ const DORMANT_HALFLIFE_FACTOR: f64 = 2.737;
 const CONSOLIDATE_BATCH: usize = 1000;
 const DECAY_BATCH: usize = 500;
 
+// Session distillation (secondary-brain slice A1). Bounded per pass: at most
+// `DISTILL_SESSIONS_PER_PASS` sessions, each summarizing at most
+// `DISTILL_MEMBER_CAP` member memories — the phase cost scales with new idle
+// sessions, never with corpus size.
+pub(crate) const DISTILL_SESSIONS_PER_PASS: usize = 3;
+/// A session is distillable once its newest raw event is this old.
+pub(crate) const DISTILL_IDLE_MS: i64 = 30 * 60 * 1000;
+/// Sessions with fewer memories are swept to `closed` instead (too trivial).
+pub(crate) const DISTILL_MIN_MEMORIES: i64 = 3;
+/// Newest member memories included in the distill prompt and linked.
+pub(crate) const DISTILL_MEMBER_CAP: usize = 20;
+/// Weight of the `temporal` link from a session summary to each member.
+pub const DISTILL_LINK_WEIGHT: f64 = 0.30;
+
 // M7 association graph (ARCHITECTURE-PLAN §9.3/§9.4, §21.10).
 /// Degree-strength saturation for `centrality = clamp(Σ weight / SAT, 0, 1)` (§9.4).
 pub const CENTRALITY_SAT: f64 = 8.0;
@@ -63,6 +77,9 @@ pub fn half_life_ms(kind: &str) -> Option<i64> {
     let days = match kind {
         "identity" => return None,
         "preference" => 180,
+        // Session narratives are the secondary-brain raw material; they decay
+        // slowly so heuristic extraction has months of evidence to draw on.
+        "session_summary" => 180,
         "fact" => 120,
         "decision" => 90,
         "task" | "todo" => 21,
@@ -265,6 +282,7 @@ pub struct DreamOptions {
 pub struct DreamOutcome {
     pub run_id: String,
     pub consolidated: usize,
+    pub distilled: usize,
     pub associated: usize,
     pub proposed: usize,
     pub decayed: usize,
@@ -293,6 +311,7 @@ pub fn dream_once<A: ProviderAdapter>(
 
     let mut window_spend = 0.0_f64;
     let mut consolidated = 0_usize;
+    let mut distilled = 0_usize;
     let mut associated = 0_usize;
     let mut proposed = 0_usize;
     let mut decayed = 0_usize;
@@ -325,6 +344,33 @@ pub fn dream_once<A: ProviderAdapter>(
         // iteration (which could trip the wall-clock and falsely mark the run partial).
         if batch.raw_consumed < CONSOLIDATE_BATCH {
             break;
+        }
+    }
+
+    // Distill phase: turn idle, fully-consolidated sessions into one narrative
+    // `session_summary` memory each (secondary-brain A1). Runs after consolidate
+    // (so member memories exist) and before associate (so summaries get embedded
+    // and semantically linked in the same pass). LLM-only: without a chat
+    // adapter it reduces to the deterministic close-sweep of trivial sessions.
+    if !partial && clock() - start < max_ms {
+        let distill = store.distill_sessions(
+            adapter,
+            opts.budget_usd,
+            &mut window_spend,
+            &run_id,
+            &crate::store::DistillPolicy {
+                sessions_per_pass: DISTILL_SESSIONS_PER_PASS,
+                idle_ms: DISTILL_IDLE_MS,
+                min_memories: DISTILL_MIN_MEMORIES,
+                member_cap: DISTILL_MEMBER_CAP,
+            },
+            clock(),
+        )?;
+        distilled += distill.sessions_distilled;
+        tokens += distill.tokens;
+        budget_hit |= distill.budget_hit;
+        if distill.sessions_distilled + distill.sessions_closed > 0 {
+            jobs_run += 1;
         }
     }
 
@@ -394,6 +440,7 @@ pub fn dream_once<A: ProviderAdapter>(
     Ok(DreamOutcome {
         run_id,
         consolidated,
+        distilled,
         associated,
         proposed,
         decayed,

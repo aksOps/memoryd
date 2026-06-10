@@ -1139,6 +1139,7 @@ fn dream_response_json(outcome: &memoryd_core::dream::DreamOutcome) -> Result<St
     Ok(serde_json::to_string(&serde_json::json!({
         "run_id": outcome.run_id,
         "consolidated": outcome.consolidated,
+        "distilled": outcome.distilled,
         "associated": outcome.associated,
         "proposed": outcome.proposed,
         "decayed": outcome.decayed,
