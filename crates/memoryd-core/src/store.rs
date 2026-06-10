@@ -878,6 +878,88 @@ impl Store {
         Ok(batch)
     }
 
+    /// Governed retention sweep (roadmap B1+B2): physically delete up to
+    /// `batch` consolidated raw events older than the raw horizon (their FTS
+    /// rows and embeddings go with them), and raw-event embeddings older than
+    /// the embedding horizon. Memories, the association graph, sessions, and
+    /// the audit log are untouched — the corpus keeps distilled knowledge and
+    /// sheds raw traffic. Both horizons are owner opt-in (0 = keep forever).
+    pub(crate) fn retain_expired(
+        &mut self,
+        policy: &RetainPolicy,
+        now_ms: i64,
+    ) -> Result<RetainBatch, StoreError> {
+        let mut batch = RetainBatch::default();
+        if policy.raw_horizon_ms == 0 && policy.embed_horizon_ms == 0 {
+            return Ok(batch);
+        }
+        let limit = i64::try_from(policy.batch).unwrap_or(i64::MAX);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if policy.raw_horizon_ms > 0 {
+            let cutoff = now_ms.saturating_sub(policy.raw_horizon_ms);
+            let ids: Vec<i64> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM raw_events
+                     WHERE consolidated_at IS NOT NULL AND ts <= ?1
+                     ORDER BY id ASC LIMIT ?2",
+                )?;
+                let mapped = stmt.query_map(params![cutoff, limit], |row| row.get::<_, i64>(0))?;
+                mapped.collect::<Result<Vec<_>, _>>()?
+            };
+            for id in &ids {
+                let id_text = id.to_string();
+                tx.execute(
+                    "DELETE FROM embeddings WHERE owner_type = 'raw_event' AND owner_id = ?1",
+                    params![id_text],
+                )?;
+                tx.execute(
+                    "DELETE FROM raw_events_fts WHERE raw_event_id = ?1",
+                    params![id],
+                )?;
+                tx.execute("DELETE FROM raw_events WHERE id = ?1", params![id])?;
+            }
+            batch.raw_events_deleted = ids.len();
+        }
+
+        if policy.embed_horizon_ms > 0 {
+            let cutoff = now_ms.saturating_sub(policy.embed_horizon_ms);
+            batch.embeddings_deleted = tx.execute(
+                "DELETE FROM embeddings
+                 WHERE owner_type = 'raw_event'
+                   AND id IN (
+                       SELECT e.id FROM embeddings e
+                       JOIN raw_events r ON r.id = CAST(e.owner_id AS INTEGER)
+                       WHERE e.owner_type = 'raw_event'
+                         AND r.consolidated_at IS NOT NULL AND r.ts <= ?1
+                       LIMIT ?2)",
+                params![cutoff, limit],
+            )?;
+        }
+
+        if batch.raw_events_deleted + batch.embeddings_deleted > 0 {
+            let detail = serde_json::to_string(&serde_json::json!({
+                "raw_events_deleted": batch.raw_events_deleted,
+                "embeddings_deleted": batch.embeddings_deleted,
+                "raw_horizon_ms": policy.raw_horizon_ms,
+                "embed_horizon_ms": policy.embed_horizon_ms,
+            }))?;
+            insert_audit_log(
+                &tx,
+                AUDIT_ACTOR,
+                "retention.sweep",
+                "raw_event",
+                None,
+                Some(detail.as_str()),
+                now_ms,
+            )?;
+        }
+        tx.commit()?;
+        Ok(batch)
+    }
+
     /// Recompute decay + lifecycle for up to `limit` *due* memories (those whose
     /// `decay_at` checkpoint has passed), scan-free via `memories_decay_due`. State is
     /// a pure function of age, so access (which resets `last_accessed_at`) revives a
@@ -3583,6 +3665,21 @@ pub struct HeuristicBatch {
     pub budget_hit: bool,
 }
 
+/// Retention horizons in ms (0 = disabled) plus the per-call batch bound.
+#[derive(Debug, Clone, Copy)]
+pub struct RetainPolicy {
+    pub raw_horizon_ms: i64,
+    pub embed_horizon_ms: i64,
+    pub batch: usize,
+}
+
+/// Counts from one retention sweep.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetainBatch {
+    pub raw_events_deleted: usize,
+    pub embeddings_deleted: usize,
+}
+
 /// Stable, readable key fragment for a heuristic principle: lowercase
 /// alphanumeric words joined by hyphens, capped to keep keys scannable.
 fn heuristic_slug(principle: &str) -> String {
@@ -6157,6 +6254,169 @@ mod tests {
             .expect("phase inert");
         assert_eq!(batch.proposed, 0);
         assert_eq!(count(&store, "SELECT COUNT(*) FROM approvals"), 0);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn retention_deletes_only_old_consolidated_raw_events() {
+        let path = temp_db_path("retain-basic");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        let day = 86_400_000i64;
+        // Old + consolidated (eligible), old + unconsolidated (kept),
+        // fresh + consolidated (kept).
+        let old_id = store
+            .capture_event(test_event_with_text(
+                "s",
+                now - 200 * day,
+                "old consolidated",
+            ))
+            .expect("capture")
+            .raw_event_id;
+        let fresh_id = store
+            .capture_event(test_event_with_text("s", now - day, "fresh consolidated"))
+            .expect("capture")
+            .raw_event_id;
+        let mut spend = 0.0;
+        store
+            .consolidate_pending(&NullAdapter::new(), 0.0, &mut spend, "run", 1000, now)
+            .expect("consolidate");
+        let pending_id = store
+            .capture_event(test_event_with_text("s", now - 200 * day, "old pending"))
+            .expect("capture")
+            .raw_event_id;
+
+        let batch = store
+            .retain_expired(
+                &RetainPolicy {
+                    raw_horizon_ms: 180 * day,
+                    embed_horizon_ms: 0,
+                    batch: 500,
+                },
+                now,
+            )
+            .expect("sweep succeeds");
+
+        assert_eq!(batch.raw_events_deleted, 1);
+        let mut stmt = store
+            .conn
+            .prepare("SELECT id FROM raw_events ORDER BY id")
+            .expect("stmt");
+        let remaining: Vec<i64> = stmt
+            .query_map([], |r| r.get(0))
+            .expect("rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("ids");
+        drop(stmt);
+        assert_eq!(remaining, vec![fresh_id, pending_id]);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM raw_events_fts WHERE raw_event_id NOT IN (SELECT id FROM raw_events)"
+            ),
+            0,
+            "no orphaned FTS rows"
+        );
+        assert!(
+            count(&store, "SELECT COUNT(*) FROM memories") >= 2,
+            "memories survive retention"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'retention.sweep'"
+            ),
+            1
+        );
+        // old_id's embedding rows (if any) went with it.
+        let orphaned: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM embeddings WHERE owner_type='raw_event' AND owner_id = ?1",
+                params![old_id.to_string()],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(orphaned, 0);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn retention_disabled_is_a_no_op() {
+        let path = temp_db_path("retain-disabled");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        store
+            .capture_event(test_event_with_text("s", 1000, "ancient"))
+            .expect("capture");
+        let mut spend = 0.0;
+        store
+            .consolidate_pending(&NullAdapter::new(), 0.0, &mut spend, "run", 1000, now)
+            .expect("consolidate");
+
+        let batch = store
+            .retain_expired(
+                &RetainPolicy {
+                    raw_horizon_ms: 0,
+                    embed_horizon_ms: 0,
+                    batch: 500,
+                },
+                now,
+            )
+            .expect("no-op succeeds");
+        assert_eq!(batch, RetainBatch::default());
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM raw_events"), 1);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn retention_embedding_horizon_drops_vectors_but_keeps_events() {
+        let path = temp_db_path("retain-embed");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        let day = 86_400_000i64;
+        let id = store
+            .capture_event(test_event_with_text("s", now - 60 * day, "embedded event"))
+            .expect("capture")
+            .raw_event_id;
+        let mut spend = 0.0;
+        store
+            .consolidate_pending(&NullAdapter::new(), 0.0, &mut spend, "run", 1000, now)
+            .expect("consolidate");
+        store
+            .conn
+            .execute(
+                "INSERT INTO embeddings (id, owner_type, owner_id, model_id, dim, vector, created_at)
+                 VALUES ('emb-1', 'raw_event', ?1, 'm', 1, x'00000000', ?2)",
+                params![id.to_string(), now - 60 * day],
+            )
+            .expect("seed embedding");
+
+        let batch = store
+            .retain_expired(
+                &RetainPolicy {
+                    raw_horizon_ms: 0,
+                    embed_horizon_ms: 30 * day,
+                    batch: 500,
+                },
+                now,
+            )
+            .expect("sweep succeeds");
+
+        assert_eq!(batch.embeddings_deleted, 1);
+        assert_eq!(batch.raw_events_deleted, 0);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM raw_events"),
+            1,
+            "events stay; only their vectors aged out"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM embeddings WHERE owner_type='raw_event'"
+            ),
+            0
+        );
         cleanup_db_files(&path);
     }
 

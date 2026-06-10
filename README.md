@@ -156,6 +156,23 @@ Still planned: remote provider adapters (openai_compat/ollama), hook facades, br
 
 There is no Node wrapper in S01. When Node/package workflows are added, use `pnpm` and commit `pnpm-lock.yaml`. `npm` is reserved for the eventual registry publication target, not local development workflows.
 
+## Retention
+
+By default memoryd keeps every raw event forever (~3-5KB per capture). Two
+opt-in horizons shed raw traffic while keeping distilled knowledge — memories,
+the association graph, sessions, and the audit log are never touched:
+
+```bash
+MEMORYD_RETAIN_RAW_DAYS=180 \
+MEMORYD_RETAIN_RAW_EMBED_DAYS=60 \
+memoryd serve
+```
+
+`MEMORYD_RETAIN_RAW_DAYS` deletes *consolidated* raw events (and their FTS/
+embedding rows) older than the horizon; `MEMORYD_RETAIN_RAW_EMBED_DAYS` drops
+only the raw-event embedding vectors. Both run as a bounded dream phase with
+`retention.sweep` audit rows; 0 (default) disables deletion entirely.
+
 ## Development Checks
 
 ```bash

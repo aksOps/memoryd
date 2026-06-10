@@ -1146,6 +1146,7 @@ fn dream_response_json(outcome: &memoryd_core::dream::DreamOutcome) -> Result<St
         "associated": outcome.associated,
         "proposed": outcome.proposed,
         "decayed": outcome.decayed,
+        "retained": outcome.retained,
         "tokens_used": outcome.tokens_used,
         "status": outcome.status,
     }))?)

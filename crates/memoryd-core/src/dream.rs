@@ -47,6 +47,10 @@ pub(crate) const HEURISTIC_INPUT_CAP: usize = 20;
 pub(crate) const HEURISTIC_MIN_INPUTS: usize = 5;
 pub(crate) const HEURISTIC_MAX_PROPOSALS: usize = 3;
 
+/// Retention sweep batch bound (roadmap B1+B2); horizons come from `Caps`.
+pub(crate) const RETAIN_BATCH: usize = 500;
+const DAY_MS_U: u64 = 86_400_000;
+
 // M7 association graph (ARCHITECTURE-PLAN §9.3/§9.4, §21.10).
 /// Degree-strength saturation for `centrality = clamp(Σ weight / SAT, 0, 1)` (§9.4).
 pub const CENTRALITY_SAT: f64 = 8.0;
@@ -293,6 +297,7 @@ pub struct DreamOutcome {
     pub associated: usize,
     pub proposed: usize,
     pub decayed: usize,
+    pub retained: usize,
     pub tokens_used: i64,
     pub status: &'static str,
 }
@@ -304,7 +309,7 @@ pub struct DreamOutcome {
 pub fn dream_once<A: ProviderAdapter>(
     store: &mut Store,
     adapter: &A,
-    _caps: &Caps,
+    caps: &Caps,
     opts: &DreamOptions,
     clock: &dyn Fn() -> i64,
 ) -> Result<DreamOutcome, StoreError> {
@@ -457,6 +462,37 @@ pub fn dream_once<A: ProviderAdapter>(
         }
     }
 
+    // Retention phase (roadmap B1+B2): owner-opt-in deletion of consolidated
+    // raw events / raw-event embeddings past their horizons. Bounded batches
+    // under the same wall clock; a no-op when both horizons are 0 (default).
+    let mut retained = 0_usize;
+    if !partial && (caps.retain_raw_days > 0 || caps.retain_raw_embeddings_days > 0) {
+        let policy = crate::store::RetainPolicy {
+            raw_horizon_ms: i64::try_from(caps.retain_raw_days.saturating_mul(DAY_MS_U))
+                .unwrap_or(i64::MAX),
+            embed_horizon_ms: i64::try_from(
+                caps.retain_raw_embeddings_days.saturating_mul(DAY_MS_U),
+            )
+            .unwrap_or(i64::MAX),
+            batch: RETAIN_BATCH,
+        };
+        loop {
+            if clock() - start >= max_ms {
+                partial = true;
+                break;
+            }
+            let batch = store.retain_expired(&policy, clock())?;
+            let touched = batch.raw_events_deleted + batch.embeddings_deleted;
+            retained += touched;
+            if touched > 0 {
+                jobs_run += 1;
+            }
+            if batch.raw_events_deleted < RETAIN_BATCH && batch.embeddings_deleted < RETAIN_BATCH {
+                break;
+            }
+        }
+    }
+
     let status = if partial {
         "partial"
     } else if budget_hit {
@@ -474,6 +510,7 @@ pub fn dream_once<A: ProviderAdapter>(
         associated,
         proposed,
         decayed,
+        retained,
         tokens_used: tokens,
         status,
     })

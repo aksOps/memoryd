@@ -11,6 +11,8 @@ pub const MIN_BEARER_TOKEN_LEN: usize = 16;
 /// downstream millisecond conversions to i64::MAX — silently meaning "no cap
 /// at all" — so they are rejected at validation instead.
 pub const MAX_DURATION_SECS: u64 = 86_400;
+/// Upper bound (10 years) on retention horizons; 0 disables retention.
+pub const MAX_RETAIN_DAYS: u64 = 3_650;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -75,6 +77,29 @@ impl Config {
                 .map_err(|_| ConfigError::ApiKeyFileUnreadable { path })?;
             self.providers.openai_compat.api_key =
                 Some(contents.trim_end_matches(['\r', '\n']).to_string());
+        }
+        for (var, target) in [
+            ("MEMORYD_RETAIN_RAW_DAYS", 0usize),
+            ("MEMORYD_RETAIN_RAW_EMBED_DAYS", 1usize),
+        ] {
+            if let Some(days) = get(var) {
+                let days = days
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|value| *value <= MAX_RETAIN_DAYS)
+                    .ok_or(ConfigError::InvalidNumberEnv {
+                        var: if target == 0 {
+                            "MEMORYD_RETAIN_RAW_DAYS"
+                        } else {
+                            "MEMORYD_RETAIN_RAW_EMBED_DAYS"
+                        },
+                    })?;
+                if target == 0 {
+                    self.caps.retain_raw_days = days;
+                } else {
+                    self.caps.retain_raw_embeddings_days = days;
+                }
+            }
         }
         if let Some(model) = get("MEMORYD_OPENAI_EMBED_MODEL") {
             self.providers.openai_compat.embed_model = model;
@@ -183,6 +208,13 @@ pub struct Caps {
     pub lease_visibility_secs: u64,
     pub job_max_attempts: u32,
     pub job_backoff_base_ms: u64,
+    /// Retention horizon (days) for consolidated raw events; 0 = keep forever
+    /// (the default — deleting history is an explicit owner opt-in via
+    /// `MEMORYD_RETAIN_RAW_DAYS`). Memories, the graph, and audit stay.
+    pub retain_raw_days: u64,
+    /// Retention horizon (days) for raw-event embeddings (the second-largest
+    /// growth component; memory-level embeddings remain). 0 = keep forever.
+    pub retain_raw_embeddings_days: u64,
     /// Which `VectorIndex` implementation recall uses: "brute-force" (default, oracle)
     /// or "hnsw" (ARCHITECTURE-PLAN §21.12).
     pub vector_index_kind: String,
@@ -199,6 +231,8 @@ impl Caps {
             lease_visibility_secs: 30,
             job_max_attempts: 5,
             job_backoff_base_ms: 500,
+            retain_raw_days: 0,
+            retain_raw_embeddings_days: 0,
             vector_index_kind: "brute-force".to_string(),
         }
     }

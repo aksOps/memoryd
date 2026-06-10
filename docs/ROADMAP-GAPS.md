@@ -48,11 +48,11 @@ only weak graph links are ever deleted. Recall stays fast by construction
 (indexed FTS prefilter, 256-candidate cap), so these are about disk and
 corpus hygiene, not query latency.
 
-- `[ ]` B1. Governed retention dream phase: archive/delete raw events older
+- `[x]` B1. Governed retention dream phase: archive/delete raw events older
   than N months **that are already consolidated**, keeping memories,
   provenance summaries, and the graph. Frontier-marked and per-pass capped
   like every other phase. Biggest lever (~80% of growth).
-- `[ ]` B2. Drop raw-event embeddings once the corresponding memory-level
+- `[x]` B2. Drop raw-event embeddings (via MEMORYD_RETAIN_RAW_EMBED_DAYS) once the corresponding memory-level
   embedding exists (second-largest growth component).
 - `[ ]` B3. Audit-log retention: an explicit policy decision — the table is
   append-only by trigger *by design*, so pruning needs a deliberate
