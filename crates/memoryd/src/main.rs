@@ -13,9 +13,11 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+mod logging;
 
 const MAX_HTTP_LINE_BYTES: usize = 8 * 1024;
 const MAX_HTTP_HEADERS: usize = 64;
@@ -299,23 +301,29 @@ fn serve(cli: Cli) -> Result<(), CliError> {
     // connection threads open their own per-connection stores.
     drop(Store::open(&cfg.db_path)?);
 
+    let shutdown = Arc::new(AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        signal_hook::flag::register(signal, Arc::clone(&shutdown))?;
+    }
+
     let worker_db = cfg.db_path.clone();
     let worker_caps = cfg.caps.clone();
     let worker_adapter_kind = cfg.providers.default_adapter.clone();
-    // Detached for M3: the worker runs for the process lifetime. Graceful shutdown
-    // (draining in-flight jobs) and consolidating onto the planned single-writer
-    // actor (ARCHITECTURE-PLAN s7.1/U5) are deferred; today it is a second writer.
-    let _worker = std::thread::spawn(move || {
+    let worker_shutdown = Arc::clone(&shutdown);
+    // Consolidating onto the planned single-writer actor (ARCHITECTURE-PLAN
+    // s7.1/U5) is deferred; today this is a second writer that drains its
+    // in-flight tick and exits on shutdown.
+    let worker = std::thread::spawn(move || {
         let adapter =
             memoryd_core::adapters::AdapterKind::from_default_adapter(&worker_adapter_kind);
         let mut worker_store = match Store::open(&worker_db) {
             Ok(store) => store,
             Err(err) => {
-                eprintln!("memoryd: worker store open failed: {err}");
+                logging::log_error!("worker store open failed: {err}");
                 return;
             }
         };
-        loop {
+        while !worker_shutdown.load(Ordering::Acquire) {
             let now = unix_ms_now();
             match memoryd_core::worker::tick_embed(&mut worker_store, &adapter, &worker_caps, now) {
                 Ok(report) if report.leased == 0 => {
@@ -323,7 +331,7 @@ fn serve(cli: Cli) -> Result<(), CliError> {
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    eprintln!("memoryd: worker tick failed: {err}");
+                    logging::log_warn!("worker tick failed: {err}");
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
             }
@@ -333,17 +341,18 @@ fn serve(cli: Cli) -> Result<(), CliError> {
     let dream_db = cfg.db_path.clone();
     let dream_caps = cfg.caps.clone();
     let dream_adapter_kind = cfg.providers.default_adapter.clone();
+    let dream_shutdown = Arc::clone(&shutdown);
     // M6: a second governed background loop runs a dream pass on an interval
-    // (consolidate + decay), capped by dream_wallclock_secs + paid_spend_cap_usd. Like
-    // the embed worker it is a detached writer for now (the single-writer actor is
-    // deferred, ARCHITECTURE-PLAN s7.1/U5).
-    let _dream_worker = std::thread::spawn(move || {
+    // (consolidate + decay), capped by dream_wallclock_secs + paid_spend_cap_usd.
+    // The interval sleep is sliced so shutdown is observed within ~500ms; an
+    // in-flight dream pass finishes before the thread exits.
+    let dream_worker = std::thread::spawn(move || {
         let adapter =
             memoryd_core::adapters::AdapterKind::from_default_adapter(&dream_adapter_kind);
         let mut dream_store = match Store::open(&dream_db) {
             Ok(store) => store,
             Err(err) => {
-                eprintln!("memoryd: dream store open failed: {err}");
+                logging::log_error!("dream store open failed: {err}");
                 return;
             }
         };
@@ -352,8 +361,17 @@ fn serve(cli: Cli) -> Result<(), CliError> {
             budget_usd: dream_caps.paid_spend_cap_usd,
             max_seconds: dream_caps.dream_wallclock_secs,
         };
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(DREAM_INTERVAL_SECS));
+        'outer: loop {
+            let mut slept = std::time::Duration::ZERO;
+            let interval = std::time::Duration::from_secs(DREAM_INTERVAL_SECS);
+            while slept < interval {
+                if dream_shutdown.load(Ordering::Acquire) {
+                    break 'outer;
+                }
+                let slice = std::time::Duration::from_millis(500).min(interval - slept);
+                std::thread::sleep(slice);
+                slept += slice;
+            }
             if let Err(err) = memoryd_core::dream::dream_once(
                 &mut dream_store,
                 &adapter,
@@ -361,42 +379,62 @@ fn serve(cli: Cli) -> Result<(), CliError> {
                 &opts,
                 &|| unix_ms_now(),
             ) {
-                eprintln!("memoryd: dream tick failed: {err}");
+                logging::log_warn!("dream tick failed: {err}");
             }
         }
     });
 
     let listener = TcpListener::bind(cfg.bind)?;
-    println!("memoryd serve");
-    println!("bind: {}", cfg.bind);
-    println!("db_path: {}", cfg.db_path.display());
-    println!("worker: embed ({} adapter)", cfg.providers.default_adapter);
-    println!("dream: scheduled every {DREAM_INTERVAL_SECS}s");
+    logging::log_info!("serve starting");
+    logging::log_info!("bind: {}", cfg.bind);
+    logging::log_info!("db_path: {}", cfg.db_path.display());
+    logging::log_info!("worker: embed ({} adapter)", cfg.providers.default_adapter);
+    logging::log_info!("dream: scheduled every {DREAM_INTERVAL_SECS}s");
 
-    serve_loop(
+    let result = serve_loop(
         listener,
         Arc::new(cfg),
         Arc::new(AuthThrottle::new()),
+        Arc::clone(&shutdown),
         HTTP_READ_TIMEOUT,
         HTTP_WRITE_TIMEOUT,
-    )
+    );
+
+    logging::log_info!("shutdown: draining background workers");
+    if worker.join().is_err() {
+        logging::log_error!("embed worker panicked during shutdown");
+    }
+    if dream_worker.join().is_err() {
+        logging::log_error!("dream worker panicked during shutdown");
+    }
+    logging::log_info!("shutdown complete");
+    result
 }
 
 /// Accept loop: each connection is handled on its own thread with its own
 /// store, so one slow or stalled client cannot serialize other callers. The
 /// active-connection counter bounds the thread count; peers past the cap get
-/// an immediate 503.
+/// an immediate 503. The listener is non-blocking so the shutdown flag is
+/// observed within ~50ms; on shutdown the loop waits up to 5s for in-flight
+/// connections to drain (socket timeouts bound their lifetime regardless).
 fn serve_loop(
     listener: TcpListener,
     cfg: Arc<Config>,
     throttle: Arc<AuthThrottle>,
+    shutdown: Arc<AtomicBool>,
     read_timeout: Duration,
     write_timeout: Duration,
 ) -> Result<(), CliError> {
+    listener.set_nonblocking(true)?;
     let active = Arc::new(AtomicUsize::new(0));
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
+    while !shutdown.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                // Hand the socket back to blocking mode; per-connection
+                // deadlines come from read/write timeouts, not non-blocking IO.
+                if stream.set_nonblocking(false).is_err() {
+                    continue;
+                }
                 if active.load(Ordering::Acquire) >= MAX_CONCURRENT_CONNECTIONS {
                     let response =
                         HttpResponse::error(503, "server_busy", "too many concurrent connections");
@@ -416,14 +454,21 @@ fn serve_loop(
                         read_timeout,
                         write_timeout,
                     ) {
-                        eprintln!("memoryd: request failed: {err}");
+                        logging::log_warn!("request failed: {err}");
                     }
                 });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
             }
             Err(err) => return Err(CliError::Io(err)),
         }
     }
 
+    let drain_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while active.load(Ordering::Acquire) > 0 && std::time::Instant::now() < drain_deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     Ok(())
 }
 
@@ -1199,6 +1244,13 @@ fn handle_http_request(
     peer: Option<SocketAddr>,
     request: HttpRequest,
 ) -> HttpResponse {
+    // GET /v1/health is auth-exempt for loopback peers only: it is read-only
+    // and leaks nothing beyond the schema version, so local supervisors can
+    // probe liveness without the bearer token. Remote probes still need auth.
+    if request.path == "/v1/health" && peer.map(|addr| addr.ip().is_loopback()).unwrap_or(false) {
+        return handle_http_health(store, &request);
+    }
+
     if !is_authorized(cfg, peer, &request.headers) {
         let peer_loopback = peer.map(|addr| addr.ip().is_loopback());
         let authorization_header_present =
@@ -1231,6 +1283,11 @@ fn handle_http_request(
         );
     }
 
+    // Authorized non-loopback callers reach health here.
+    if request.path == "/v1/health" {
+        return handle_http_health(store, &request);
+    }
+
     if request.path != "/v1/capture" && request.path != "/v1/recall" {
         return HttpResponse::error(404, "not_found", "route not found");
     }
@@ -1251,6 +1308,23 @@ fn handle_http_request(
         "/v1/capture" => handle_http_capture(store, body, cfg.caps.queue_depth_max),
         "/v1/recall" => handle_http_recall(store, body, &cfg.providers.default_adapter),
         _ => HttpResponse::error(404, "not_found", "route not found"),
+    }
+}
+
+fn handle_http_health(store: &Store, request: &HttpRequest) -> HttpResponse {
+    if request.method != "GET" {
+        return HttpResponse::error(405, "method_not_allowed", "GET required");
+    }
+    match store.schema_version() {
+        Ok(schema_version) => HttpResponse::json(
+            200,
+            "OK",
+            serde_json::json!({
+                "status": "ok",
+                "schema_version": schema_version,
+            }),
+        ),
+        Err(_) => HttpResponse::error(500, "store_error", "health check could not read the store"),
     }
 }
 
@@ -2703,23 +2777,33 @@ mod tests {
     }
 
     /// Spawn `serve_loop` on an ephemeral loopback port with short timeouts so
-    /// socket-level behavior (slowloris, throttling) is testable end to end.
-    /// The loop thread is detached; it dies with the test process.
-    fn spawn_test_server(cfg: Config) -> SocketAddr {
+    /// socket-level behavior (slowloris, throttling, shutdown) is testable end
+    /// to end. Returns the bound address, the loop's join handle, and the
+    /// shutdown flag.
+    fn spawn_test_server(
+        cfg: Config,
+    ) -> (
+        SocketAddr,
+        std::thread::JoinHandle<Result<(), CliError>>,
+        Arc<AtomicBool>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test listener binds");
         let addr = listener.local_addr().expect("listener has local addr");
         let cfg = Arc::new(cfg);
         let throttle = Arc::new(AuthThrottle::new());
-        std::thread::spawn(move || {
-            let _ = serve_loop(
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let loop_shutdown = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            serve_loop(
                 listener,
                 cfg,
                 throttle,
+                loop_shutdown,
                 Duration::from_millis(200),
                 Duration::from_secs(5),
-            );
+            )
         });
-        addr
+        (addr, handle, shutdown)
     }
 
     fn send_raw_request(addr: SocketAddr, raw: &str) -> String {
@@ -2746,7 +2830,7 @@ mod tests {
     #[test]
     fn tcp_idle_connection_receives_408_timeout() {
         let path = temp_db_path("tcp-idle-408");
-        let addr = spawn_test_server(Config::with_db_path(path.clone()));
+        let (addr, _handle, _shutdown) = spawn_test_server(Config::with_db_path(path.clone()));
 
         let mut stream = TcpStream::connect(addr).expect("test client connects");
         stream
@@ -2766,7 +2850,7 @@ mod tests {
     #[test]
     fn tcp_slow_client_does_not_block_concurrent_request() {
         let path = temp_db_path("tcp-slowloris");
-        let addr = spawn_test_server(Config::with_db_path(path.clone()));
+        let (addr, _handle, _shutdown) = spawn_test_server(Config::with_db_path(path.clone()));
 
         // Hold an idle connection open, then issue a real request on a second
         // connection; it must complete promptly despite the stalled peer.
@@ -2790,7 +2874,7 @@ mod tests {
         let path = temp_db_path("tcp-auth-throttle");
         let mut cfg = Config::with_db_path(path.clone());
         cfg.bearer_token = Some("correct-horse-battery-staple".to_string());
-        let addr = spawn_test_server(cfg);
+        let (addr, _handle, _shutdown) = spawn_test_server(cfg);
 
         for attempt in 0..AUTH_FAIL_LIMIT {
             let response = send_raw_request(addr, &capture_request_raw("wrong-token"));
@@ -2804,6 +2888,144 @@ mod tests {
             response.starts_with("HTTP/1.1 429"),
             "post-limit attempt should be throttled, got: {response}"
         );
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn serve_loop_exits_when_shutdown_flag_set() {
+        let path = temp_db_path("serve-shutdown");
+        let (_addr, handle, shutdown) = spawn_test_server(Config::with_db_path(path.clone()));
+
+        shutdown.store(true, Ordering::Release);
+        let started = Instant::now();
+        let result = handle.join().expect("serve loop thread joins");
+        assert!(result.is_ok(), "serve loop exits cleanly on shutdown");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown must be observed promptly"
+        );
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn serve_loop_finishes_inflight_request_during_shutdown() {
+        let path = temp_db_path("serve-shutdown-inflight");
+        let (addr, handle, shutdown) = spawn_test_server(Config::with_db_path(path.clone()));
+
+        // Open the connection first, signal shutdown, then send the request:
+        // the already-accepted (or about-to-be-accepted) work must still get a
+        // response while the loop drains.
+        let mut stream = TcpStream::connect(addr).expect("test client connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        let raw = capture_request_raw("unused");
+        stream
+            .write_all(raw.as_bytes())
+            .expect("test client writes");
+        std::thread::sleep(Duration::from_millis(100));
+        shutdown.store(true, Ordering::Release);
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        assert!(
+            response.starts_with("HTTP/1.1 202"),
+            "in-flight request still answered, got: {response}"
+        );
+        assert!(handle.join().expect("loop joins").is_ok());
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn http_health_get_on_loopback_bypasses_bearer_auth() {
+        let path = temp_db_path("http-health-loopback");
+        let mut cfg = Config::with_db_path(path.clone());
+        cfg.bearer_token = Some("configured-token-0123456789".to_string());
+        let mut store = Store::open(&path).expect("store opens");
+
+        let response = handle_http_request(
+            &mut store,
+            &cfg,
+            Some("127.0.0.1:65000".parse().expect("peer parses")),
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/v1/health".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        );
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["status"], "ok");
+        assert!(
+            response.body["schema_version"].is_i64(),
+            "schema_version is an integer: {}",
+            response.body
+        );
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn http_health_requires_bearer_for_non_loopback() {
+        let path = temp_db_path("http-health-remote");
+        let mut cfg = Config::with_db_path(path.clone());
+        cfg.bind = "0.0.0.0:7077".parse().expect("bind parses");
+        cfg.bearer_token = Some("configured-token-0123456789".to_string());
+        let mut store = Store::open(&path).expect("store opens");
+
+        let response = handle_http_request(
+            &mut store,
+            &cfg,
+            Some("203.0.113.9:50000".parse().expect("peer parses")),
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/v1/health".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        );
+        assert_eq!(response.status, 401);
+
+        let authorized = handle_http_request(
+            &mut store,
+            &cfg,
+            Some("203.0.113.9:50000".parse().expect("peer parses")),
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/v1/health".to_string(),
+                headers: vec![(
+                    "authorization".to_string(),
+                    "Bearer configured-token-0123456789".to_string(),
+                )],
+                body: Vec::new(),
+            },
+        );
+        assert_eq!(authorized.status, 200);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn http_health_rejects_post() {
+        let path = temp_db_path("http-health-post");
+        let cfg = Config::with_db_path(path.clone());
+        let mut store = Store::open(&path).expect("store opens");
+
+        let response = handle_http_request(
+            &mut store,
+            &cfg,
+            Some("127.0.0.1:65000".parse().expect("peer parses")),
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/v1/health".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        );
+        assert_eq!(response.status, 405);
 
         cleanup_db_files(&path);
     }

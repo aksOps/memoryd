@@ -1339,6 +1339,13 @@ impl Store {
     pub fn table_stats(&self) -> Result<Vec<TableStats>, StoreError> {
         let mut stats = Vec::with_capacity(CANONICAL_TABLES.len());
         for table in CANONICAL_TABLES {
+            // This is the single interpolated-SQL site in the store and must
+            // never take dynamic input: identifiers cannot be bound as
+            // parameters, so safety rests on the hardcoded const list.
+            debug_assert!(
+                CANONICAL_TABLES.contains(&table),
+                "table_stats must only interpolate canonical table names"
+            );
             let sql = format!("SELECT COUNT(*) FROM {table}");
             let rows = self.conn.query_row(&sql, [], |row| row.get::<_, i64>(0))?;
             stats.push(TableStats {

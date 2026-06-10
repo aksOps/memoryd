@@ -89,6 +89,23 @@ non-loopback bind requires a bearer token at startup.
 
 Base URL: `http://127.0.0.1:7077` by default.
 
+### `GET /v1/health`
+
+Liveness probe. Read-only; reports nothing beyond status and schema version.
+
+Loopback peers may call it without authorization even when a bearer token is
+configured, so local supervisors can probe without holding the token. Non-
+loopback peers go through normal bearer auth. Non-GET methods return `405`.
+
+Response `200 OK`:
+
+```json
+{
+  "status": "ok",
+  "schema_version": 2
+}
+```
+
 ### `POST /v1/capture`
 
 Redacts common secret shapes, appends the redacted raw event, upserts its

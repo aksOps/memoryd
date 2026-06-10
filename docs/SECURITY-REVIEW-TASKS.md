@@ -69,26 +69,27 @@ bind; everything else is hardening, defense-in-depth, or planned-work tracking.
 
 ## P3 — Robustness and Code-Quality Improvements
 
-- `[ ]` Graceful shutdown: handle SIGTERM, drain the embed worker and dream
-  scheduler (both are detached threads today), close the listener. Currently
-  relies entirely on SQLite crash safety (noted as deferred in
-  `crates/memoryd/src/main.rs:285-287`).
+- `[x]` Graceful shutdown. Shipped: SIGTERM/SIGINT set an `AtomicBool` via
+  `signal-hook` (the one new dependency; safe std cannot install handlers);
+  the accept loop is non-blocking and observes the flag within ~50ms, waits
+  up to 5s for in-flight connections, and joins the embed worker and dream
+  scheduler (sliced sleeps) before exit.
 - `[ ]` Consolidate the three writers (HTTP handler, embed worker, dream
   loop) onto the planned single-writer `store::Writer` actor
   (ARCHITECTURE-PLAN §7.1/U5). WAL + `busy_timeout=5000` makes today's shape
   safe but contention-prone.
-- `[ ]` Add a `GET /v1/health` endpoint (doctor/stats exist only as CLI);
-  useful for supervisors and the planned npm distribution.
-- `[ ]` Pin `table_stats` to the const table list defensively
-  (`crates/memoryd-core/src/store.rs:1316`): the `format!`-built `SELECT
-  COUNT(*) FROM {table}` is safe today because it iterates hardcoded
-  `CANONICAL_TABLES`, but it is the one interpolated SQL site — add a comment
-  or debug assertion so a refactor can't make it dynamic.
-- `[ ]` Use `total_cmp` in the brute-force vector sort for consistency with
-  HNSW (`crates/memoryd-core/src/vectorindex.rs:40-44`); harmless today since
-  vectors are L2-normalized, but future-proof.
-- `[ ]` Adopt structured logging (`log`/`tracing`) in place of
-  `println!`/`eprintln!` before the worker count grows further.
+- `[x]` `GET /v1/health` endpoint. Shipped: `{"status":"ok","schema_version"}`;
+  auth-exempt for loopback peers only (read-only, supervisor-friendly),
+  bearer-gated for everyone else, 405 for non-GET.
+- `[x]` `table_stats` pinned. Shipped: `debug_assert!` against
+  `CANONICAL_TABLES` plus a comment marking it as the single interpolated-SQL
+  site that must never take dynamic input.
+- `[x]` `total_cmp` in the brute-force vector sort (matches HNSW's
+  comparator); NaN-presence and id-DESC tie-break tests added.
+- `[x]` Structured logging. Shipped as a zero-dependency internal module
+  (`crates/memoryd/src/logging.rs`, `{unix_ms} LEVEL memoryd: msg` on
+  stderr) — a `log`/`tracing` dependency adds nothing while the daemon is the
+  only consumer. CLI JSON output on stdout is untouched.
 
 ## Verified Non-Issues (do not re-open without new evidence)
 
