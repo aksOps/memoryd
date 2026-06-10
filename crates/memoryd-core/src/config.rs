@@ -3,6 +3,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:7077";
+/// Minimum bearer-token length accepted for a non-loopback bind. The token is
+/// the entire security boundary for remote callers, so trivially guessable
+/// values are rejected at startup; loopback dev tokens stay unrestricted.
+pub const MIN_BEARER_TOKEN_LEN: usize = 16;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -29,6 +33,18 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if !is_loopback(self.bind.ip()) && self.bearer_token.is_none() {
             return Err(ConfigError::RemoteBindRequiresBearer { bind: self.bind });
+        }
+
+        if let Some(token) = self.bearer_token.as_deref() {
+            // An empty token can never match any Authorization header, so it
+            // fails closed — but a clear startup error beats a silent self-DoS
+            // (e.g. MEMORYD_TOKEN set-but-empty in a shell script).
+            if token.trim().is_empty() {
+                return Err(ConfigError::EmptyBearerToken);
+            }
+            if !is_loopback(self.bind.ip()) && token.len() < MIN_BEARER_TOKEN_LEN {
+                return Err(ConfigError::BearerTokenTooShort { len: token.len() });
+            }
         }
 
         if !matches!(
@@ -109,6 +125,8 @@ impl Default for ProviderConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigError {
     RemoteBindRequiresBearer { bind: SocketAddr },
+    EmptyBearerToken,
+    BearerTokenTooShort { len: usize },
     PaidProviderRequiresBudget { adapter: String },
     UnknownVectorIndex { kind: String },
     UnknownAdapter { adapter: String },
@@ -119,6 +137,18 @@ impl fmt::Display for ConfigError {
         match self {
             Self::RemoteBindRequiresBearer { bind } => {
                 write!(f, "non-loopback bind {bind} requires a bearer token")
+            }
+            Self::EmptyBearerToken => {
+                write!(
+                    f,
+                    "bearer token must not be empty (set MEMORYD_TOKEN or --token)"
+                )
+            }
+            Self::BearerTokenTooShort { len } => {
+                write!(
+                    f,
+                    "bearer token must be at least {MIN_BEARER_TOKEN_LEN} characters for a non-loopback bind (got {len})"
+                )
             }
             Self::PaidProviderRequiresBudget { adapter } => write!(
                 f,
@@ -174,8 +204,44 @@ mod tests {
             Err(ConfigError::RemoteBindRequiresBearer { .. })
         ));
 
-        cfg.bearer_token = Some("test-token".to_string());
+        cfg.bearer_token = Some("test-token-0123456789".to_string());
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_bearer_token() {
+        let mut cfg = Config::with_db_path(PathBuf::from("memoryd.db"));
+        for empty in ["", "   "] {
+            cfg.bearer_token = Some(empty.to_string());
+            assert!(
+                matches!(cfg.validate(), Err(ConfigError::EmptyBearerToken)),
+                "empty token rejected on loopback"
+            );
+        }
+        cfg.bind = "0.0.0.0:7077".parse().expect("test bind parses");
+        cfg.bearer_token = Some(String::new());
+        assert!(
+            matches!(cfg.validate(), Err(ConfigError::EmptyBearerToken)),
+            "empty token rejected on non-loopback"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_short_token_for_non_loopback() {
+        let mut cfg = Config::with_db_path(PathBuf::from("memoryd.db"));
+        cfg.bind = "0.0.0.0:7077".parse().expect("test bind parses");
+        cfg.bearer_token = Some("fifteen-chars-x".to_string());
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::BearerTokenTooShort { len: 15 })
+        ));
+    }
+
+    #[test]
+    fn validate_allows_short_token_on_loopback() {
+        let mut cfg = Config::with_db_path(PathBuf::from("memoryd.db"));
+        cfg.bearer_token = Some("dev".to_string());
+        assert!(cfg.validate().is_ok(), "loopback dev tokens stay legal");
     }
 
     #[test]

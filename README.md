@@ -52,7 +52,13 @@ See `docs/API.md` for CLI and REST request/response details. See
 
 - Runtime is local-first and does not call public internet services by default.
 - The default bind is `127.0.0.1:7077`.
-- Any non-loopback bind requires a bearer token.
+- Any non-loopback bind requires a bearer token of at least 16 characters; empty
+  tokens are rejected at startup on any bind.
+- Each accepted connection is handled on its own thread with 10s socket
+  read/write deadlines, and concurrent connections are capped (excess gets 503),
+  so a stalled client cannot block other callers.
+- Repeated failed bearer authentication is throttled per peer IP (5 failures per
+  minute locks the peer out for a minute with 429 responses).
 - Capture redacts common secret shapes before writing metadata, payloads, provenance, and recall index text to SQLite.
 - Capture writes safe `audit_log` rows for capture append and redaction summaries; HTTP auth rejection writes a safe audit row without storing bearer token values.
 - Capture appends redacted raw events and queues background work when below the queue-depth cap; saturated captures return degraded instead of calling providers or failing inline.

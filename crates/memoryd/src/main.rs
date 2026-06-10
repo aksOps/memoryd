@@ -5,20 +5,39 @@ use memoryd_core::store::{
     ApprovalDecision, ApprovalRow, CaptureAck, MemoryRecallResult, NewRawEvent, RecallResult,
     Store, StoreError,
 };
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_HTTP_LINE_BYTES: usize = 8 * 1024;
 const MAX_HTTP_HEADERS: usize = 64;
 const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
 /// How often the `serve` dream scheduler runs a consolidate+decay pass.
 const DREAM_INTERVAL_SECS: u64 = 300;
+/// Socket deadlines for each accepted connection. Without these a client that
+/// connects and never sends (or dribbles) bytes would pin its handler thread
+/// forever — the classic slowloris. 10s is generous for a local daemon.
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound on concurrently handled connections; excess connections get an
+/// immediate 503 instead of an unbounded thread pile-up.
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+/// Auth throttle policy: this many 401s within the window locks the peer IP out
+/// for the lockout duration. A successful request clears the peer's state.
+const AUTH_FAIL_LIMIT: u32 = 5;
+const AUTH_FAIL_WINDOW_MS: i64 = 60_000;
+const AUTH_LOCKOUT_MS: i64 = 60_000;
+/// Memory bound for the throttle map; expired entries are dropped first, then
+/// the entry with the oldest failure is evicted.
+const AUTH_THROTTLE_MAX_ENTRIES: usize = 1024;
 
 fn main() -> ExitCode {
     match run(env::args_os()) {
@@ -276,7 +295,9 @@ fn serve(cli: Cli) -> Result<(), CliError> {
     let cfg = cli.config()?;
     cfg.validate()?;
 
-    let mut store = Store::open(&cfg.db_path)?;
+    // Fail fast (and run migrations once) before any background thread starts;
+    // connection threads open their own per-connection stores.
+    drop(Store::open(&cfg.db_path)?);
 
     let worker_db = cfg.db_path.clone();
     let worker_caps = cfg.caps.clone();
@@ -352,18 +373,184 @@ fn serve(cli: Cli) -> Result<(), CliError> {
     println!("worker: embed ({} adapter)", cfg.providers.default_adapter);
     println!("dream: scheduled every {DREAM_INTERVAL_SECS}s");
 
+    serve_loop(
+        listener,
+        Arc::new(cfg),
+        Arc::new(AuthThrottle::new()),
+        HTTP_READ_TIMEOUT,
+        HTTP_WRITE_TIMEOUT,
+    )
+}
+
+/// Accept loop: each connection is handled on its own thread with its own
+/// store, so one slow or stalled client cannot serialize other callers. The
+/// active-connection counter bounds the thread count; peers past the cap get
+/// an immediate 503.
+fn serve_loop(
+    listener: TcpListener,
+    cfg: Arc<Config>,
+    throttle: Arc<AuthThrottle>,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> Result<(), CliError> {
+    let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => {
-                if let Err(err) = handle_http_connection(&mut store, &cfg, stream) {
-                    eprintln!("memoryd: request failed: {err}");
+            Ok(mut stream) => {
+                if active.load(Ordering::Acquire) >= MAX_CONCURRENT_CONNECTIONS {
+                    let response =
+                        HttpResponse::error(503, "server_busy", "too many concurrent connections");
+                    let _ = stream.set_write_timeout(Some(write_timeout));
+                    let _ = write_http_response(&mut stream, response);
+                    continue;
                 }
+                let guard = ConnectionGuard::register(Arc::clone(&active));
+                let cfg = Arc::clone(&cfg);
+                let throttle = Arc::clone(&throttle);
+                std::thread::spawn(move || {
+                    let _guard = guard;
+                    if let Err(err) = handle_connection_thread(
+                        &cfg,
+                        &throttle,
+                        stream,
+                        read_timeout,
+                        write_timeout,
+                    ) {
+                        eprintln!("memoryd: request failed: {err}");
+                    }
+                });
             }
             Err(err) => return Err(CliError::Io(err)),
         }
     }
 
     Ok(())
+}
+
+/// Per-connection entry point: opens this thread's store and delegates. A store
+/// that cannot open still produces an HTTP 500 instead of a silently dropped
+/// connection.
+fn handle_connection_thread(
+    cfg: &Config,
+    throttle: &AuthThrottle,
+    mut stream: TcpStream,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> Result<(), CliError> {
+    match Store::open(&cfg.db_path) {
+        Ok(mut store) => handle_http_connection(
+            &mut store,
+            cfg,
+            throttle,
+            stream,
+            read_timeout,
+            write_timeout,
+        ),
+        Err(err) => {
+            let _ = stream.set_write_timeout(Some(write_timeout));
+            let _ = write_http_response(
+                &mut stream,
+                HttpResponse::error(500, "store_error", "store could not be opened"),
+            );
+            Err(CliError::Store(err))
+        }
+    }
+}
+
+/// RAII registration in the active-connection counter; decrements on drop so
+/// panics and early returns cannot leak a slot.
+struct ConnectionGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl ConnectionGuard {
+    fn register(active: Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::AcqRel);
+        Self { active }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Per-IP fixed-window auth throttle: `AUTH_FAIL_LIMIT` 401s within
+/// `AUTH_FAIL_WINDOW_MS` lock the peer out for `AUTH_LOCKOUT_MS`. State is
+/// in-memory only and bounded by `AUTH_THROTTLE_MAX_ENTRIES`. Callers inject
+/// `now_ms` so tests control the clock.
+struct AuthThrottle {
+    inner: Mutex<HashMap<IpAddr, FailState>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FailState {
+    failures: u32,
+    window_start_ms: i64,
+    locked_until_ms: i64,
+    last_failure_ms: i64,
+}
+
+impl AuthThrottle {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn is_throttled(&self, ip: IpAddr, now_ms: i64) -> bool {
+        let map = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        map.get(&ip)
+            .map(|state| state.locked_until_ms > now_ms)
+            .unwrap_or(false)
+    }
+
+    fn record_failure(&self, ip: IpAddr, now_ms: i64) {
+        let mut map = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        if !map.contains_key(&ip) && map.len() >= AUTH_THROTTLE_MAX_ENTRIES {
+            Self::evict(&mut map, now_ms);
+        }
+        let state = map.entry(ip).or_insert(FailState {
+            failures: 0,
+            window_start_ms: now_ms,
+            locked_until_ms: 0,
+            last_failure_ms: now_ms,
+        });
+        if now_ms.saturating_sub(state.window_start_ms) > AUTH_FAIL_WINDOW_MS {
+            state.failures = 0;
+            state.window_start_ms = now_ms;
+        }
+        state.failures += 1;
+        state.last_failure_ms = now_ms;
+        if state.failures >= AUTH_FAIL_LIMIT {
+            state.locked_until_ms = now_ms + AUTH_LOCKOUT_MS;
+            state.failures = 0;
+            state.window_start_ms = now_ms;
+        }
+    }
+
+    fn record_success(&self, ip: IpAddr) {
+        let mut map = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        map.remove(&ip);
+    }
+
+    /// Drop entries that are neither locked out nor recently failing; if none
+    /// expired, evict the entry with the oldest failure so the map stays bounded.
+    fn evict(map: &mut HashMap<IpAddr, FailState>, now_ms: i64) {
+        map.retain(|_, state| {
+            state.locked_until_ms > now_ms
+                || now_ms.saturating_sub(state.last_failure_ms) <= AUTH_FAIL_WINDOW_MS
+        });
+        if map.len() >= AUTH_THROTTLE_MAX_ENTRIES
+            && let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, state)| state.last_failure_ms)
+                .map(|(ip, _)| *ip)
+        {
+            map.remove(&oldest);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -938,14 +1125,45 @@ fn recall_response_value(result: &RecallOutput) -> serde_json::Value {
 fn handle_http_connection(
     store: &mut Store,
     cfg: &Config,
+    throttle: &AuthThrottle,
     mut stream: TcpStream,
+    read_timeout: Duration,
+    write_timeout: Duration,
 ) -> Result<(), CliError> {
+    stream.set_read_timeout(Some(read_timeout))?;
+    stream.set_write_timeout(Some(write_timeout))?;
     let peer = stream.peer_addr().ok();
+    let peer_ip = peer.map(|addr| addr.ip());
+
+    // Throttled peers are rejected before any request byte is read: cheapest
+    // possible path for a brute-forcing client, and no parser work.
+    if let Some(ip) = peer_ip
+        && throttle.is_throttled(ip, unix_ms_now())
+    {
+        write_http_response(
+            &mut stream,
+            HttpResponse::error(
+                429,
+                "rate_limited",
+                "too many failed authentication attempts; retry later",
+            ),
+        )?;
+        return Ok(());
+    }
+
     let response = match read_http_request(&mut stream) {
         Ok(request) => handle_http_request(store, cfg, peer, request),
         Err(err) => HttpResponse::error(err.status, err.code, err.message),
     };
+    let status = response.status;
     write_http_response(&mut stream, response)?;
+    if let Some(ip) = peer_ip {
+        if status == 401 {
+            throttle.record_failure(ip, unix_ms_now());
+        } else if (200..300).contains(&status) {
+            throttle.record_success(ip);
+        }
+    }
     Ok(())
 }
 
@@ -1079,8 +1297,12 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, HttpParseErr
                 ));
             }
             let mut body = vec![0; body_len];
-            stream.read_exact(&mut body).map_err(|_| {
-                HttpParseError::new(400, "bad_request", "could not read request body")
+            stream.read_exact(&mut body).map_err(|err| {
+                if is_timeout(&err) {
+                    http_timeout_error()
+                } else {
+                    HttpParseError::new(400, "bad_request", "could not read request body")
+                }
             })?;
             return Ok(HttpRequest {
                 method: method.to_string(),
@@ -1133,6 +1355,7 @@ fn read_http_line(stream: &mut TcpStream) -> Result<String, HttpParseError> {
                     break;
                 }
             }
+            Err(err) if is_timeout(&err) => return Err(http_timeout_error()),
             Err(_) => {
                 return Err(HttpParseError::new(
                     400,
@@ -1154,6 +1377,23 @@ fn read_http_line(stream: &mut TcpStream) -> Result<String, HttpParseError> {
     let line = String::from_utf8(bytes)
         .map_err(|_| HttpParseError::new(400, "bad_request", "HTTP request must be UTF-8"))?;
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Socket read timeouts surface as `WouldBlock` or `TimedOut` depending on the
+/// platform; both mean the client did not deliver bytes within the deadline.
+fn is_timeout(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+fn http_timeout_error() -> HttpParseError {
+    HttpParseError::new(
+        408,
+        "request_timeout",
+        "client did not send a complete request in time",
+    )
 }
 
 fn capture_event_from_json(value: serde_json::Value) -> Result<NewRawEvent, &'static str> {
@@ -1341,11 +1581,14 @@ impl HttpResponse {
             401 => "Unauthorized",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            408 => "Request Timeout",
             413 => "Payload Too Large",
             415 => "Unsupported Media Type",
             422 => "Unprocessable Entity",
+            429 => "Too Many Requests",
             431 => "Request Header Fields Too Large",
             500 => "Internal Server Error",
+            503 => "Service Unavailable",
             _ => "Error",
         };
         Self::json(
@@ -2227,6 +2470,190 @@ mod tests {
             .expect("system clock after unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("memoryd-{name}-{}-{nanos}.db", std::process::id()))
+    }
+
+    fn test_ip(last: u8) -> IpAddr {
+        IpAddr::from([10, 0, 0, last])
+    }
+
+    #[test]
+    fn auth_throttle_allows_under_limit() {
+        let throttle = AuthThrottle::new();
+        let ip = test_ip(1);
+        for _ in 0..(AUTH_FAIL_LIMIT - 1) {
+            throttle.record_failure(ip, 0);
+        }
+        assert!(!throttle.is_throttled(ip, 1_000));
+    }
+
+    #[test]
+    fn auth_throttle_blocks_after_limit_failures_in_window() {
+        let throttle = AuthThrottle::new();
+        let ip = test_ip(2);
+        for _ in 0..AUTH_FAIL_LIMIT {
+            throttle.record_failure(ip, 0);
+        }
+        assert!(throttle.is_throttled(ip, 1_000));
+    }
+
+    #[test]
+    fn auth_throttle_unblocks_after_lockout_expires() {
+        let throttle = AuthThrottle::new();
+        let ip = test_ip(3);
+        for _ in 0..AUTH_FAIL_LIMIT {
+            throttle.record_failure(ip, 0);
+        }
+        let after_lockout = AUTH_LOCKOUT_MS + 1_000;
+        assert!(!throttle.is_throttled(ip, after_lockout));
+        // The failure count was reset at lockout; one new failure must not re-lock.
+        throttle.record_failure(ip, after_lockout);
+        assert!(!throttle.is_throttled(ip, after_lockout + 1));
+    }
+
+    #[test]
+    fn auth_throttle_success_clears_failures() {
+        let throttle = AuthThrottle::new();
+        let ip = test_ip(4);
+        for _ in 0..(AUTH_FAIL_LIMIT - 1) {
+            throttle.record_failure(ip, 0);
+        }
+        throttle.record_success(ip);
+        for _ in 0..(AUTH_FAIL_LIMIT - 1) {
+            throttle.record_failure(ip, 1);
+        }
+        assert!(!throttle.is_throttled(ip, 2));
+    }
+
+    #[test]
+    fn auth_throttle_evicts_oldest_when_full() {
+        let throttle = AuthThrottle::new();
+        // Lock out every entry so eviction cannot reclaim them as expired.
+        for index in 0..AUTH_THROTTLE_MAX_ENTRIES {
+            let ip = IpAddr::from([
+                10,
+                1,
+                u8::try_from(index / 256).expect("index fits"),
+                u8::try_from(index % 256).expect("index fits"),
+            ]);
+            for _ in 0..AUTH_FAIL_LIMIT {
+                throttle.record_failure(ip, index as i64);
+            }
+        }
+        let newcomer = IpAddr::from([10, 2, 0, 1]);
+        throttle.record_failure(newcomer, 10);
+        let map = throttle.inner.lock().expect("throttle lock");
+        assert!(map.len() <= AUTH_THROTTLE_MAX_ENTRIES);
+        assert!(map.contains_key(&newcomer), "newcomer was admitted");
+        assert!(
+            !map.contains_key(&IpAddr::from([10, 1, 0, 0])),
+            "oldest entry was evicted"
+        );
+    }
+
+    /// Spawn `serve_loop` on an ephemeral loopback port with short timeouts so
+    /// socket-level behavior (slowloris, throttling) is testable end to end.
+    /// The loop thread is detached; it dies with the test process.
+    fn spawn_test_server(cfg: Config) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener binds");
+        let addr = listener.local_addr().expect("listener has local addr");
+        let cfg = Arc::new(cfg);
+        let throttle = Arc::new(AuthThrottle::new());
+        std::thread::spawn(move || {
+            let _ = serve_loop(
+                listener,
+                cfg,
+                throttle,
+                Duration::from_millis(200),
+                Duration::from_secs(5),
+            );
+        });
+        addr
+    }
+
+    fn send_raw_request(addr: SocketAddr, raw: &str) -> String {
+        let mut stream = TcpStream::connect(addr).expect("test client connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        stream
+            .write_all(raw.as_bytes())
+            .expect("test client writes");
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        response
+    }
+
+    fn capture_request_raw(token: &str) -> String {
+        let body = r#"{"session_id":"s1","agent":"a","source":"hook","kind":"observation","payload":{"text":"tcp test"}}"#;
+        format!(
+            "POST /v1/capture HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn tcp_idle_connection_receives_408_timeout() {
+        let path = temp_db_path("tcp-idle-408");
+        let addr = spawn_test_server(Config::with_db_path(path.clone()));
+
+        let mut stream = TcpStream::connect(addr).expect("test client connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        // Send nothing: the server's read deadline must produce a 408.
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        assert!(
+            response.starts_with("HTTP/1.1 408"),
+            "idle connection should time out with 408, got: {response}"
+        );
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn tcp_slow_client_does_not_block_concurrent_request() {
+        let path = temp_db_path("tcp-slowloris");
+        let addr = spawn_test_server(Config::with_db_path(path.clone()));
+
+        // Hold an idle connection open, then issue a real request on a second
+        // connection; it must complete promptly despite the stalled peer.
+        let _idle = TcpStream::connect(addr).expect("idle connection connects");
+        let started = Instant::now();
+        let response = send_raw_request(addr, &capture_request_raw("unused"));
+        assert!(
+            response.starts_with("HTTP/1.1 202"),
+            "concurrent capture should succeed, got: {response}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "concurrent request must not wait behind the idle connection"
+        );
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn tcp_repeated_auth_failures_return_429() {
+        let path = temp_db_path("tcp-auth-throttle");
+        let mut cfg = Config::with_db_path(path.clone());
+        cfg.bearer_token = Some("correct-horse-battery-staple".to_string());
+        let addr = spawn_test_server(cfg);
+
+        for attempt in 0..AUTH_FAIL_LIMIT {
+            let response = send_raw_request(addr, &capture_request_raw("wrong-token"));
+            assert!(
+                response.starts_with("HTTP/1.1 401"),
+                "attempt {attempt} should be 401, got: {response}"
+            );
+        }
+        let response = send_raw_request(addr, &capture_request_raw("wrong-token"));
+        assert!(
+            response.starts_with("HTTP/1.1 429"),
+            "post-limit attempt should be throttled, got: {response}"
+        );
+
+        cleanup_db_files(&path);
     }
 
     fn cleanup_db_files(path: &Path) {

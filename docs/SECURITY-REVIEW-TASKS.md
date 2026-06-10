@@ -19,23 +19,19 @@ bind; everything else is hardening, defense-in-depth, or planned-work tracking.
 
 ## P0 — Remotely Relevant Hardening (fix before any non-loopback deployment)
 
-- `[ ]` Set socket read/write timeouts on accepted HTTP connections.
-  `serve` handles connections sequentially and `read_http_line`
-  (`crates/memoryd/src/main.rs:1117`) reads byte-by-byte with no
-  `set_read_timeout`/`set_write_timeout`, so one client that connects and
-  sends nothing freezes the daemon for all callers — before auth runs.
-- `[ ]` Handle connections off the accept loop (small thread pool or
-  thread-per-connection) so one stalled or slow client cannot serialize all
-  other requests behind it (`crates/memoryd/src/main.rs:355-364`).
-- `[ ]` Throttle failed bearer-token auth (per-route rate limits are already
-  designed in `docs/ARCHITECTURE-PLAN.md`). Failed auth writes an audit row
-  but token brute-force throughput is unbounded; `constant_time_eq` closes the
-  timing channel only.
-- `[ ]` Reject empty bearer tokens at startup. `Config::validate`
-  (`crates/memoryd-core/src/config.rs:30`) only checks `is_none()`, so
-  `MEMORYD_TOKEN=""` validates for a non-loopback bind (fails closed —
-  self-DoS, not a bypass — but should be a clear startup error). Consider a
-  minimum token length (e.g. 16 chars) while here.
+- `[x]` Set socket read/write timeouts on accepted HTTP connections.
+  Shipped: 10s read/write deadlines set immediately after accept
+  (`HTTP_READ_TIMEOUT`/`HTTP_WRITE_TIMEOUT`); timeouts surface as 408.
+- `[x]` Handle connections off the accept loop. Shipped: thread-per-connection
+  with a per-connection store, bounded by `MAX_CONCURRENT_CONNECTIONS` (64,
+  excess → 503) via an RAII connection counter (`serve_loop`).
+- `[x]` Throttle failed bearer-token auth. Shipped: per-IP fixed window
+  (`AuthThrottle`): 5 × 401 within 60s locks the peer for 60s (429 before any
+  request byte is read); success clears; map bounded at 1024 entries.
+- `[x]` Reject empty bearer tokens at startup. Shipped: `Config::validate`
+  rejects empty/whitespace tokens on any bind (`EmptyBearerToken`) and tokens
+  under 16 chars on non-loopback binds (`BearerTokenTooShort`,
+  `MIN_BEARER_TOKEN_LEN`).
 
 ## P1 — Secret Handling and Redaction Defense-in-Depth
 
