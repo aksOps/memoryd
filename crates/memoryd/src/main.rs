@@ -113,7 +113,7 @@ fn recall(cli: Cli, args: RecallArgs) -> Result<(), CliError> {
             memoryd_core::config::ConfigError::UnknownVectorIndex { kind: index_kind },
         ));
     }
-    let result = recall_with_mode(&store, &args, &index_kind)?;
+    let result = recall_with_mode(&store, &args, &index_kind, &cfg.providers.default_adapter)?;
     println!("{}", recall_response_json(&result)?);
     Ok(())
 }
@@ -147,14 +147,16 @@ fn import(cli: Cli, args: ImportArgs) -> Result<(), CliError> {
 }
 
 /// Run one dream pass now: consolidate pending raw_events into durable memories and
-/// decay due memories, under the wall-clock + spend caps (overridable via flags). The
-/// shipped `null` adapter consolidates lexically with no spend.
+/// decay due memories, under the wall-clock + spend caps (overridable via flags).
+/// The adapter comes from config (`local` default: in-process embeddings, lexical
+/// consolidation, no spend; `null`: fully inert).
 fn dream(cli: Cli, args: DreamArgs) -> Result<(), CliError> {
     let cfg = cli.config()?;
     cfg.validate()?;
 
     let mut store = Store::open(&cfg.db_path)?;
-    let adapter = memoryd_core::adapters::NullAdapter::new();
+    let adapter =
+        memoryd_core::adapters::AdapterKind::from_default_adapter(&cfg.providers.default_adapter);
     let opts = memoryd_core::dream::DreamOptions {
         trigger: "manual",
         budget_usd: args.budget_usd.unwrap_or(cfg.caps.paid_spend_cap_usd),
@@ -238,8 +240,9 @@ fn recall_with_mode(
     store: &Store,
     args: &RecallArgs,
     index_kind: &str,
+    adapter_kind: &str,
 ) -> Result<RecallOutput, StoreError> {
-    let adapter = memoryd_core::adapters::NullAdapter::new();
+    let adapter = memoryd_core::adapters::AdapterKind::from_default_adapter(adapter_kind);
     // Prefer durable memory + graph recall; fall back to raw-event recall when the
     // memory corpus has no match (e.g. before any dream run) so M2 behavior is preserved.
     let memory =
@@ -277,11 +280,13 @@ fn serve(cli: Cli) -> Result<(), CliError> {
 
     let worker_db = cfg.db_path.clone();
     let worker_caps = cfg.caps.clone();
+    let worker_adapter_kind = cfg.providers.default_adapter.clone();
     // Detached for M3: the worker runs for the process lifetime. Graceful shutdown
     // (draining in-flight jobs) and consolidating onto the planned single-writer
     // actor (ARCHITECTURE-PLAN s7.1/U5) are deferred; today it is a second writer.
     let _worker = std::thread::spawn(move || {
-        let adapter = memoryd_core::adapters::NullAdapter::new();
+        let adapter =
+            memoryd_core::adapters::AdapterKind::from_default_adapter(&worker_adapter_kind);
         let mut worker_store = match Store::open(&worker_db) {
             Ok(store) => store,
             Err(err) => {
@@ -306,12 +311,14 @@ fn serve(cli: Cli) -> Result<(), CliError> {
 
     let dream_db = cfg.db_path.clone();
     let dream_caps = cfg.caps.clone();
+    let dream_adapter_kind = cfg.providers.default_adapter.clone();
     // M6: a second governed background loop runs a dream pass on an interval
     // (consolidate + decay), capped by dream_wallclock_secs + paid_spend_cap_usd. Like
     // the embed worker it is a detached writer for now (the single-writer actor is
     // deferred, ARCHITECTURE-PLAN s7.1/U5).
     let _dream_worker = std::thread::spawn(move || {
-        let adapter = memoryd_core::adapters::NullAdapter::new();
+        let adapter =
+            memoryd_core::adapters::AdapterKind::from_default_adapter(&dream_adapter_kind);
         let mut dream_store = match Store::open(&dream_db) {
             Ok(store) => store,
             Err(err) => {
@@ -985,7 +992,7 @@ fn handle_http_request(
     };
     match request.path.as_str() {
         "/v1/capture" => handle_http_capture(store, body, cfg.caps.queue_depth_max),
-        "/v1/recall" => handle_http_recall(store, body),
+        "/v1/recall" => handle_http_recall(store, body, &cfg.providers.default_adapter),
         _ => HttpResponse::error(404, "not_found", "route not found"),
     }
 }
@@ -1019,7 +1026,7 @@ fn handle_http_capture(
     }
 }
 
-fn handle_http_recall(store: &Store, body: serde_json::Value) -> HttpResponse {
+fn handle_http_recall(store: &Store, body: serde_json::Value, adapter_kind: &str) -> HttpResponse {
     let args = match recall_request_from_json(body) {
         Ok(args) => args,
         Err(message) => return HttpResponse::error(422, "invalid_request", message),
@@ -1029,7 +1036,7 @@ fn handle_http_recall(store: &Store, body: serde_json::Value) -> HttpResponse {
     // CLI-only override, and HNSW is not yet a latency win (it builds per call over the
     // shortlist — see vectorindex.rs / ARCHITECTURE-PLAN §21.12). Revisit when the
     // persistent full-corpus index lands.
-    match recall_with_mode(store, &args, "brute-force") {
+    match recall_with_mode(store, &args, "brute-force", adapter_kind) {
         Ok(result) => HttpResponse::json(200, "OK", recall_response_value(&result)),
         Err(StoreError::InvalidRecallQuery) => {
             HttpResponse::error(422, "invalid_request", "query must contain searchable text")
@@ -1597,7 +1604,8 @@ mod tests {
             hops: 1,
             index_kind: None,
         };
-        let result = recall_with_mode(&store, &args, "brute-force").expect("recall succeeds");
+        let result =
+            recall_with_mode(&store, &args, "brute-force", "null").expect("recall succeeds");
 
         // No memory exists (no dream run), so recall falls back to raw-event recall.
         // The only shipped adapter is null, which self-degrades
@@ -2304,7 +2312,7 @@ mod tests {
             index_kind: None,
         };
         let RecallOutput::Memory(result) =
-            recall_with_mode(&store, &args, "brute-force").expect("recall")
+            recall_with_mode(&store, &args, "brute-force", "null").expect("recall")
         else {
             panic!("memory corpus exists, so recall should return memories");
         };
@@ -2332,7 +2340,7 @@ mod tests {
             index_kind: None,
         };
         let RecallOutput::Memory(direct) =
-            recall_with_mode(&store, &args0, "brute-force").expect("recall")
+            recall_with_mode(&store, &args0, "brute-force", "null").expect("recall")
         else {
             panic!("expected memories");
         };

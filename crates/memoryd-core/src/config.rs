@@ -31,7 +31,20 @@ impl Config {
             return Err(ConfigError::RemoteBindRequiresBearer { bind: self.bind });
         }
 
-        if self.providers.default_adapter != "null" && self.providers.paid_spend_cap_usd == 0.0 {
+        if !matches!(
+            self.providers.default_adapter.as_str(),
+            "null" | "local" | "openai_compat" | "ollama" | "opencode"
+        ) {
+            return Err(ConfigError::UnknownAdapter {
+                adapter: self.providers.default_adapter.clone(),
+            });
+        }
+
+        // 'null' and 'local' run in-process and spend nothing; only remote adapters
+        // need a non-zero paid budget (H5).
+        if !matches!(self.providers.default_adapter.as_str(), "null" | "local")
+            && self.providers.paid_spend_cap_usd == 0.0
+        {
             return Err(ConfigError::PaidProviderRequiresBudget {
                 adapter: self.providers.default_adapter.clone(),
             });
@@ -87,7 +100,7 @@ pub struct ProviderConfig {
 impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
-            default_adapter: "null".to_string(),
+            default_adapter: "local".to_string(),
             paid_spend_cap_usd: 0.0,
         }
     }
@@ -98,6 +111,7 @@ pub enum ConfigError {
     RemoteBindRequiresBearer { bind: SocketAddr },
     PaidProviderRequiresBudget { adapter: String },
     UnknownVectorIndex { kind: String },
+    UnknownAdapter { adapter: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -115,6 +129,9 @@ impl fmt::Display for ConfigError {
                     f,
                     "unknown vector index kind: {kind} (expected brute-force or hnsw)"
                 )
+            }
+            Self::UnknownAdapter { adapter } => {
+                write!(f, "unknown provider adapter: {adapter}")
             }
         }
     }
@@ -134,11 +151,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_is_localhost_null_provider_zero_spend() {
+    fn default_config_is_localhost_local_provider_zero_spend() {
         let cfg = Config::with_db_path(PathBuf::from("memoryd.db"));
 
         assert_eq!(cfg.bind.to_string(), DEFAULT_BIND);
-        assert_eq!(cfg.providers.default_adapter, "null");
+        assert_eq!(cfg.providers.default_adapter, "local");
         assert_eq!(cfg.caps.worker_concurrency, 1);
         assert_eq!(cfg.caps.paid_spend_cap_usd, 0.0);
         assert_eq!(cfg.caps.lease_visibility_secs, 30);
@@ -159,6 +176,31 @@ mod tests {
 
         cfg.bearer_token = Some("test-token".to_string());
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_adapter_rules() {
+        let mut cfg = Config::with_db_path(PathBuf::from("memoryd.db"));
+        for free in ["null", "local"] {
+            cfg.providers.default_adapter = free.to_string();
+            cfg.providers.paid_spend_cap_usd = 0.0;
+            assert!(cfg.validate().is_ok(), "{free} is free, no budget needed");
+        }
+        cfg.providers.default_adapter = "ollama".to_string();
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::PaidProviderRequiresBudget { .. })
+        ));
+        cfg.providers.paid_spend_cap_usd = 1.0;
+        assert!(
+            cfg.validate().is_ok(),
+            "remote adapter with budget validates"
+        );
+        cfg.providers.default_adapter = "bogus".to_string();
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::UnknownAdapter { .. })
+        ));
     }
 
     #[test]

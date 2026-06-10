@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 pub const CANONICAL_TABLES: [&str; 13] = [
     "sessions",
@@ -1736,11 +1736,8 @@ impl Store {
         if let Some(vector) = self.embedding_vector("query", &owner_id, model_id)? {
             return Ok(Some(vector));
         }
-        let vectors = match adapter.embed(std::slice::from_ref(&query.to_string())) {
-            Ok(vectors) => vectors,
-            Err(_) => return Ok(None),
-        };
-        let Some(vector) = vectors.into_iter().next().filter(|v| !v.is_empty()) else {
+        // embed_query (not embed): asymmetric-retrieval adapters prefix queries.
+        let Some(vector) = adapter.embed_query(query).ok().filter(|v| !v.is_empty()) else {
             return Ok(None);
         };
         // Cache the embedding and its usage ledger row atomically (unchecked_transaction
@@ -1878,11 +1875,15 @@ impl Store {
         &mut self,
         job_id: i64,
         raw_event_id: i64,
-        model_id: &str,
+        provider: EmbedProvider<'_>,
         vector: &[f32],
         prompt_tokens: i64,
         now_ms: i64,
     ) -> Result<(), StoreError> {
+        let EmbedProvider {
+            adapter_id,
+            model_id,
+        } = provider;
         let dim = i64::try_from(vector.len()).unwrap_or(0);
         let mut bytes = Vec::with_capacity(vector.len() * 4);
         for value in vector {
@@ -1904,8 +1905,8 @@ impl Store {
         tx.execute(
             "INSERT INTO provider_usage
                 (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
-             VALUES (?1, 'null', ?2, 'embed', ?3, 0, 0.0, ?4)",
-            params![now_ms, model_id, prompt_tokens, job_id],
+             VALUES (?1, ?2, ?3, 'embed', ?4, 0, 0.0, ?5)",
+            params![now_ms, adapter_id, model_id, prompt_tokens, job_id],
         )?;
         tx.execute(
             "UPDATE jobs SET state = 'done', finished_at = ?2 WHERE id = ?1",
@@ -2728,8 +2729,33 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
         )?;
     }
 
+    let applied_0007 = tx
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [7],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+
+    if !applied_0007 {
+        tx.execute_batch(MIGRATION_0007)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (?1, ?2, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
+            (7, "0007_provider_usage_local_adapter"),
+        )?;
+    }
+
     tx.commit()?;
     Ok(())
+}
+
+/// Provider identity recorded with a completed embed job (ledger + embeddings row).
+#[derive(Debug, Clone, Copy)]
+pub struct EmbedProvider<'a> {
+    pub adapter_id: &'a str,
+    pub model_id: &'a str,
 }
 
 const MIGRATION_0001: &str = r#"
@@ -3171,6 +3197,29 @@ CREATE INDEX memories_session ON memories(source_session) WHERE source_session I
 
 const MIGRATION_0006: &str = r#"
 CREATE INDEX approvals_target ON approvals(target_type, target_ref);
+"#;
+
+// Admit the in-process 'local' adapter into the provider_usage ledger. SQLite cannot
+// alter a CHECK constraint, so the table is rebuilt in place (same columns, same
+// rowids, same index) with the widened adapter vocabulary.
+const MIGRATION_0007: &str = r#"
+CREATE TABLE provider_usage_new (
+    id INTEGER PRIMARY KEY,
+    ts INTEGER NOT NULL,
+    adapter TEXT NOT NULL CHECK (adapter IN ('openai_compat', 'ollama', 'opencode', 'null', 'local')),
+    model_id TEXT NOT NULL,
+    op TEXT NOT NULL CHECK (op IN ('embed', 'complete', 'embed:dry', 'complete:dry')),
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    est_cost REAL NOT NULL DEFAULT 0.0,
+    job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL
+) STRICT;
+INSERT INTO provider_usage_new
+    SELECT id, ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id
+    FROM provider_usage;
+DROP TABLE provider_usage;
+ALTER TABLE provider_usage_new RENAME TO provider_usage;
+CREATE INDEX provider_usage_ts_adapter ON provider_usage(ts, adapter);
 "#;
 
 #[cfg(test)]
@@ -3914,7 +3963,10 @@ mod tests {
             .complete_embed_job(
                 leased[0].job_id,
                 leased[0].raw_event_id,
-                adapter.model_id(),
+                EmbedProvider {
+                    adapter_id: adapter.id(),
+                    model_id: adapter.model_id(),
+                },
                 &vectors[0],
                 prompt_token_estimate(&leased[0].content),
                 5000,
@@ -4025,7 +4077,10 @@ mod tests {
                             .complete_embed_job(
                                 job.job_id,
                                 job.raw_event_id,
-                                adapter.model_id(),
+                                EmbedProvider {
+                                    adapter_id: adapter.id(),
+                                    model_id: adapter.model_id(),
+                                },
                                 &vectors[0],
                                 prompt_token_estimate(&job.content),
                                 10_000,
@@ -6097,6 +6152,158 @@ mod tests {
         assert_eq!(
             hnsw_ids, oracle_ids,
             "HNSW recall matches the BruteForce oracle"
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn migration_0007_rebuild_preserves_rows_and_admits_local() {
+        // Drive the rebuild SQL directly against a v1-vocabulary table with data in
+        // place, proving rows survive and the widened CHECK admits 'local' only.
+        let path = temp_db_path("mig-0007");
+        let conn = Connection::open(&path).expect("conn opens");
+        conn.execute_batch(MIGRATION_0001).expect("v1 schema");
+        conn.execute(
+            "INSERT INTO provider_usage
+                (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
+             VALUES (1000, 'null', 'null-hash-32', 'embed', 3, 0, 0.0, NULL)",
+            [],
+        )
+        .expect("seed old-vocab row");
+        conn.execute_batch(MIGRATION_0007)
+            .expect("rebuild succeeds");
+
+        let (count, adapter): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MIN(adapter) FROM provider_usage",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("rows queryable");
+        assert_eq!(count, 1, "existing ledger rows survive the rebuild");
+        assert_eq!(adapter, "null");
+
+        conn.execute(
+            "INSERT INTO provider_usage
+                (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
+             VALUES (2000, 'local', 'bge-small-en-v1.5', 'embed', 3, 0, 0.0, NULL)",
+            [],
+        )
+        .expect("'local' is admitted after rebuild");
+        let bogus = conn.execute(
+            "INSERT INTO provider_usage
+                (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
+             VALUES (3000, 'bogus', 'x', 'embed', 0, 0, 0.0, NULL)",
+            [],
+        );
+        assert!(bogus.is_err(), "unknown adapters still rejected by CHECK");
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn local_adapter_embeds_384_dim_with_local_ledger_row() {
+        use crate::adapters::{LocalAdapter, ProviderAdapter, prompt_token_estimate};
+        let path = temp_db_path("local-embed");
+        let mut store = Store::open(&path).expect("store opens");
+        let (job_id, raw_event_id) = seed_embed_job(
+            &mut store,
+            100,
+            1000,
+            "I prefer dark mode in all my editors",
+        );
+
+        let leased = store.lease_embed_jobs(10, 5000, 60_000).expect("lease");
+        assert_eq!(leased.len(), 1);
+        let adapter = LocalAdapter;
+        let vectors = adapter
+            .embed(std::slice::from_ref(&leased[0].content))
+            .expect("local embed succeeds");
+        store
+            .complete_embed_job(
+                job_id,
+                raw_event_id,
+                EmbedProvider {
+                    adapter_id: adapter.id(),
+                    model_id: adapter.model_id(),
+                },
+                &vectors[0],
+                prompt_token_estimate(&leased[0].content),
+                5000,
+            )
+            .expect("complete succeeds");
+
+        let (dim, vector_len, model_id): (i64, i64, String) = store
+            .conn
+            .query_row(
+                "SELECT dim, length(vector), model_id FROM embeddings WHERE owner_id = ?1",
+                params![raw_event_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("embedding row exists");
+        assert_eq!(dim, 384, "bge-small dimension");
+        assert_eq!(vector_len, 384 * 4, "f32 little-endian blob");
+        assert_eq!(model_id, "bge-small-en-v1.5");
+
+        let ledger_adapter: String = store
+            .conn
+            .query_row(
+                "SELECT adapter FROM provider_usage WHERE job_id = ?1",
+                params![job_id],
+                |row| row.get(0),
+            )
+            .expect("ledger row exists");
+        assert_eq!(ledger_adapter, "local", "ledger names the real provider");
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn recall_semantic_with_local_adapter_ranks_semantic_neighbor_first() {
+        use crate::adapters::{LocalAdapter, ProviderAdapter, prompt_token_estimate};
+        use crate::vectorindex::BruteForce;
+        let path = temp_db_path("local-recall");
+        let mut store = Store::open(&path).expect("store opens");
+        let adapter = LocalAdapter;
+
+        let texts = [
+            "the user prefers dark themes in every editor",
+            "the quarterly finance report is due next week",
+        ];
+        for (i, text) in texts.iter().enumerate() {
+            let (job_id, raw_event_id) =
+                seed_embed_job(&mut store, 100 + i as i64, 1000 + i as i64, text);
+            let leased = store.lease_embed_jobs(10, 5000, 60_000).expect("lease");
+            let job = leased
+                .iter()
+                .find(|j| j.job_id == job_id)
+                .expect("seeded job leased");
+            let vectors = adapter
+                .embed(std::slice::from_ref(&job.content))
+                .expect("embed");
+            store
+                .complete_embed_job(
+                    job_id,
+                    raw_event_id,
+                    EmbedProvider {
+                        adapter_id: adapter.id(),
+                        model_id: adapter.model_id(),
+                    },
+                    &vectors[0],
+                    prompt_token_estimate(&job.content),
+                    5000,
+                )
+                .expect("complete");
+        }
+
+        // The query FTS-matches the dark-theme row; the rerank must keep semantic
+        // mode (real signal, not degraded) and surface it.
+        let result = store
+            .recall_semantic("dark theme preference", 5, &adapter, &BruteForce, 6000)
+            .expect("semantic recall");
+        assert_eq!(result.mode, "semantic", "real signal => semantic mode");
+        assert!(!result.degraded);
+        assert!(
+            !result.hits.is_empty(),
+            "semantic recall returns the dark-theme memory"
         );
         cleanup_db_files(&path);
     }

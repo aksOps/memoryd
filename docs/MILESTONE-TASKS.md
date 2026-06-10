@@ -183,6 +183,14 @@ increment behind the in-place `ProviderAdapter` seam.
   enqueue at the cap; covered by existing regression tests).
 - `[x]` Add fixed worker with `Embed` active first (the only active worker this slice).
 - `[x]` Add `null` provider adapter for offline CI and default no-spend mode.
+- `[x]` Add `local` in-process embedding adapter (2026-06-10): bge-small-en-v1.5
+  fp32 ONNX via tract (pure Rust), model + tokenizer `include_bytes!`-embedded with
+  SHA-256 pins (`scripts/fetch-embed-model.sh` + `build.rs`); 384-dim CLS-pooled
+  L2-normalized vectors; bge query prefix via new defaulted `embed_query` trait
+  method; selected by `providers.default_adapter` (now the **default**); migration
+  0007 widens the `provider_usage.adapter` CHECK; `complete_embed_job` now records
+  the real adapter id. Quality evidence (SciFact, 5183 docs/300 queries): fused
+  R@10 0.851 / MRR 0.694 vs lexical 0.784 / 0.629.
 - `[ ]` Add `openai_compat` provider adapter behind explicit config. (Deferred.)
 - `[ ]` Add `ollama` provider adapter behind explicit config. (Deferred.)
 - `[ ]` Add provider reachability probe and failover order. (Deferred — single
@@ -190,8 +198,8 @@ increment behind the in-place `ProviderAdapter` seam.
 - `[x]` Write `embeddings` rows from the `Embed` worker.
 - `[x]` Write `provider_usage` rows for every embed provider call.
 - `[x]` Block paid calls at the default zero spend cap (config validation rejects a
-  non-`null` default adapter when `paid_spend_cap_usd == 0`; the `null` adapter records
-  `est_cost = 0`). The *runtime* ledger-based spend ceiling is deferred (see the caps
+  remote default adapter when `paid_spend_cap_usd == 0`; `null` and `local` are
+  free in-process adapters recording `est_cost = 0`). The *runtime* ledger-based spend ceiling is deferred (see the caps
   line above).
 - `[ ]` Add `setup` or equivalent provider config/reachability command. (Deferred
   with the remote adapters.)

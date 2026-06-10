@@ -4,10 +4,18 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [dependencies]
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 serde_json = { version = "1.0.150", default-features = false, features = ["std"] }
+# In-process embedding (ARCHITECTURE-PLAN local-adapter callout): pure-Rust ONNX
+# inference + tokenizer. No C/FFI backends (no ort, no onig).
+tract-onnx = "0.23"
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+
+[build-dependencies]
+sha2 = { version = "0.10", default-features = false }
 
 [lints]
 workspace = true

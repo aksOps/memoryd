@@ -111,6 +111,13 @@ Implemented now:
   The trait is stateless so HNSW builds per call — not yet a latency win over the ≤256
   shortlist; the persistent full-corpus index (the real win) and a large perf fixture
   are deferred to M10.
+- `local` in-process embedding adapter (2026-06-10): bge-small-en-v1.5 fp32 ONNX
+  executed by tract (pure Rust, no network/GPU/C), model `include_bytes!`-embedded
+  with SHA-256 pins fetched at build time (`scripts/fetch-embed-model.sh`); now the
+  default adapter, giving recall a real 384-dim semantic signal (SciFact fused
+  R@10 0.851 vs 0.784 lexical). New deps: `tract-onnx`, `tokenizers` (fancy-regex);
+  this amends the original "no model runtime" stance for embeddings only (owner
+  decision; chat/summarization still requires a remote adapter).
 - CI/security gates for format, build, clippy, tests, dependency policy,
   advisory audit, and SBOM generation.
 - OpenSSF Best Practices passing evidence.
