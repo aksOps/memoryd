@@ -285,6 +285,8 @@ pub fn dream_once<A: ProviderAdapter>(
 ) -> Result<DreamOutcome, StoreError> {
     let start = clock();
     let run_id = store.create_dream_run(opts.trigger, start)?;
+    // Saturation here is a now-unreachable backstop: Config::validate and the
+    // --max-seconds CLI bound both reject values over MAX_DURATION_SECS.
     let max_ms = i64::try_from(opts.max_seconds)
         .unwrap_or(i64::MAX)
         .saturating_mul(1000);

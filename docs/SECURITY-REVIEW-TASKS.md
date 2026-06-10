@@ -56,17 +56,16 @@ bind; everything else is hardening, defense-in-depth, or planned-work tracking.
 
 ## P2 — HTTP Protocol and Input-Handling Correctness
 
-- `[ ]` Reject `Transfer-Encoding: chunked` explicitly (`501` or `411`).
-  Today a chunked request parses as a zero-length body and returns a
-  confusing JSON error (`crates/memoryd/src/main.rs:1048-1115`).
-- `[ ]` Make `ts_ms` validation consistent in `capture_event_from_json`
-  (`crates/memoryd/src/main.rs:1175-1180`): a string value is silently
-  replaced with "now" while other non-number types are rejected; either
-  reject strings too or parse them.
-- `[ ]` Bound large duration/visibility config values instead of saturating.
-  Huge `max_seconds` (`crates/memoryd-core/src/dream.rs:288`) or
-  `lease_visibility_secs` (`crates/memoryd-core/src/worker.rs:28`) saturate to
-  `i64::MAX`, silently meaning "no cap"; validation should reject (e.g.) >24h.
+- `[x]` Reject `Transfer-Encoding: chunked` explicitly. Shipped: requests
+  carrying a chunked transfer-encoding header get `501 not_implemented`
+  ("send Content-Length") right after auth, before any body parsing.
+- `[x]` Make `ts_ms` validation consistent. Shipped: the silent string→now
+  arm is gone; any non-integer `ts_ms`/`ts` (including numeric strings) is
+  rejected with 422 "ts_ms must be integer milliseconds".
+- `[x]` Bound large duration/visibility config values. Shipped:
+  `Config::validate` rejects `dream_wallclock_secs`/`lease_visibility_secs`
+  over `MAX_DURATION_SECS` (24h), and `dream --max-seconds` enforces the same
+  bound at parse; the saturating conversions remain as commented backstops.
 
 ## P3 — Robustness and Code-Quality Improvements
 

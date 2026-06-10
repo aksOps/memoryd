@@ -7,6 +7,10 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:7077";
 /// the entire security boundary for remote callers, so trivially guessable
 /// values are rejected at startup; loopback dev tokens stay unrestricted.
 pub const MIN_BEARER_TOKEN_LEN: usize = 16;
+/// Upper bound (24h) on duration caps. Larger values used to saturate the
+/// downstream millisecond conversions to i64::MAX — silently meaning "no cap
+/// at all" — so they are rejected at validation instead.
+pub const MAX_DURATION_SECS: u64 = 86_400;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -72,6 +76,19 @@ impl Config {
             });
         }
 
+        for (field, value) in [
+            ("dream_wallclock_secs", self.caps.dream_wallclock_secs),
+            ("lease_visibility_secs", self.caps.lease_visibility_secs),
+        ] {
+            if value > MAX_DURATION_SECS {
+                return Err(ConfigError::CapDurationTooLarge {
+                    field,
+                    value,
+                    max: MAX_DURATION_SECS,
+                });
+            }
+        }
+
         Ok(())
     }
 }
@@ -124,12 +141,27 @@ impl Default for ProviderConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigError {
-    RemoteBindRequiresBearer { bind: SocketAddr },
+    RemoteBindRequiresBearer {
+        bind: SocketAddr,
+    },
     EmptyBearerToken,
-    BearerTokenTooShort { len: usize },
-    PaidProviderRequiresBudget { adapter: String },
-    UnknownVectorIndex { kind: String },
-    UnknownAdapter { adapter: String },
+    BearerTokenTooShort {
+        len: usize,
+    },
+    CapDurationTooLarge {
+        field: &'static str,
+        value: u64,
+        max: u64,
+    },
+    PaidProviderRequiresBudget {
+        adapter: String,
+    },
+    UnknownVectorIndex {
+        kind: String,
+    },
+    UnknownAdapter {
+        adapter: String,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -149,6 +181,9 @@ impl fmt::Display for ConfigError {
                     f,
                     "bearer token must be at least {MIN_BEARER_TOKEN_LEN} characters for a non-loopback bind (got {len})"
                 )
+            }
+            Self::CapDurationTooLarge { field, value, max } => {
+                write!(f, "{field} must be at most {max} seconds (got {value})")
             }
             Self::PaidProviderRequiresBudget { adapter } => write!(
                 f,
@@ -242,6 +277,40 @@ mod tests {
         let mut cfg = Config::with_db_path(PathBuf::from("memoryd.db"));
         cfg.bearer_token = Some("dev".to_string());
         assert!(cfg.validate().is_ok(), "loopback dev tokens stay legal");
+    }
+
+    #[test]
+    fn validate_rejects_oversized_dream_wallclock() {
+        let mut cfg = Config::with_db_path(PathBuf::from("memoryd.db"));
+        cfg.caps.dream_wallclock_secs = MAX_DURATION_SECS + 1;
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::CapDurationTooLarge {
+                field: "dream_wallclock_secs",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_oversized_lease_visibility() {
+        let mut cfg = Config::with_db_path(PathBuf::from("memoryd.db"));
+        cfg.caps.lease_visibility_secs = MAX_DURATION_SECS + 1;
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::CapDurationTooLarge {
+                field: "lease_visibility_secs",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_durations_at_bound() {
+        let mut cfg = Config::with_db_path(PathBuf::from("memoryd.db"));
+        cfg.caps.dream_wallclock_secs = MAX_DURATION_SECS;
+        cfg.caps.lease_visibility_secs = MAX_DURATION_SECS;
+        assert!(cfg.validate().is_ok(), "exactly 24h validates");
     }
 
     #[test]

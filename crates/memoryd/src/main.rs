@@ -740,9 +740,19 @@ impl Cli {
                         return Err(CliError::UnknownFlag(token));
                     };
                     let value = next_string(&mut args, "--max-seconds")?;
-                    dream.max_seconds = Some(value.parse::<u64>().map_err(|_| {
+                    let seconds = value.parse::<u64>().map_err(|_| {
                         CliError::InvalidNumberFlag("--max-seconds", value.to_string())
-                    })?);
+                    })?;
+                    if seconds > memoryd_core::config::MAX_DURATION_SECS {
+                        return Err(CliError::Config(
+                            memoryd_core::config::ConfigError::CapDurationTooLarge {
+                                field: "--max-seconds",
+                                value: seconds,
+                                max: memoryd_core::config::MAX_DURATION_SECS,
+                            },
+                        ));
+                    }
+                    dream.max_seconds = Some(seconds);
                 }
                 "--now" => {
                     if !matches!(command, Command::Dream(_)) {
@@ -1208,6 +1218,19 @@ fn handle_http_request(
         return HttpResponse::error(401, "unauthorized", "authorization failed");
     }
 
+    // The parser only supports Content-Length framing; a chunked request would
+    // otherwise parse as a zero-length body and return a misleading JSON error.
+    if header_value(&request.headers, "transfer-encoding")
+        .map(|value| value.to_ascii_lowercase().contains("chunked"))
+        .unwrap_or(false)
+    {
+        return HttpResponse::error(
+            501,
+            "not_implemented",
+            "Transfer-Encoding is not supported; send Content-Length",
+        );
+    }
+
     if request.path != "/v1/capture" && request.path != "/v1/recall" {
         return HttpResponse::error(404, "not_found", "route not found");
     }
@@ -1430,7 +1453,6 @@ fn capture_event_from_json(value: serde_json::Value) -> Result<NewRawEvent, &'st
         .unwrap_or_else(|| serde_json::json!({}));
     let ts_ms = match object.get("ts_ms").or_else(|| object.get("ts")) {
         Some(value) if value.is_number() => value.as_i64().ok_or("timestamp is out of range")?,
-        Some(value) if value.is_string() => unix_ms_now(),
         Some(_) => return Err("ts_ms must be integer milliseconds"),
         None => unix_ms_now(),
     };
@@ -2358,6 +2380,81 @@ mod tests {
         assert_eq!(table_rows(&stats, "jobs"), 0);
 
         cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn http_chunked_transfer_encoding_returns_501() {
+        let path = temp_db_path("http-chunked");
+        let cfg = Config::with_db_path(path.clone());
+        let mut store = Store::open(&path).expect("store opens");
+
+        let response = handle_http_request(
+            &mut store,
+            &cfg,
+            Some("127.0.0.1:65000".parse().expect("peer parses")),
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/v1/capture".to_string(),
+                headers: vec![
+                    ("content-type".to_string(), "application/json".to_string()),
+                    ("transfer-encoding".to_string(), "Chunked".to_string()),
+                ],
+                body: Vec::new(),
+            },
+        );
+
+        assert_eq!(response.status, 501);
+        assert_eq!(response.body["error"]["code"], "not_implemented");
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn http_capture_rejects_string_ts_ms() {
+        let path = temp_db_path("http-string-ts");
+        let cfg = Config::with_db_path(path.clone());
+        let mut store = Store::open(&path).expect("store opens");
+
+        let response = handle_http_request(
+            &mut store,
+            &cfg,
+            Some("127.0.0.1:65000".parse().expect("peer parses")),
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/v1/capture".to_string(),
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: br#"{
+                    "session_id":"session-1",
+                    "agent":"claude",
+                    "source":"tool_result",
+                    "kind":"observation",
+                    "payload":{"text":"x"},
+                    "ts_ms":"1234"
+                }"#
+                .to_vec(),
+            },
+        );
+
+        assert_eq!(response.status, 422);
+        assert_eq!(
+            response.body["error"]["message"],
+            "ts_ms must be integer milliseconds"
+        );
+        let stats = store.table_stats().expect("table stats");
+        assert_eq!(table_rows(&stats, "raw_events"), 0);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn dream_cli_rejects_max_seconds_over_one_day() {
+        let result = Cli::parse(["memoryd", "dream", "--max-seconds", "86401"].map(OsString::from));
+        assert!(matches!(
+            result,
+            Err(CliError::Config(
+                memoryd_core::config::ConfigError::CapDurationTooLarge { .. }
+            ))
+        ));
     }
 
     #[test]

@@ -109,6 +109,11 @@ Authorization: Bearer <token>
 `Authorization` is required when a token is configured. Loopback calls may omit
 authorization when no token is configured.
 
+Requests must be framed with `Content-Length`; `Transfer-Encoding: chunked` is
+not supported and is rejected with `501 not_implemented`. `ts_ms` (or `ts`)
+must be integer milliseconds when present — any other JSON type, including a
+numeric string, is rejected with `422`; omitting it uses the server clock.
+
 Request body:
 
 ```json
