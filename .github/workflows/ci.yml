@@ -18,6 +18,9 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal --component clippy --component rustfmt
 
+      - name: Fetch embed model (sha256-pinned; build.rs re-verifies)
+        run: bash scripts/fetch-embed-model.sh
+
       - name: Format check
         run: cargo fmt --all -- --check
 

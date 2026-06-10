@@ -41,7 +41,10 @@ pub fn tick_embed<A: ProviderAdapter>(
                     store.complete_embed_job(
                         job.job_id,
                         job.raw_event_id,
-                        adapter.model_id(),
+                        crate::store::EmbedProvider {
+                            adapter_id: adapter.id(),
+                            model_id: adapter.model_id(),
+                        },
                         &vector,
                         prompt_token_estimate(&job.content),
                         now_ms,
