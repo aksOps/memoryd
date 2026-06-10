@@ -1,0 +1,7 @@
+# cargo-audit policy (CI runs `cargo-audit audit --deny warnings`).
+[advisories]
+# RUSTSEC-2024-0436: `paste` is unmaintained (archived by its author). It is a
+# transitive dep of tract (in-process embedding runtime) and a compile-time
+# proc-macro only — it contributes no code to the shipped binary and carries no
+# vulnerability. Re-evaluate when tract swaps it out upstream.
+ignore = ["RUSTSEC-2024-0436"]
