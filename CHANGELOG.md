@@ -30,5 +30,10 @@ The project uses Semantic Versioning before the first stable release.
   bind) exposing `memory_remember`, `memory_recall`, `memory_stats`, and the
   new `memory_graph` association-graph neighbors tool backed by
   `Store::memory_neighbors`.
+- Added the generic `openai_compat` provider adapter (embeddings + chat
+  completions against any OpenAI-shaped base URL: api.openai.com, Ollama,
+  vLLM, LM Studio), replacing the provider-specific `ollama`/`opencode` stub
+  names. Opt-in via `--adapter`/`MEMORYD_ADAPTER` + `MEMORYD_OPENAI_*` env
+  settings; requires a non-zero `MEMORYD_SPEND_CAP_USD`; rustls TLS.
 
 No public runtime vulnerabilities have been fixed in a release yet.

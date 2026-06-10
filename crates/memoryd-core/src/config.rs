@@ -34,6 +34,66 @@ impl Config {
         }
     }
 
+    /// Apply provider settings from process environment variables:
+    /// `MEMORYD_ADAPTER` (null|local|openai_compat), `MEMORYD_SPEND_CAP_USD`,
+    /// and the `MEMORYD_OPENAI_*` family (BASE_URL, API_KEY, API_KEY_FILE,
+    /// EMBED_MODEL, CHAT_MODEL, USD_PER_1K). Call before [`Config::validate`].
+    pub fn apply_env(&mut self) -> Result<(), ConfigError> {
+        self.apply_env_from(&|name| std::env::var(name).ok())
+    }
+
+    /// Env application with an injected lookup so tests avoid process-global
+    /// environment mutation.
+    pub fn apply_env_from(
+        &mut self,
+        get: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), ConfigError> {
+        if let Some(adapter) = get("MEMORYD_ADAPTER") {
+            self.providers.default_adapter = adapter;
+        }
+        if let Some(cap) = get("MEMORYD_SPEND_CAP_USD") {
+            let cap = cap
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .ok_or(ConfigError::InvalidNumberEnv {
+                    var: "MEMORYD_SPEND_CAP_USD",
+                })?;
+            self.providers.paid_spend_cap_usd = cap;
+            self.caps.paid_spend_cap_usd = cap;
+        }
+        if let Some(base_url) = get("MEMORYD_OPENAI_BASE_URL") {
+            self.providers.openai_compat.base_url = base_url.trim_end_matches('/').to_string();
+        }
+        // API_KEY_FILE wins over API_KEY (same hygiene rationale as
+        // --token-file: files can be chmod 0600, environments leak more ways).
+        if let Some(key) = get("MEMORYD_OPENAI_API_KEY") {
+            self.providers.openai_compat.api_key = Some(key);
+        }
+        if let Some(path) = get("MEMORYD_OPENAI_API_KEY_FILE") {
+            let contents = std::fs::read_to_string(&path)
+                .map_err(|_| ConfigError::ApiKeyFileUnreadable { path })?;
+            self.providers.openai_compat.api_key =
+                Some(contents.trim_end_matches(['\r', '\n']).to_string());
+        }
+        if let Some(model) = get("MEMORYD_OPENAI_EMBED_MODEL") {
+            self.providers.openai_compat.embed_model = model;
+        }
+        if let Some(model) = get("MEMORYD_OPENAI_CHAT_MODEL") {
+            self.providers.openai_compat.chat_model = model;
+        }
+        if let Some(price) = get("MEMORYD_OPENAI_USD_PER_1K") {
+            self.providers.openai_compat.usd_per_1k_prompt_tokens = price
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .ok_or(ConfigError::InvalidNumberEnv {
+                    var: "MEMORYD_OPENAI_USD_PER_1K",
+                })?;
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if !is_loopback(self.bind.ip()) && self.bearer_token.is_none() {
             return Err(ConfigError::RemoteBindRequiresBearer { bind: self.bind });
@@ -51,13 +111,33 @@ impl Config {
             }
         }
 
+        // One generic remote adapter, not provider-specific names: Ollama,
+        // vLLM, LM Studio, etc. are reached via `openai_compat` + base_url.
         if !matches!(
             self.providers.default_adapter.as_str(),
-            "null" | "local" | "openai_compat" | "ollama" | "opencode"
+            "null" | "local" | "openai_compat"
         ) {
             return Err(ConfigError::UnknownAdapter {
                 adapter: self.providers.default_adapter.clone(),
             });
+        }
+
+        if self.providers.default_adapter == "openai_compat" {
+            let base = self.providers.openai_compat.base_url.as_str();
+            if !(base.starts_with("http://") || base.starts_with("https://")) {
+                return Err(ConfigError::InvalidBaseUrl {
+                    base_url: base.to_string(),
+                });
+            }
+            if self
+                .providers
+                .openai_compat
+                .api_key
+                .as_deref()
+                .is_some_and(|key| key.trim().is_empty())
+            {
+                return Err(ConfigError::EmptyApiKey);
+            }
         }
 
         // 'null' and 'local' run in-process and spend nothing; only remote adapters
@@ -128,6 +208,7 @@ impl Caps {
 pub struct ProviderConfig {
     pub default_adapter: String,
     pub paid_spend_cap_usd: f64,
+    pub openai_compat: OpenAiCompatConfig,
 }
 
 impl Default for ProviderConfig {
@@ -135,6 +216,38 @@ impl Default for ProviderConfig {
         Self {
             default_adapter: "local".to_string(),
             paid_spend_cap_usd: 0.0,
+            openai_compat: OpenAiCompatConfig::default(),
+        }
+    }
+}
+
+/// Settings for the generic OpenAI-compatible adapter. Provider-agnostic by
+/// design: any endpoint speaking the OpenAI embeddings/chat-completions wire
+/// shape works (api.openai.com, Ollama's `/v1`, vLLM, LM Studio, llama.cpp).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenAiCompatConfig {
+    /// Base URL up to and including the API root, e.g.
+    /// `https://api.openai.com/v1` or `http://127.0.0.1:11434/v1`.
+    pub base_url: String,
+    /// Bearer key sent as `Authorization: Bearer <key>`. `None` for local
+    /// runtimes that do not authenticate.
+    pub api_key: Option<String>,
+    /// Model for `POST {base}/embeddings`.
+    pub embed_model: String,
+    /// Model for `POST {base}/chat/completions` (dream summarization).
+    pub chat_model: String,
+    /// Price signal for the dream spend governor; 0.0 = free (local runtimes).
+    pub usd_per_1k_prompt_tokens: f64,
+}
+
+impl Default for OpenAiCompatConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: None,
+            embed_model: "text-embedding-3-small".to_string(),
+            chat_model: "gpt-4o-mini".to_string(),
+            usd_per_1k_prompt_tokens: 0.0,
         }
     }
 }
@@ -152,6 +265,16 @@ pub enum ConfigError {
         field: &'static str,
         value: u64,
         max: u64,
+    },
+    InvalidBaseUrl {
+        base_url: String,
+    },
+    EmptyApiKey,
+    ApiKeyFileUnreadable {
+        path: String,
+    },
+    InvalidNumberEnv {
+        var: &'static str,
     },
     PaidProviderRequiresBudget {
         adapter: String,
@@ -184,6 +307,24 @@ impl fmt::Display for ConfigError {
             }
             Self::CapDurationTooLarge { field, value, max } => {
                 write!(f, "{field} must be at most {max} seconds (got {value})")
+            }
+            Self::InvalidBaseUrl { base_url } => {
+                write!(
+                    f,
+                    "openai_compat base URL must start with http:// or https:// (got {base_url})"
+                )
+            }
+            Self::EmptyApiKey => {
+                write!(
+                    f,
+                    "openai_compat API key must not be empty (unset it for keyless local runtimes)"
+                )
+            }
+            Self::ApiKeyFileUnreadable { path } => {
+                write!(f, "could not read API key file {path}")
+            }
+            Self::InvalidNumberEnv { var } => {
+                write!(f, "{var} must be a non-negative number")
             }
             Self::PaidProviderRequiresBudget { adapter } => write!(
                 f,
@@ -321,7 +462,7 @@ mod tests {
             cfg.providers.paid_spend_cap_usd = 0.0;
             assert!(cfg.validate().is_ok(), "{free} is free, no budget needed");
         }
-        cfg.providers.default_adapter = "ollama".to_string();
+        cfg.providers.default_adapter = "openai_compat".to_string();
         assert!(matches!(
             cfg.validate(),
             Err(ConfigError::PaidProviderRequiresBudget { .. })
@@ -331,11 +472,98 @@ mod tests {
             cfg.validate().is_ok(),
             "remote adapter with budget validates"
         );
-        cfg.providers.default_adapter = "bogus".to_string();
+        for provider_specific in ["ollama", "opencode", "bogus"] {
+            cfg.providers.default_adapter = provider_specific.to_string();
+            assert!(
+                matches!(cfg.validate(), Err(ConfigError::UnknownAdapter { .. })),
+                "provider-specific adapter names are gone; use openai_compat + base_url"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_openai_compat_rejects_bad_base_url_and_empty_key() {
+        let mut cfg = Config::with_db_path(PathBuf::from("memoryd.db"));
+        cfg.providers.default_adapter = "openai_compat".to_string();
+        cfg.providers.paid_spend_cap_usd = 1.0;
+
+        cfg.providers.openai_compat.base_url = "ftp://example".to_string();
         assert!(matches!(
             cfg.validate(),
-            Err(ConfigError::UnknownAdapter { .. })
+            Err(ConfigError::InvalidBaseUrl { .. })
         ));
+
+        cfg.providers.openai_compat.base_url = "http://127.0.0.1:11434/v1".to_string();
+        cfg.providers.openai_compat.api_key = Some("  ".to_string());
+        assert!(matches!(cfg.validate(), Err(ConfigError::EmptyApiKey)));
+
+        cfg.providers.openai_compat.api_key = None;
+        assert!(cfg.validate().is_ok(), "keyless local runtime validates");
+    }
+
+    #[test]
+    fn apply_env_overrides_provider_settings() {
+        let mut cfg = Config::with_db_path(PathBuf::from("memoryd.db"));
+        let env = |name: &str| -> Option<String> {
+            match name {
+                "MEMORYD_ADAPTER" => Some("openai_compat".to_string()),
+                "MEMORYD_SPEND_CAP_USD" => Some("2.5".to_string()),
+                "MEMORYD_OPENAI_BASE_URL" => Some("http://127.0.0.1:11434/v1/".to_string()),
+                "MEMORYD_OPENAI_API_KEY" => Some("env-key".to_string()),
+                "MEMORYD_OPENAI_EMBED_MODEL" => Some("nomic-embed-text".to_string()),
+                "MEMORYD_OPENAI_CHAT_MODEL" => Some("llama3.2".to_string()),
+                "MEMORYD_OPENAI_USD_PER_1K" => Some("0.0001".to_string()),
+                _ => None,
+            }
+        };
+        cfg.apply_env_from(&env).expect("env applies");
+
+        assert_eq!(cfg.providers.default_adapter, "openai_compat");
+        assert_eq!(cfg.providers.paid_spend_cap_usd, 2.5);
+        assert_eq!(cfg.caps.paid_spend_cap_usd, 2.5);
+        assert_eq!(
+            cfg.providers.openai_compat.base_url, "http://127.0.0.1:11434/v1",
+            "trailing slash trimmed"
+        );
+        assert_eq!(
+            cfg.providers.openai_compat.api_key.as_deref(),
+            Some("env-key")
+        );
+        assert_eq!(cfg.providers.openai_compat.embed_model, "nomic-embed-text");
+        assert_eq!(cfg.providers.openai_compat.chat_model, "llama3.2");
+        assert_eq!(cfg.providers.openai_compat.usd_per_1k_prompt_tokens, 0.0001);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn apply_env_rejects_bad_numbers_and_prefers_key_file() {
+        let mut cfg = Config::with_db_path(PathBuf::from("memoryd.db"));
+        assert!(matches!(
+            cfg.apply_env_from(&|name| (name == "MEMORYD_SPEND_CAP_USD").then(|| "-1".to_string())),
+            Err(ConfigError::InvalidNumberEnv {
+                var: "MEMORYD_SPEND_CAP_USD"
+            })
+        ));
+
+        let key_path = std::env::temp_dir().join(format!(
+            "memoryd-test-key-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&key_path, "file-key\n").expect("key file written");
+        let key_file = key_path.to_str().expect("utf-8 path").to_string();
+        cfg.apply_env_from(&move |name| match name {
+            "MEMORYD_OPENAI_API_KEY" => Some("env-key".to_string()),
+            "MEMORYD_OPENAI_API_KEY_FILE" => Some(key_file.clone()),
+            _ => None,
+        })
+        .expect("env applies");
+        assert_eq!(
+            cfg.providers.openai_compat.api_key.as_deref(),
+            Some("file-key"),
+            "key file wins over env key; newline trimmed"
+        );
+        let _ = std::fs::remove_file(&key_path);
     }
 
     #[test]

@@ -137,7 +137,8 @@ fn recall(cli: Cli, args: RecallArgs) -> Result<(), CliError> {
             memoryd_core::config::ConfigError::UnknownVectorIndex { kind: index_kind },
         ));
     }
-    let result = recall_with_mode(&store, &args, &index_kind, &cfg.providers.default_adapter)?;
+    let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(&cfg.providers);
+    let result = recall_with_mode(&store, &args, &index_kind, &adapter)?;
     println!("{}", recall_response_json(&result)?);
     Ok(())
 }
@@ -179,8 +180,7 @@ fn dream(cli: Cli, args: DreamArgs) -> Result<(), CliError> {
     cfg.validate()?;
 
     let mut store = Store::open(&cfg.db_path)?;
-    let adapter =
-        memoryd_core::adapters::AdapterKind::from_default_adapter(&cfg.providers.default_adapter);
+    let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(&cfg.providers);
     let opts = memoryd_core::dream::DreamOptions {
         trigger: "manual",
         budget_usd: args.budget_usd.unwrap_or(cfg.caps.paid_spend_cap_usd),
@@ -256,21 +256,20 @@ fn approve_decision_json(id: &str, decision: &ApprovalDecision) -> Result<String
     }))?)
 }
 
-/// Run semantic recall when requested, else lexical. Only the no-spend `null`
-/// adapter ships today, and it self-degrades to lexical (`embeds_semantically`
-/// is false), so `--semantic` is safe by default; a configured non-`null` embedding
-/// provider (deferred M3 increment) activates real rerank with no caller change.
+/// Run semantic recall when requested, else lexical. The `null` adapter
+/// self-degrades to lexical (`embeds_semantically` is false), so `--semantic`
+/// is safe by default; `local` and a configured `openai_compat` endpoint
+/// activate real rerank with no caller change.
 fn recall_with_mode(
     store: &Store,
     args: &RecallArgs,
     index_kind: &str,
-    adapter_kind: &str,
+    adapter: &memoryd_core::adapters::AdapterKind,
 ) -> Result<RecallOutput, StoreError> {
-    let adapter = memoryd_core::adapters::AdapterKind::from_default_adapter(adapter_kind);
     // Prefer durable memory + graph recall; fall back to raw-event recall when the
     // memory corpus has no match (e.g. before any dream run) so M2 behavior is preserved.
     let memory =
-        store.recall_memories(&args.query, args.limit, args.hops, &adapter, unix_ms_now())?;
+        store.recall_memories(&args.query, args.limit, args.hops, adapter, unix_ms_now())?;
     if !memory.hits.is_empty() {
         return Ok(RecallOutput::Memory(memory));
     }
@@ -279,7 +278,7 @@ fn recall_with_mode(
         store.recall_semantic(
             &args.query,
             args.limit,
-            &adapter,
+            adapter,
             index.as_ref(),
             unix_ms_now(),
         )?
@@ -312,15 +311,14 @@ fn serve(cli: Cli) -> Result<(), CliError> {
     }
 
     let worker_caps = cfg.caps.clone();
-    let worker_adapter_kind = cfg.providers.default_adapter.clone();
+    let worker_providers = cfg.providers.clone();
     let worker_shutdown = Arc::clone(&shutdown);
     let mut worker_access = writer.clone();
     // The embed worker leases/completes jobs through the writer actor; only
     // the embedding compute runs on this thread. It drains its in-flight tick
     // and exits on shutdown.
     let worker = std::thread::spawn(move || {
-        let adapter =
-            memoryd_core::adapters::AdapterKind::from_default_adapter(&worker_adapter_kind);
+        let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(&worker_providers);
         while !worker_shutdown.load(Ordering::Acquire) {
             let now = unix_ms_now();
             match memoryd_core::worker::tick_embed(&mut worker_access, &adapter, &worker_caps, now)
@@ -339,7 +337,7 @@ fn serve(cli: Cli) -> Result<(), CliError> {
 
     let dream_db = cfg.db_path.clone();
     let dream_caps = cfg.caps.clone();
-    let dream_adapter_kind = cfg.providers.default_adapter.clone();
+    let dream_providers = cfg.providers.clone();
     let dream_shutdown = Arc::clone(&shutdown);
     // M6: a second governed background loop runs a dream pass on an interval
     // (consolidate + decay), capped by dream_wallclock_secs + paid_spend_cap_usd.
@@ -350,8 +348,7 @@ fn serve(cli: Cli) -> Result<(), CliError> {
     // The interval sleep is sliced so shutdown is observed within ~500ms; an
     // in-flight dream pass finishes before the thread exits.
     let dream_worker = std::thread::spawn(move || {
-        let adapter =
-            memoryd_core::adapters::AdapterKind::from_default_adapter(&dream_adapter_kind);
+        let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(&dream_providers);
         let mut dream_store = match Store::open(&dream_db) {
             Ok(store) => store,
             Err(err) => {
@@ -705,6 +702,9 @@ struct Cli {
     db_path: PathBuf,
     bind: SocketAddr,
     bearer_token: Option<String>,
+    /// Provider adapter override (null|local|openai_compat); also settable
+    /// via MEMORYD_ADAPTER. Endpoint details come from MEMORYD_OPENAI_*.
+    adapter: Option<String>,
 }
 
 impl Cli {
@@ -734,6 +734,7 @@ impl Cli {
             .parse()
             .expect("DEFAULT_BIND must be a valid socket address");
         let mut bearer_token = env::var("MEMORYD_TOKEN").ok();
+        let mut adapter: Option<String> = None;
 
         while let Some(raw) = args.next() {
             let token = raw.to_string_lossy().into_owned();
@@ -749,6 +750,9 @@ impl Cli {
                 }
                 "--token" => {
                     bearer_token = Some(next_string(&mut args, "--token")?);
+                }
+                "--adapter" => {
+                    adapter = Some(next_string(&mut args, "--adapter")?);
                 }
                 "--token-file" => {
                     // Preferred over --token for real tokens: argv is
@@ -887,6 +891,7 @@ impl Cli {
                         db_path,
                         bind,
                         bearer_token,
+                        adapter,
                     });
                 }
                 other
@@ -933,6 +938,7 @@ impl Cli {
             db_path,
             bind,
             bearer_token,
+            adapter,
         })
     }
 
@@ -940,6 +946,10 @@ impl Cli {
         let mut cfg = Config::with_db_path(self.db_path.clone());
         cfg.bind = self.bind;
         cfg.bearer_token = self.bearer_token.clone();
+        cfg.apply_env()?;
+        if let Some(adapter) = &self.adapter {
+            cfg.providers.default_adapter = adapter.clone();
+        }
         Ok(cfg)
     }
 }
@@ -1020,7 +1030,10 @@ fn print_help() {
             memoryd dream [--now] [--budget-usd <n>] [--max-seconds <n>] [--db <path>]\n\
             memoryd approve [--list] [--id <id> --accept|--reject] [--db <path>]\n\
             memoryd mcp [--db <path>]   (MCP stdio server; no network bind)\n\
-            memoryd serve [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>]\n\n\
+            memoryd serve [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>] [--adapter <null|local|openai_compat>]\n\n\
+          Provider env: MEMORYD_ADAPTER, MEMORYD_SPEND_CAP_USD, MEMORYD_OPENAI_BASE_URL,\n\
+          MEMORYD_OPENAI_API_KEY[_FILE], MEMORYD_OPENAI_EMBED_MODEL, MEMORYD_OPENAI_CHAT_MODEL,\n\
+          MEMORYD_OPENAI_USD_PER_1K.\n\n\
           Tokens: prefer MEMORYD_TOKEN or --token-file over --token; command-line\n\
           arguments are world-readable via /proc/<pid>/cmdline.\n\n\
           Defaults:\n\
@@ -1328,7 +1341,7 @@ fn handle_http_request(
     };
     match request.path.as_str() {
         "/v1/capture" => handle_http_capture(writer, body, cfg.caps.queue_depth_max),
-        "/v1/recall" => handle_http_recall(store, body, &cfg.providers.default_adapter),
+        "/v1/recall" => handle_http_recall(store, body, &cfg.providers),
         _ => HttpResponse::error(404, "not_found", "route not found"),
     }
 }
@@ -1381,7 +1394,11 @@ fn handle_http_capture(
     }
 }
 
-fn handle_http_recall(store: &Store, body: serde_json::Value, adapter_kind: &str) -> HttpResponse {
+fn handle_http_recall(
+    store: &Store,
+    body: serde_json::Value,
+    providers: &memoryd_core::config::ProviderConfig,
+) -> HttpResponse {
     let args = match recall_request_from_json(body) {
         Ok(args) => args,
         Err(message) => return HttpResponse::error(422, "invalid_request", message),
@@ -1391,7 +1408,8 @@ fn handle_http_recall(store: &Store, body: serde_json::Value, adapter_kind: &str
     // CLI-only override, and HNSW is not yet a latency win (it builds per call over the
     // shortlist — see vectorindex.rs / ARCHITECTURE-PLAN §21.12). Revisit when the
     // persistent full-corpus index lands.
-    match recall_with_mode(store, &args, "brute-force", adapter_kind) {
+    let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(providers);
+    match recall_with_mode(store, &args, "brute-force", &adapter) {
         Ok(result) => HttpResponse::json(200, "OK", recall_response_value(&result)),
         Err(StoreError::InvalidRecallQuery) => {
             HttpResponse::error(422, "invalid_request", "query must contain searchable text")
@@ -2022,8 +2040,13 @@ mod tests {
             hops: 1,
             index_kind: None,
         };
-        let result =
-            recall_with_mode(&store, &args, "brute-force", "null").expect("recall succeeds");
+        let result = recall_with_mode(
+            &store,
+            &args,
+            "brute-force",
+            &memoryd_core::adapters::AdapterKind::from_default_adapter("null"),
+        )
+        .expect("recall succeeds");
 
         // No memory exists (no dream run), so recall falls back to raw-event recall.
         // The only shipped adapter is null, which self-degrades
@@ -3220,9 +3243,13 @@ mod tests {
             hops: 1,
             index_kind: None,
         };
-        let RecallOutput::Memory(result) =
-            recall_with_mode(&store, &args, "brute-force", "null").expect("recall")
-        else {
+        let RecallOutput::Memory(result) = recall_with_mode(
+            &store,
+            &args,
+            "brute-force",
+            &memoryd_core::adapters::AdapterKind::from_default_adapter("null"),
+        )
+        .expect("recall") else {
             panic!("memory corpus exists, so recall should return memories");
         };
         assert_eq!(result.mode, "memory+graph");
@@ -3248,9 +3275,13 @@ mod tests {
             hops: 0,
             index_kind: None,
         };
-        let RecallOutput::Memory(direct) =
-            recall_with_mode(&store, &args0, "brute-force", "null").expect("recall")
-        else {
+        let RecallOutput::Memory(direct) = recall_with_mode(
+            &store,
+            &args0,
+            "brute-force",
+            &memoryd_core::adapters::AdapterKind::from_default_adapter("null"),
+        )
+        .expect("recall") else {
             panic!("expected memories");
         };
         assert!(

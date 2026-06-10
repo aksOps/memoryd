@@ -85,6 +85,13 @@ memoryd serve [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file
 Starts the local HTTP server. The default bind is `127.0.0.1:7077`. Any
 non-loopback bind requires a bearer token at startup.
 
+`--adapter <null|local|openai_compat>` (or `MEMORYD_ADAPTER`) selects the
+provider. `openai_compat` is the single generic remote adapter — any
+OpenAI-shaped endpoint via `MEMORYD_OPENAI_BASE_URL` (api.openai.com, Ollama's
+`/v1`, vLLM, LM Studio) with `MEMORYD_OPENAI_API_KEY[_FILE]`,
+`MEMORYD_OPENAI_EMBED_MODEL`, `MEMORYD_OPENAI_CHAT_MODEL`, and
+`MEMORYD_OPENAI_USD_PER_1K`; it requires a non-zero `MEMORYD_SPEND_CAP_USD`.
+
 ## REST
 
 Base URL: `http://127.0.0.1:7077` by default.

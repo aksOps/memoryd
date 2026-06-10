@@ -80,7 +80,7 @@ pub fn tick_embed<A: ProviderAdapter, S: crate::writer::StoreAccess>(
                     report.failed += 1;
                 }
             },
-            Err(AdapterError::Embed(message)) => {
+            Err(AdapterError::Embed(message) | AdapterError::Summarize(message)) => {
                 access.run(move |s| {
                     s.fail_job(
                         job.job_id,

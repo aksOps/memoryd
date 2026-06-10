@@ -299,7 +299,8 @@ fn call_memory_recall(
     arguments: serde_json::Value,
 ) -> Result<ToolOutcome, ToolError> {
     let args = crate::recall_request_from_json(arguments).map_err(ToolError::InvalidArguments)?;
-    match crate::recall_with_mode(store, &args, "brute-force", &cfg.providers.default_adapter) {
+    let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(&cfg.providers);
+    match crate::recall_with_mode(store, &args, "brute-force", &adapter) {
         Ok(result) => Ok(ToolOutcome::Success(crate::recall_response_value(&result))),
         Err(StoreError::InvalidRecallQuery) => {
             Ok(ToolOutcome::Failure("query must contain searchable text"))

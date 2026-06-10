@@ -63,6 +63,45 @@ printf '%s\n%s\n%s\n' \
 
 See `docs/API.md` for tool schemas, the trust model, and error mapping.
 
+## Providers
+
+The provider seam has three adapters: `null` (inert), `local` (default —
+in-process bge-small embeddings, no network, no spend), and `openai_compat` —
+one **generic** adapter for any endpoint speaking the OpenAI wire shape
+(embeddings + chat completions). There are no provider-specific adapters:
+Ollama, vLLM, LM Studio, llama.cpp, and api.openai.com are all just a base
+URL. It is selected with `--adapter openai_compat` or `MEMORYD_ADAPTER`, and
+requires an explicit non-zero `MEMORYD_SPEND_CAP_USD` at startup — network
+providers are opt-in, never a default.
+
+Local Ollama:
+
+```bash
+MEMORYD_SPEND_CAP_USD=0.01 \
+MEMORYD_OPENAI_BASE_URL=http://127.0.0.1:11434/v1 \
+MEMORYD_OPENAI_EMBED_MODEL=nomic-embed-text \
+MEMORYD_OPENAI_CHAT_MODEL=llama3.2 \
+memoryd serve --adapter openai_compat
+```
+
+OpenAI:
+
+```bash
+MEMORYD_SPEND_CAP_USD=1.00 \
+MEMORYD_OPENAI_API_KEY_FILE=~/.config/memoryd/openai.key \
+MEMORYD_OPENAI_USD_PER_1K=0.00002 \
+memoryd serve --adapter openai_compat
+```
+
+`MEMORYD_OPENAI_API_KEY_FILE` is preferred over `MEMORYD_OPENAI_API_KEY` (the
+file can be `chmod 0600`); the key is sent only as the `Authorization` header
+and never logged or echoed into errors. The embed worker uses
+`{base}/embeddings`; dream consolidation/profile summarization uses
+`{base}/chat/completions`, gated by the spend cap with
+`MEMORYD_OPENAI_USD_PER_1K` as the price signal (0 = free local runtime).
+Provider error bodies are truncated before persistence. TLS is rustls-based
+(no system OpenSSL).
+
 HTTP capture example:
 
 ```bash
@@ -84,7 +123,9 @@ See `docs/API.md` for CLI and REST request/response details. See
 
 ## Security Defaults
 
-- Runtime is local-first and does not call public internet services by default.
+- Runtime is local-first and does not call public internet services by default;
+  the `openai_compat` provider is explicit opt-in (`--adapter`/`MEMORYD_ADAPTER`)
+  and refuses to start without a non-zero spend cap.
 - The default bind is `127.0.0.1:7077`.
 - Any non-loopback bind requires a bearer token of at least 16 characters; empty
   tokens are rejected at startup on any bind.

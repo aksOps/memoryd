@@ -51,10 +51,15 @@ Status legend:
   2024-11-05, tools `memory_remember`/`memory_recall`/`memory_stats`/
   `memory_graph` over the M7 association graph, no socket bind); resources
   (`memory://session/{id}`) deferred.
-- `[ ]` M10 (bench/packaging) and the deferred M3 increment remain.
+- `[~]` Deferred M3 increment: the generic `openai_compat` adapter is delivered
+  (one adapter for any OpenAI-shaped endpoint — provider-specific
+  `ollama`/`opencode` names removed; embeddings + chat-completions + reachability
+  probe, env-configured, spend-cap-gated, rustls TLS). Failover, the `setup`
+  CLI, and the runtime spend ledger remain.
+- `[ ]` M10 (bench/packaging) remains.
 
-Next implementation target: the deferred M3 increment (openai_compat/ollama adapters,
-reachability/failover, setup CLI, runtime spend ledger) and/or M10.
+Next implementation target: the rest of the M3 increment (failover, setup CLI,
+runtime spend ledger) and/or M10.
 
 ## M0 — Store Skeleton, Config, CLI Shell, Security Gate
 

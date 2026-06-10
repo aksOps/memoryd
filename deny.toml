@@ -24,8 +24,14 @@ allow = [
 # tract-core (the in-process embedding runtime). MPL-2.0 is file-level copyleft —
 # obligations attach only to modifications of dyn-eq's own files, which we consume
 # unmodified from crates.io; it does not affect the memoryd binary's licensing.
+#
+# webpki-roots is the Mozilla CA certificate *data* bundled by ureq/rustls for
+# the openai_compat adapter's TLS. CDLA-Permissive-2.0 is a permissive data
+# license with no copyleft obligations; the data is consumed unmodified and
+# does not affect the memoryd binary's licensing.
 exceptions = [
     { name = "dyn-eq", allow = ["MPL-2.0"] },
+    { name = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
 ]
 
 [bans]

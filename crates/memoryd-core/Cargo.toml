@@ -14,6 +14,10 @@ serde_json = { version = "1.0.150", default-features = false, features = ["std"]
 # does assemble SIMD kernels via `cc`, so a C toolchain is required at build time.
 tract-onnx = "0.23"
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+# HTTP client for the generic OpenAI-compatible provider adapter (embeddings +
+# chat completions against any base URL: api.openai.com, Ollama, vLLM, LM
+# Studio). rustls-based TLS; no native OpenSSL linkage.
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
 
 [build-dependencies]
 sha2 = { version = "0.10", default-features = false }

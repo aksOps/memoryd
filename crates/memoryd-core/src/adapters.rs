@@ -1,8 +1,9 @@
 //! Provider adapter seam plus the two offline adapters: the deterministic `null`
 //! hash adapter (no semantic signal, CI/fallback) and the in-process `local`
 //! adapter (bge-small via tract, real semantic signal, no network, no spend).
-//! Remote `openai_compat`/`ollama`/`opencode` adapters land later behind this
-//! same trait.
+//! The remote seam is the single generic `openai_compat` adapter
+//! (`crate::openaicompat`) — any OpenAI-shaped endpoint via base URL, not
+//! provider-specific adapters.
 
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
@@ -151,20 +152,34 @@ impl ProviderAdapter for LocalAdapter {
 pub enum AdapterKind {
     Null(NullAdapter),
     Local(LocalAdapter),
+    OpenAiCompat(crate::openaicompat::OpenAiCompatAdapter),
 }
 
 impl AdapterKind {
-    /// Resolve the configured default adapter. Remote adapter names
-    /// (`openai_compat`/`ollama`/`opencode`) pass config validation when a budget is
-    /// set but are not implemented yet — they degrade to `null` (lexical-only recall)
-    /// with a stderr warning so the degradation is never silent.
+    /// Resolve the configured provider. `openai_compat` carries endpoint
+    /// settings, so callers with a full [`crate::config::ProviderConfig`]
+    /// should use this; unknown names degrade to `null` (lexical-only recall)
+    /// with a stderr warning so the degradation is never silent — though
+    /// `Config::validate` rejects them before any long-lived caller gets here.
+    pub fn from_provider_config(providers: &crate::config::ProviderConfig) -> Self {
+        match providers.default_adapter.as_str() {
+            "openai_compat" => Self::OpenAiCompat(
+                crate::openaicompat::OpenAiCompatAdapter::from_config(&providers.openai_compat),
+            ),
+            other => Self::from_default_adapter(other),
+        }
+    }
+
+    /// Resolve by bare name (`null`/`local`). `openai_compat` requires endpoint
+    /// settings and therefore [`AdapterKind::from_provider_config`]; resolving
+    /// it by name alone degrades to `null` with a warning.
     pub fn from_default_adapter(name: &str) -> Self {
         match name {
             "local" => Self::Local(LocalAdapter),
             "null" => Self::Null(NullAdapter::new()),
             other => {
                 eprintln!(
-                    "memoryd: provider adapter '{other}' is not implemented yet; \
+                    "memoryd: provider adapter '{other}' cannot be resolved by name alone; \
                      falling back to 'null' (lexical-only recall)"
                 );
                 Self::Null(NullAdapter::new())
@@ -178,6 +193,7 @@ impl ProviderAdapter for AdapterKind {
         match self {
             Self::Null(a) => a.id(),
             Self::Local(a) => a.id(),
+            Self::OpenAiCompat(a) => a.id(),
         }
     }
 
@@ -185,6 +201,7 @@ impl ProviderAdapter for AdapterKind {
         match self {
             Self::Null(a) => a.model_id(),
             Self::Local(a) => a.model_id(),
+            Self::OpenAiCompat(a) => a.model_id(),
         }
     }
 
@@ -192,6 +209,7 @@ impl ProviderAdapter for AdapterKind {
         match self {
             Self::Null(a) => a.embed(texts),
             Self::Local(a) => a.embed(texts),
+            Self::OpenAiCompat(a) => a.embed(texts),
         }
     }
 
@@ -199,6 +217,7 @@ impl ProviderAdapter for AdapterKind {
         match self {
             Self::Null(a) => a.embed_query(text),
             Self::Local(a) => a.embed_query(text),
+            Self::OpenAiCompat(a) => a.embed_query(text),
         }
     }
 
@@ -206,6 +225,7 @@ impl ProviderAdapter for AdapterKind {
         match self {
             Self::Null(a) => a.reachable(),
             Self::Local(a) => a.reachable(),
+            Self::OpenAiCompat(a) => a.reachable(),
         }
     }
 
@@ -213,6 +233,7 @@ impl ProviderAdapter for AdapterKind {
         match self {
             Self::Null(a) => a.embeds_semantically(),
             Self::Local(a) => a.embeds_semantically(),
+            Self::OpenAiCompat(a) => a.embeds_semantically(),
         }
     }
 
@@ -220,6 +241,7 @@ impl ProviderAdapter for AdapterKind {
         match self {
             Self::Null(a) => a.summarize(texts),
             Self::Local(a) => a.summarize(texts),
+            Self::OpenAiCompat(a) => a.summarize(texts),
         }
     }
 
@@ -227,6 +249,7 @@ impl ProviderAdapter for AdapterKind {
         match self {
             Self::Null(a) => a.usd_per_1k_prompt_tokens(),
             Self::Local(a) => a.usd_per_1k_prompt_tokens(),
+            Self::OpenAiCompat(a) => a.usd_per_1k_prompt_tokens(),
         }
     }
 }
@@ -241,12 +264,14 @@ pub fn prompt_token_estimate(text: &str) -> i64 {
 #[derive(Debug, Clone)]
 pub enum AdapterError {
     Embed(String),
+    Summarize(String),
 }
 
 impl fmt::Display for AdapterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Embed(message) => write!(f, "embed failed: {message}"),
+            Self::Summarize(message) => write!(f, "summarize failed: {message}"),
         }
     }
 }
