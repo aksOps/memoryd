@@ -47,6 +47,8 @@ pub(crate) const HEURISTIC_INPUT_CAP: usize = 20;
 pub(crate) const HEURISTIC_MIN_INPUTS: usize = 5;
 pub(crate) const HEURISTIC_MAX_PROPOSALS: usize = 3;
 
+/// Rolling window for the provider spend ledger (roadmap C2).
+pub(crate) const SPEND_WINDOW_MS: i64 = 86_400_000;
 /// Retention sweep batch bound (roadmap B1+B2); horizons come from `Caps`.
 pub(crate) const RETAIN_BATCH: usize = 500;
 const DAY_MS_U: u64 = 86_400_000;
@@ -321,7 +323,11 @@ pub fn dream_once<A: ProviderAdapter>(
         .unwrap_or(i64::MAX)
         .saturating_mul(1000);
 
-    let mut window_spend = 0.0_f64;
+    // Runtime spend ledger (roadmap C2): the pass's spend window starts at
+    // what was already spent in the trailing 24h, so `budget_usd` is a rolling
+    // daily cap across passes, not a per-pass allowance. Restart-safe: the
+    // ledger lives in provider_usage.
+    let mut window_spend = store.provider_spend_since(start - SPEND_WINDOW_MS)?;
     let mut consolidated = 0_usize;
     let mut distilled = 0_usize;
     let mut associated = 0_usize;

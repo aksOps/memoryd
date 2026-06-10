@@ -878,6 +878,16 @@ impl Store {
         Ok(batch)
     }
 
+    /// Total estimated provider spend recorded since `since_ms` (rolling-window
+    /// ledger, roadmap C2). Backed by the `provider_usage` table.
+    pub fn provider_spend_since(&self, since_ms: i64) -> Result<f64, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(SUM(est_cost), 0.0) FROM provider_usage WHERE ts > ?1",
+            params![since_ms],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Governed retention sweep (roadmap B1+B2): physically delete up to
     /// `batch` consolidated raw events older than the raw horizon (their FTS
     /// rows and embeddings go with them), and raw-event embeddings older than
@@ -6338,6 +6348,58 @@ mod tests {
             )
             .expect("count");
         assert_eq!(orphaned, 0);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn provider_spend_ledger_caps_across_passes() {
+        let path = temp_db_path("spend-ledger");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        // Prior pass spent 0.9 of a 1.0 daily budget inside the window; an
+        // older row outside the window must not count.
+        store
+            .conn
+            .execute(
+                "INSERT INTO provider_usage (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
+                 VALUES (?1, 'openai_compat', 'm', 'complete', 100, 0, 0.9, NULL),
+                        (?2, 'openai_compat', 'm', 'complete', 100, 0, 5.0, NULL)",
+                params![now - 1_000, now - 90_000_000],
+            )
+            .expect("usage seeded");
+        assert!(
+            (store.provider_spend_since(now - 86_400_000).expect("sum") - 0.9).abs() < 1e-9,
+            "only in-window spend counts"
+        );
+
+        // A dream pass with budget 1.0 sees 0.9 already spent: the metered
+        // summarize (cost > 0.1) is skipped and the run is budget_capped.
+        store
+            .capture_event(test_event_with_text(
+                "ledger-s",
+                now - 3_600_000,
+                &"long enough body to cost a few hundred tokens ".repeat(20),
+            ))
+            .expect("capture");
+        use crate::config::Caps;
+        use crate::dream::{DreamOptions, dream_once};
+        let opts = DreamOptions {
+            trigger: "manual",
+            budget_usd: 1.0,
+            max_seconds: 60,
+        };
+        let outcome = dream_once(
+            &mut store,
+            &SummarizingAdapter,
+            &Caps::small(),
+            &opts,
+            &|| now,
+        )
+        .expect("dream succeeds");
+        assert_eq!(
+            outcome.status, "budget_capped",
+            "prior-pass spend binds the rolling daily cap"
+        );
         cleanup_db_files(&path);
     }
 

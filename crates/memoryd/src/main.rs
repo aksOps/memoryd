@@ -42,6 +42,9 @@ const AUTH_LOCKOUT_MS: i64 = 60_000;
 /// Memory bound for the throttle map; expired entries are dropped first, then
 /// the entry with the oldest failure is evicted.
 const AUTH_THROTTLE_MAX_ENTRIES: usize = 1024;
+/// After a failed embed tick against an unreachable remote provider, the
+/// worker embeds with the local adapter for this long before retrying.
+const ADAPTER_FALLBACK_COOLDOWN_MS: i64 = 60_000;
 
 fn main() -> ExitCode {
     match run(env::args_os()) {
@@ -181,6 +184,10 @@ fn dream(cli: Cli, args: DreamArgs) -> Result<(), CliError> {
 
     let mut store = Store::open(&cfg.db_path)?;
     let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(&cfg.providers);
+    let (adapter, degraded) = adapter.effective_for_pass();
+    if degraded {
+        eprintln!("memoryd: provider unreachable; dream pass uses the local adapter");
+    }
     let opts = memoryd_core::dream::DreamOptions {
         trigger: "manual",
         budget_usd: args.budget_usd.unwrap_or(cfg.caps.paid_spend_cap_usd),
@@ -319,16 +326,39 @@ fn serve(cli: Cli) -> Result<(), CliError> {
     // and exits on shutdown.
     let worker = std::thread::spawn(move || {
         let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(&worker_providers);
+        // Failover circuit breaker (roadmap C1): after a failed tick against an
+        // unreachable remote endpoint, embed with the in-process local adapter
+        // for a cooldown instead of burning job retries; then re-try primary.
+        let mut fallback_until = 0_i64;
         while !worker_shutdown.load(Ordering::Acquire) {
             let now = unix_ms_now();
-            match memoryd_core::worker::tick_embed(&mut worker_access, &adapter, &worker_caps, now)
-            {
+            let pass_adapter = if now < fallback_until {
+                memoryd_core::adapters::AdapterKind::from_default_adapter("local")
+            } else {
+                adapter.clone()
+            };
+            match memoryd_core::worker::tick_embed(
+                &mut worker_access,
+                &pass_adapter,
+                &worker_caps,
+                now,
+            ) {
                 Ok(report) if report.leased == 0 => {
                     std::thread::sleep(std::time::Duration::from_millis(250));
                 }
                 Ok(_) => {}
                 Err(err) => {
                     logging::log_warn!("worker tick failed: {err}");
+                    if now >= fallback_until {
+                        let (_, degraded) = adapter.effective_for_pass();
+                        if degraded {
+                            fallback_until = now + ADAPTER_FALLBACK_COOLDOWN_MS;
+                            logging::log_warn!(
+                                "provider unreachable; embedding with local adapter for {}s",
+                                ADAPTER_FALLBACK_COOLDOWN_MS / 1000
+                            );
+                        }
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
             }
@@ -372,9 +402,16 @@ fn serve(cli: Cli) -> Result<(), CliError> {
                 std::thread::sleep(slice);
                 slept += slice;
             }
+            // One reachability probe per pass (roadmap C1): a dead remote
+            // endpoint degrades this pass to the local adapter instead of
+            // failing every LLM phase.
+            let (pass_adapter, degraded) = adapter.effective_for_pass();
+            if degraded {
+                logging::log_warn!("provider unreachable; dream pass uses the local adapter");
+            }
             if let Err(err) = memoryd_core::dream::dream_once(
                 &mut dream_store,
-                &adapter,
+                &pass_adapter,
                 &dream_caps,
                 &opts,
                 &|| unix_ms_now(),

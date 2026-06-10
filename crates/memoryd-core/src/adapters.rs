@@ -185,6 +185,20 @@ impl AdapterKind {
         }
     }
 
+    /// Failover for one governed pass (roadmap C1): remote adapters that fail
+    /// their reachability probe degrade to the in-process `local` adapter for
+    /// this pass — work proceeds with real (local) semantic vectors instead of
+    /// burning retries against a dead endpoint. `null`/`local` return
+    /// themselves untouched (always reachable, zero probe overhead).
+    pub fn effective_for_pass(&self) -> (Self, bool) {
+        match self {
+            Self::OpenAiCompat(adapter) if !adapter.reachable() => {
+                (Self::Local(LocalAdapter), true)
+            }
+            other => (other.clone(), false),
+        }
+    }
+
     /// Resolve by bare name (`null`/`local`). `openai_compat` requires endpoint
     /// settings and therefore [`AdapterKind::from_provider_config`]; resolving
     /// it by name alone degrades to `null` with a warning.

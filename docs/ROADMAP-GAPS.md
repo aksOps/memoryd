@@ -70,11 +70,11 @@ corpus hygiene, not query latency.
 
 ## C — Provider completion (rest of the deferred M3 increment)
 
-- `[ ]` C1. Adapter failover: `reachable()` exists but nothing consumes it —
+- `[x]` C1. Adapter failover: `reachable()` exists but nothing consumes it —
   worker/dream should probe before a batch and degrade to `local` for the
   pass (with an audit row) instead of burning retries when the endpoint is
   down.
-- `[ ]` C2. Runtime spend ledger: per-window (daily/weekly) spend
+- `[x]` C2. Runtime spend ledger: per-window (daily/weekly) spend
   enforcement across passes from `provider_usage`, not just the per-pass
   budget check.
 - `[ ]` C3. `memoryd setup` CLI: interactive first-run config (adapter, base
