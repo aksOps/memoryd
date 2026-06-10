@@ -35,6 +35,10 @@ const REDACTED: &str = "[REDACTED]";
 const AUDIT_ACTOR: &str = "memoryd";
 const HIGH_ENTROPY_MIN_LEN: usize = 20;
 const HIGH_ENTROPY_MIN_BITS_PER_CHAR: f64 = 4.0;
+/// All-digit runs at least this long are treated as secrets (PANs, numeric
+/// tokens). 16 catches full card numbers while leaving unix-millisecond
+/// timestamps (13 digits) alone.
+const DIGIT_SECRET_MIN_LEN: usize = 16;
 
 pub struct Store {
     conn: Connection,
@@ -1094,6 +1098,10 @@ impl Store {
                     .summarize(std::slice::from_ref(content))?
                     .unwrap_or_else(|| content.clone())
             };
+            // Defense in depth: memory content was redacted at capture, but a
+            // provider summary (or any upstream miss) must not introduce a
+            // secret into approvals/audit rows.
+            let fact_value = redact_inline_string_with_count(&fact_value).value;
 
             let proposed_change = serde_json::to_string(&serde_json::json!({
                 "fact_key": fact_key,
@@ -1188,6 +1196,7 @@ impl Store {
                 already_decided: true,
             });
         }
+        let mut fact_value_redactions = 0usize;
         let (new_state, committed_fact) = if accept {
             tx.execute(
                 "UPDATE approvals SET state = 'approved', decided_at = ?1 WHERE id = ?2",
@@ -1199,10 +1208,19 @@ impl Store {
                     .get("fact_key")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let fact_value = change
-                    .get("fact_value")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                // Defense in depth: the fact value derives from memory content
+                // that was redacted at capture, but anything upstream ever
+                // misses must not be re-persisted (and audit-logged) here.
+                let RedactedString {
+                    value: fact_value,
+                    redactions,
+                } = redact_inline_string_with_count(
+                    change
+                        .get("fact_value")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                );
+                fact_value_redactions = redactions;
                 if fact_key.is_empty() {
                     return Err(StoreError::MalformedApproval(format!(
                         "approval {approval_id} has no fact_key"
@@ -1254,13 +1272,21 @@ impl Store {
         } else {
             "approve"
         };
+        let detail = if fact_value_redactions > 0 {
+            Some(serde_json::to_string(&serde_json::json!({
+                "fact_value_redactions": fact_value_redactions,
+                "replacement": REDACTED,
+            }))?)
+        } else {
+            None
+        };
         insert_audit_log(
             &tx,
             AUDIT_ACTOR,
             action,
             "approval",
             Some(approval_id),
-            None,
+            detail.as_deref(),
             now_ms,
         )?;
         tx.commit()?;
@@ -2307,6 +2333,11 @@ fn is_sensitive_key(key: &str) -> bool {
         || normalized.contains("privatekey")
 }
 
+/// Known limitation (decision recorded): secrets that arrive percent-encoded
+/// are split at `%xx` boundaries by the span collectors and are not reassembled
+/// or decoded before matching; decoding arbitrary text risks false positives
+/// and double-decode bugs for marginal gain on a local-first daemon. See the
+/// README "Security Defaults" known-limitations note.
 fn redact_inline_string_with_count(input: &str) -> RedactedString {
     if input.contains("-----BEGIN") && input.contains("PRIVATE KEY-----") {
         let redactions = usize::from(input != REDACTED);
@@ -2351,7 +2382,9 @@ fn collect_known_secret_prefix_spans(input: &str, spans: &mut Vec<(usize, usize)
         "ASIA",
     ] {
         let mut offset = 0;
-        while let Some(relative) = input[offset..].find(prefix) {
+        // Case-insensitive: providers emit canonical casing, but secrets pasted
+        // through shells/editors can arrive case-mangled and must still match.
+        while let Some(relative) = find_ascii_case_insensitive(&input[offset..], prefix) {
             let start = offset + relative;
             let end = find_secret_end(input, start);
             let min_len = if matches!(prefix, "AKIA" | "ASIA") {
@@ -2405,6 +2438,18 @@ fn push_high_entropy_span(input: &str, start: usize, end: usize, spans: &mut Vec
         && candidate.bytes().any(|byte| byte.is_ascii_alphabetic())
         && candidate.bytes().any(|byte| byte.is_ascii_digit())
         && shannon_entropy(candidate) >= HIGH_ENTROPY_MIN_BITS_PER_CHAR
+    {
+        spans.push((start, end));
+        return;
+    }
+    // All-digit secrets (card numbers, numeric tokens) carry too little
+    // Shannon entropy per character to clear the mixed-content gate above, so
+    // they get a dedicated length-only rule. Dash/space-grouped digit runs are
+    // split by the tokenizer and stay out of scope; ~19-digit nanosecond
+    // timestamps will be redacted, which is the acceptable direction of error
+    // for a redactor.
+    if candidate.len() >= DIGIT_SECRET_MIN_LEN
+        && candidate.bytes().all(|byte| byte.is_ascii_digit())
     {
         spans.push((start, end));
     }
@@ -6027,6 +6072,84 @@ mod tests {
             1
         );
         cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn decide_approval_redacts_fact_value_before_persist() {
+        let path = temp_db_path("p1-fact-redact");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+        // Insert the approval directly to simulate an upstream redaction miss.
+        let proposed_change = serde_json::json!({
+            "fact_key": "ci.token",
+            "fact_value": format!("uses {secret} for CI"),
+            "confidence": 0.9,
+        })
+        .to_string();
+        store
+            .conn
+            .execute(
+                "INSERT INTO approvals
+                    (id, target_type, target_ref, proposed_change, state, requested_at)
+                 VALUES ('appr-1', 'profile_fact', 'ci.token', ?1, 'pending', ?2)",
+                params![proposed_change, now],
+            )
+            .expect("approval inserted");
+
+        let decision = store
+            .decide_approval("appr-1", true, now + 1)
+            .expect("approval accepted");
+        assert!(decision.committed_fact);
+
+        let fact_value: String = store
+            .conn
+            .query_row("SELECT fact_value FROM profile_facts", [], |r| r.get(0))
+            .expect("fact persisted");
+        assert!(
+            fact_value.contains(REDACTED),
+            "secret replaced: {fact_value}"
+        );
+        assert!(!fact_value.contains(secret), "secret must not persist");
+        let audit_detail: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT detail FROM audit_log WHERE action = 'approve_profile_fact'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("audit row exists");
+        let detail = audit_detail.expect("redaction detail recorded");
+        assert!(detail.contains("fact_value_redactions"));
+        assert!(!detail.contains(secret));
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn redacts_sixteen_digit_pan() {
+        let result = redact_inline_string_with_count("card 4111111111111111 ok");
+        assert_eq!(result.value, format!("card {REDACTED} ok"));
+        assert_eq!(result.redactions, 1);
+    }
+
+    #[test]
+    fn does_not_redact_thirteen_digit_timestamp() {
+        let result = redact_inline_string_with_count("ts 1717171717171 ok");
+        assert_eq!(result.value, "ts 1717171717171 ok");
+        assert_eq!(result.redactions, 0);
+    }
+
+    #[test]
+    fn redacts_lowercase_akia_key() {
+        let result = redact_inline_string_with_count("key akiaabcdefghij1234567890 set");
+        assert_eq!(result.value, format!("key {REDACTED} set"));
+    }
+
+    #[test]
+    fn redacts_uppercase_github_prefix() {
+        let result =
+            redact_inline_string_with_count("token GHP_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 set");
+        assert_eq!(result.value, format!("token {REDACTED} set"));
     }
 
     #[test]

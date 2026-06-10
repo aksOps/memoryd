@@ -35,21 +35,24 @@ bind; everything else is hardening, defense-in-depth, or planned-work tracking.
 
 ## P1 — Secret Handling and Redaction Defense-in-Depth
 
-- `[ ]` Re-redact `fact_value` before it is persisted into
-  `approvals`/`profile_facts` (`crates/memoryd-core/src/store.rs:1086-1103`).
-  Capture and import redact at the boundary, but the profile-fact path derives
-  from memory content without its own redaction pass; a single upstream miss
-  would be re-persisted and audit-logged.
-- `[ ]` Document that `MEMORYD_TOKEN` is preferred over `--token` (CLI args
-  are world-readable via `/proc/<pid>/cmdline`; environment is owner-only),
-  and/or add `--token-file <path>`.
-- `[ ]` Redactor: catch long digit-only secrets (16+ digits — PANs, numeric
-  tokens). The high-entropy detector requires an alphabetic byte
-  (`crates/memoryd-core/src/store.rs:2405`), so all-digit secrets escape.
-- `[ ]` Redactor: make known API-key prefix matching case-insensitive
-  (`crates/memoryd-core/src/store.rs:2354`).
-- `[ ]` Redactor: decide whether URL-encoded secrets (split at `%xx`
-  boundaries) are in scope; document the limitation either way.
+- `[x]` Re-redact `fact_value` before it is persisted into
+  `approvals`/`profile_facts`. Shipped: redaction at both persistence points —
+  `extract_profile_pending` (before `proposed_change`/audit rows) and
+  `decide_approval` (before the `profile_facts` INSERT, with a redaction-count
+  audit detail).
+- `[x]` Token-handling guidance. Shipped: `--token-file <path>` flag (trailing
+  newline trimmed, `chmod 0600`-able), plus README/help docs preferring
+  `MEMORYD_TOKEN`/`--token-file` over `--token` (argv is world-readable via
+  `/proc/<pid>/cmdline`).
+- `[x]` Redactor: long digit-only secrets. Shipped: all-digit runs of 16+
+  digits are redacted (`DIGIT_SECRET_MIN_LEN`); 13-digit unix-ms timestamps
+  stay untouched.
+- `[x]` Redactor: known API-key prefix matching is now case-insensitive via
+  the existing `find_ascii_case_insensitive` helper (zero allocation).
+- `[x]` Redactor: URL-encoded secrets — decision recorded: out of scope.
+  Documented as a known limitation at `redact_inline_string_with_count` and in
+  the README Security Defaults section (decoding arbitrary text risks false
+  positives and double-decode bugs for marginal gain on a local-first daemon).
 
 ## P2 — HTTP Protocol and Input-Handling Correctness
 

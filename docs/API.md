@@ -8,7 +8,7 @@ early and intentionally narrow.
 ### `doctor`
 
 ```bash
-memoryd doctor [--db <path>] [--bind <addr:port>] [--token <token>]
+memoryd doctor [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>]
 ```
 
 Checks SQLite schema, WAL mode, foreign keys, and configuration safety.
@@ -16,7 +16,7 @@ Checks SQLite schema, WAL mode, foreign keys, and configuration safety.
 ### `stats`
 
 ```bash
-memoryd stats [--db <path>] [--bind <addr:port>] [--token <token>]
+memoryd stats [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>]
 ```
 
 Prints row counts for canonical tables.
@@ -79,7 +79,7 @@ Output JSON:
 ### `serve`
 
 ```bash
-memoryd serve [--db <path>] [--bind <addr:port>] [--token <token>]
+memoryd serve [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>]
 ```
 
 Starts the local HTTP server. The default bind is `127.0.0.1:7077`. Any

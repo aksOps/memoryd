@@ -689,6 +689,16 @@ impl Cli {
                 "--token" => {
                     bearer_token = Some(next_string(&mut args, "--token")?);
                 }
+                "--token-file" => {
+                    // Preferred over --token for real tokens: argv is
+                    // world-readable via /proc/<pid>/cmdline, a file can be
+                    // chmod 0600. Last of --token/--token-file wins; both
+                    // override MEMORYD_TOKEN.
+                    let path = next_string(&mut args, "--token-file")?;
+                    let contents = std::fs::read_to_string(&path)
+                        .map_err(|_| CliError::TokenFileUnreadable(path))?;
+                    bearer_token = Some(contents.trim_end_matches(['\r', '\n']).to_string());
+                }
                 "--kind" => {
                     let Command::Remember(remember) = &mut command else {
                         return Err(CliError::UnknownFlag(token));
@@ -931,14 +941,16 @@ fn print_help() {
     println!(
         "memoryd\n\n\
          Usage:\n\
-            memoryd doctor [--db <path>] [--bind <addr:port>] [--token <token>]\n\
-            memoryd stats  [--db <path>] [--bind <addr:port>] [--token <token>]\n\
+            memoryd doctor [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>]\n\
+            memoryd stats  [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>]\n\
             memoryd remember <content> [--kind <kind>] [--session <id>] [--source <source>] [--tags <a,b>] [--db <path>]\n\
             memoryd recall <query> [--k <limit>] [--semantic] [--hops <0|1>] [--index <brute-force|hnsw>] [--db <path>]\n\
             memoryd import --source jsonl --path <file> [--db <path>]\n\
             memoryd dream [--now] [--budget-usd <n>] [--max-seconds <n>] [--db <path>]\n\
             memoryd approve [--list] [--id <id> --accept|--reject] [--db <path>]\n\
-            memoryd serve [--db <path>] [--bind <addr:port>] [--token <token>]\n\n\
+            memoryd serve [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>]\n\n\
+          Tokens: prefer MEMORYD_TOKEN or --token-file over --token; command-line\n\
+          arguments are world-readable via /proc/<pid>/cmdline.\n\n\
           Defaults:\n\
             bind: {DEFAULT_BIND}\n\
             provider: null\n\
@@ -957,6 +969,7 @@ enum CliError {
     InvalidUtf8Argument(&'static str),
     InvalidNumberFlag(&'static str, String),
     InvalidBind(String),
+    TokenFileUnreadable(String),
     Config(memoryd_core::config::ConfigError),
     Store(memoryd_core::store::StoreError),
     Json(serde_json::Error),
@@ -980,6 +993,9 @@ impl fmt::Display for CliError {
                 write!(f, "value for {flag} must be a positive integer: {value}")
             }
             Self::InvalidBind(bind) => write!(f, "invalid bind address: {bind}"),
+            Self::TokenFileUnreadable(path) => {
+                write!(f, "could not read token file {path}")
+            }
             Self::Config(err) => write!(f, "configuration error: {err}"),
             Self::Store(err) => write!(f, "{err}"),
             Self::Json(err) => write!(f, "JSON error: {err}"),
@@ -1673,6 +1689,45 @@ mod tests {
         let cli = Cli::parse(["memoryd", "serve"].map(OsString::from)).expect("cli parses");
 
         assert_eq!(cli.command, Command::Serve);
+    }
+
+    #[test]
+    fn parses_token_file_flag() {
+        let token_path = temp_db_path("token-file").with_extension("token");
+        fs::write(&token_path, "file-token-0123456789\n").expect("token file written");
+
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "serve",
+                "--token-file",
+                token_path.to_str().expect("path is UTF-8"),
+            ]
+            .map(OsString::from),
+        )
+        .expect("cli parses");
+
+        assert_eq!(
+            cli.bearer_token.as_deref(),
+            Some("file-token-0123456789"),
+            "token read from file with trailing newline trimmed"
+        );
+        let _ = fs::remove_file(&token_path);
+    }
+
+    #[test]
+    fn token_file_missing_is_an_error() {
+        let missing = temp_db_path("token-file-missing").with_extension("absent");
+        let result = Cli::parse(
+            [
+                "memoryd",
+                "serve",
+                "--token-file",
+                missing.to_str().expect("path is UTF-8"),
+            ]
+            .map(OsString::from),
+        );
+        assert!(matches!(result, Err(CliError::TokenFileUnreadable(_))));
     }
 
     #[test]

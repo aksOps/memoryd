@@ -67,7 +67,9 @@ See `docs/API.md` for CLI and REST request/response details. See
 - CI runs formatting, build, clippy with `-D warnings`, tests, dependency policy, advisory audit, and SBOM generation.
 - `main` is protected with required CI, up-to-date checks, linear history, no force pushes, no deletions, and conversation resolution.
 
-The current redactor is deterministic and best-effort, not a guarantee that every possible secret format is detected. It replaces matched content with `[REDACTED]` before persistence and covers sensitive JSON keys, bearer-style credentials, common API-key prefixes, private-key markers, emails, and high-entropy token-like spans.
+The current redactor is deterministic and best-effort, not a guarantee that every possible secret format is detected. It replaces matched content with `[REDACTED]` before persistence and covers sensitive JSON keys, bearer-style credentials, common API-key prefixes (case-insensitive), private-key markers, emails, long all-digit runs (16+ digits, e.g. card numbers), and high-entropy token-like spans. Known limitation: secrets that arrive percent-encoded are split at `%xx` boundaries and are not decoded or reassembled before matching.
+
+Token handling: prefer `MEMORYD_TOKEN` or `--token-file <path>` over `--token`. Command-line arguments are world-readable on Linux via `/proc/<pid>/cmdline`, while the environment is owner-only and a token file can be `chmod 0600`.
 
 ## Current Scope
 
