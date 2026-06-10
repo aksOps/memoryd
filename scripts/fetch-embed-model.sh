@@ -23,7 +23,7 @@ for name in "${!FILES[@]}"; do
     continue
   fi
   echo "fetching $name ..."
-  python3 - "$url" "$dst" <<'PY'
+  python3 - "$url" "$dst.tmp" <<'PY'
 import sys, urllib.request
 url, dst = sys.argv[1], sys.argv[2]
 req = urllib.request.Request(url, headers={"User-Agent": "memoryd-build"})
@@ -34,7 +34,8 @@ with urllib.request.urlopen(req, timeout=300) as r, open(dst, "wb") as f:
             break
         f.write(chunk)
 PY
-  echo "$sha  $dst" | sha256sum -c --status || { echo "FATAL: sha256 mismatch for $name" >&2; rm -f "$dst"; exit 1; }
+  echo "$sha  $dst.tmp" | sha256sum -c --status || { echo "FATAL: sha256 mismatch for $name" >&2; rm -f "$dst.tmp"; exit 1; }
+  mv -f "$dst.tmp" "$dst"
   echo "ok: $name (downloaded, sha256 verified)"
 done
 echo "embed model assets ready in $DIR"

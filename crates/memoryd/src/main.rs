@@ -349,7 +349,7 @@ fn serve(cli: Cli) -> Result<(), CliError> {
     println!("memoryd serve");
     println!("bind: {}", cfg.bind);
     println!("db_path: {}", cfg.db_path.display());
-    println!("worker: embed (null adapter)");
+    println!("worker: embed ({} adapter)", cfg.providers.default_adapter);
     println!("dream: scheduled every {DREAM_INTERVAL_SECS}s");
 
     for stream in listener.incoming() {
