@@ -26,15 +26,15 @@ Status legend: `[x]` shipped · `[~]` partial · `[ ]` open.
 Detail in `SECONDARY-BRAIN-PLAN.md`; constraints: no new tables/deps, all
 work in the dream plane, per-pass caps, H6 approvals gate.
 
-- `[ ]` A1. Session distillation dream phase: one synthesized
+- `[x]` A1. Session distillation dream phase: one synthesized
   `session_summary` memory per idle session (≤3 sessions/pass), linked over
   `memory_links`, `sessions.status` `open→distilled`, injection-hygienic
   prompt, re-redacted output.
-- `[ ]` A2. Heuristic extraction stage in extract-profile: induce ≤3
+- `[x]` A2. Heuristic extraction stage in extract-profile: induce ≤3
   field-agnostic decision principles per pass from recent decisions +
   session summaries; propose as `heuristic.*` facts into `approvals`
   (never direct writes).
-- `[ ]` A3. Persona surface: `memory_profile` MCP tool (approved facts +
+- `[x]` A3. Persona surface: `memory_profile` MCP tool (approved facts +
   top-centrality themes) and the deferred MCP resources
   (`memory://profile`, `memory://session/{id}`) with `resources` capability.
 - `[ ]` A4. (Post-A3, optional) Multi-user/consent model for personas served
@@ -87,10 +87,10 @@ corpus hygiene, not query latency.
   can join the single-writer actor (the documented `[~]` carve-out: today
   inference inside Store methods would serialize captures behind dream
   passes).
-- `[ ]` D2. MCP `memory_remember` provenance: `remember_event` hardcodes
+- `[x]` D2. MCP `memory_remember` provenance: `remember_event` hardcodes
   `agent: "cli"`; stamp `mcp` (and thread the real agent name through) so
   provenance distinguishes capture surfaces.
-- `[ ]` D3. Session-idle awareness for `serve`: sessions never transition
+- `[x]` D3. Session-idle awareness (shipped inside A1's close-sweep) for `serve`: sessions never transition
   from `open` today except A1's distillation; consider a cheap
   `status='closed'` sweep in the dream pass so `sessions` reflects reality
   even without A1.

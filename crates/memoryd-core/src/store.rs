@@ -2127,6 +2127,85 @@ impl Store {
         }))
     }
 
+    /// Active (approved, not superseded/retracted) profile facts, key-ordered —
+    /// the owner-curated persona kernel served by `memory_profile` and
+    /// `memory://profile` (secondary-brain A3). Read-only, index-backed.
+    pub fn active_profile_facts(&self, limit: usize) -> Result<Vec<ProfileFact>, StoreError> {
+        let limit = i64::try_from(limit.clamp(1, 200)).unwrap_or(1);
+        let mut stmt = self.conn.prepare(
+            "SELECT fact_key, fact_value, confidence FROM profile_facts
+             WHERE state = 'active' ORDER BY fact_key ASC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                Ok(ProfileFact {
+                    fact_key: row.get(0)?,
+                    fact_value: row.get(1)?,
+                    confidence: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Recall-eligible memories ranked by graph centrality — the themes the
+    /// owner's sessions return to most (the association graph's "thinking
+    /// fingerprint"). Read-only, bounded.
+    pub fn top_central_memories(&self, limit: usize) -> Result<Vec<CentralMemory>, StoreError> {
+        let limit = i64::try_from(limit.clamp(1, 50)).unwrap_or(1);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, content, centrality FROM memories
+             WHERE lifecycle_state IN ('active', 'associated', 'decaying', 'dormant')
+               AND centrality > 0.0
+             ORDER BY centrality DESC, id ASC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                Ok(CentralMemory {
+                    memory_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    content: row.get(2)?,
+                    centrality: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Distilled sessions (newest first) for the `memory://session/{id}` MCP
+    /// resource listing: id, narrative summary, and when the session ended.
+    pub fn distilled_sessions(&self, limit: usize) -> Result<Vec<DistilledSession>, StoreError> {
+        let limit = i64::try_from(limit.clamp(1, 100)).unwrap_or(1);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, summary, ended_at FROM sessions
+             WHERE status = 'consolidated' AND summary IS NOT NULL
+             ORDER BY ended_at DESC, id ASC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                Ok(DistilledSession {
+                    session_id: row.get(0)?,
+                    summary: row.get(1)?,
+                    ended_at: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// One distilled session's narrative by id (`memory://session/{id}` read).
+    pub fn distilled_session(&self, session_id: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT summary FROM sessions
+                 WHERE id = ?1 AND status = 'consolidated' AND summary IS NOT NULL",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// Fetch or compute+cache the query embedding. `None` => provider returned no
     /// usable vector (caller degrades to lexical). A cache hit makes no provider
     /// call and writes no ledger row.
@@ -2481,6 +2560,31 @@ pub struct MemoryNeighbor {
     pub link_strength: f64,
     pub last_reinforced_at: i64,
     pub lifecycle_state: String,
+}
+
+/// One approved profile fact (see [`Store::active_profile_facts`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileFact {
+    pub fact_key: String,
+    pub fact_value: String,
+    pub confidence: f64,
+}
+
+/// One high-centrality memory (see [`Store::top_central_memories`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CentralMemory {
+    pub memory_id: String,
+    pub kind: String,
+    pub content: String,
+    pub centrality: f64,
+}
+
+/// One distilled session (see [`Store::distilled_sessions`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DistilledSession {
+    pub session_id: String,
+    pub summary: String,
+    pub ended_at: Option<i64>,
 }
 
 /// Result of [`Store::memory_neighbors`] — a memory plus its one-hop neighborhood.

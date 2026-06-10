@@ -274,6 +274,10 @@ because MCP clients enforce `^[a-zA-Z0-9_-]{1,64}$` for tool names (§14.3).
   hops 0|1 = 1}`. Durable-memory recall with one-hop graph expansion, falling
   back to raw-event lexical recall; same result shape as `POST /v1/recall`.
 - `memory_stats` — `{}`. Row counts for every canonical table.
+- `memory_profile` — `{limit 1-100 = 50}`. The owner's approved persona
+  kernel: active profile facts and `heuristic.*` decision principles (all
+  through the approvals gate) plus up to 12 top-centrality themes. Built for
+  one-call persona loading at session start.
 - `memory_graph` — `{memory_id (required), limit 1–50 = 16}`. Direct
   association-graph neighbors of a memory over `memory_links`, strongest link
   first, each with `link_type` (`semantic`, `co_occurrence`, ...),
@@ -284,6 +288,14 @@ Example call:
 ```json
 {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"memory_graph","arguments":{"memory_id":"27938c38d764..."}}}
 ```
+
+### Resources
+
+`resources/list` returns `memory://profile` (the persona kernel as JSON) and
+one `memory://session/{id}` entry per distilled session (newest 50);
+`resources/read` serves them (`application/json` / `text/plain`). Unknown
+URIs return `-32002` "resource not found". The capability set is
+`{"tools": {}, "resources": {}}`.
 
 ### Error mapping
 

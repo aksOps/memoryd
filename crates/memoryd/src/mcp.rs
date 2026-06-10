@@ -1,6 +1,8 @@
 //! MCP stdio facade: hand-rolled JSON-RPC 2.0 over newline-delimited stdio
-//! (protocol revision 2024-11-05), exposing the local memory store as four
-//! tools (`memory_remember`, `memory_recall`, `memory_stats`, `memory_graph`).
+//! (protocol revision 2024-11-05), exposing the local memory store as five
+//! tools (`memory_remember`, `memory_recall`, `memory_stats`,
+//! `memory_profile`, `memory_graph`) plus the `memory://profile` and
+//! `memory://session/{id}` resources (the owner persona surface).
 //!
 //! Design constraints: zero new dependencies, no sockets (stdio only), and no
 //! background workers — captures consolidate on the next `serve`/`dream` run.
@@ -14,6 +16,10 @@ use std::io::{BufRead, Write};
 pub(crate) const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const MAX_MCP_LINE_BYTES: usize = 1024 * 1024;
 const GRAPH_SNIPPET_CHARS: usize = 240;
+/// Themes returned by `memory_profile` (graph top-centrality memories).
+const PROFILE_THEME_CAP: usize = 12;
+/// Distilled sessions listed by `resources/list` (newest first).
+const RESOURCE_SESSION_CAP: usize = 50;
 
 /// Run the MCP server over this process's stdin/stdout until EOF. The banner
 /// goes to stderr so stdout stays a pure JSON-RPC stream.
@@ -104,6 +110,8 @@ fn dispatch(
             serde_json::json!({ "tools": tool_definitions() }),
         )),
         "tools/call" => Some(handle_tools_call(store, cfg, id, message.get("params"))),
+        "resources/list" => Some(handle_resources_list(store, id)),
+        "resources/read" => Some(handle_resources_read(store, id, message.get("params"))),
         _ => Some(error_response(id, -32601, "method not found")),
     }
 }
@@ -111,11 +119,13 @@ fn dispatch(
 fn initialize_result() -> serde_json::Value {
     serde_json::json!({
         "protocolVersion": MCP_PROTOCOL_VERSION,
-        "capabilities": { "tools": {} },
+        "capabilities": { "tools": {}, "resources": {} },
         "serverInfo": { "name": "memoryd", "version": env!("CARGO_PKG_VERSION") },
-        "instructions": "Local memory store. Use memory_recall before answering; \
-                         memory_remember to persist durable facts; memory_graph to walk \
-                         associations from a memory_id returned by recall.",
+        "instructions": "Local memory store and owner persona. Call memory_profile at \
+                         session start and adopt its facts, preferences, and decision \
+                         heuristics as the owner's standing positions. Use memory_recall \
+                         before answering; memory_remember to persist durable facts; \
+                         memory_graph to walk associations from a memory_id.",
     })
 }
 
@@ -160,6 +170,20 @@ fn tool_definitions() -> serde_json::Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {}
+            }
+        },
+        {
+            "name": "memory_profile",
+            "description": "The owner's approved persona kernel: profile facts, \
+                            preferences, and decision heuristics (all human-approved), \
+                            plus the high-centrality themes their sessions return to. \
+                            Load at session start and adopt as the owner's standing \
+                            positions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 }
+                }
             }
         },
         {
@@ -215,6 +239,7 @@ fn handle_tools_call(
         "memory_recall" => call_memory_recall(store, cfg, arguments),
         "memory_stats" => call_memory_stats(store),
         "memory_graph" => call_memory_graph(store, &arguments),
+        "memory_profile" => call_memory_profile(store, &arguments),
         _ => return error_response(id, -32602, "unknown tool"),
     };
     match outcome {
@@ -277,6 +302,7 @@ fn call_memory_remember(
         session_id,
         source,
         tags,
+        agent: "mcp".to_string(),
     });
     match store.capture_event_with_queue_limit(event, cfg.caps.queue_depth_max) {
         Ok(ack) => Ok(ToolOutcome::Success(serde_json::json!({
@@ -388,6 +414,128 @@ fn optional_string(
                 "optional fields must be strings",
             )),
     }
+}
+
+/// `memory_profile`: the owner-approved persona kernel (profile facts and
+/// heuristics, all through the H6 approvals gate) plus the graph's
+/// top-centrality themes. Read-only; built for one-call persona loading.
+fn call_memory_profile(
+    store: &Store,
+    arguments: &serde_json::Value,
+) -> Result<ToolOutcome, ToolError> {
+    let object = arguments
+        .as_object()
+        .ok_or(ToolError::InvalidArguments("arguments must be an object"))?;
+    let limit = match object.get("limit") {
+        None => 50,
+        Some(value) => match value.as_u64() {
+            Some(limit @ 1..=100) => limit as usize,
+            _ => {
+                return Err(ToolError::InvalidArguments(
+                    "limit must be an integer between 1 and 100",
+                ));
+            }
+        },
+    };
+    let facts = store
+        .active_profile_facts(limit)
+        .map_err(ToolError::Store)?;
+    let themes = store
+        .top_central_memories(PROFILE_THEME_CAP)
+        .map_err(ToolError::Store)?;
+    Ok(ToolOutcome::Success(serde_json::json!({
+        "facts": facts.iter().map(|fact| serde_json::json!({
+            "key": fact.fact_key,
+            "value": fact.fact_value,
+            "confidence": fact.confidence,
+        })).collect::<Vec<_>>(),
+        "themes": themes.iter().map(|theme| serde_json::json!({
+            "memory_id": theme.memory_id,
+            "kind": theme.kind,
+            "content": snippet(&theme.content, GRAPH_SNIPPET_CHARS),
+            "centrality": theme.centrality,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+/// `resources/list`: the designed `memory://` surface — the persona profile
+/// plus one resource per distilled session (newest first, bounded).
+fn handle_resources_list(store: &Store, id: serde_json::Value) -> serde_json::Value {
+    let sessions = match store.distilled_sessions(RESOURCE_SESSION_CAP) {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            eprintln!("memoryd mcp: store error: {err}");
+            return error_response(id, -32603, "store error");
+        }
+    };
+    let mut resources = vec![serde_json::json!({
+        "uri": "memory://profile",
+        "name": "Owner profile",
+        "description": "Approved profile facts, decision heuristics, and top themes.",
+        "mimeType": "application/json",
+    })];
+    for session in sessions {
+        resources.push(serde_json::json!({
+            "uri": format!("memory://session/{}", session.session_id),
+            "name": format!("Session {}", session.session_id),
+            "description": "Distilled session narrative (what was done, decided, and why).",
+            "mimeType": "text/plain",
+        }));
+    }
+    result_response(id, serde_json::json!({ "resources": resources }))
+}
+
+/// `resources/read`: serve `memory://profile` (JSON) or a distilled session
+/// narrative (`memory://session/{id}`, plain text). Unknown URIs error.
+fn handle_resources_read(
+    store: &Store,
+    id: serde_json::Value,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let Some(uri) = params
+        .and_then(serde_json::Value::as_object)
+        .and_then(|params| params.get("uri"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return error_response(id, -32602, "uri is required");
+    };
+    if uri == "memory://profile" {
+        return match call_memory_profile(store, &serde_json::json!({})) {
+            Ok(ToolOutcome::Success(payload)) => result_response(
+                id,
+                serde_json::json!({ "contents": [{
+                    "uri": uri,
+                    "mimeType": "application/json",
+                    "text": payload.to_string(),
+                }]}),
+            ),
+            Ok(ToolOutcome::Failure(_)) | Err(ToolError::InvalidArguments(_)) => {
+                error_response(id, -32603, "store error")
+            }
+            Err(ToolError::Store(err)) => {
+                eprintln!("memoryd mcp: store error: {err}");
+                error_response(id, -32603, "store error")
+            }
+        };
+    }
+    if let Some(session_id) = uri.strip_prefix("memory://session/") {
+        return match store.distilled_session(session_id) {
+            Ok(Some(summary)) => result_response(
+                id,
+                serde_json::json!({ "contents": [{
+                    "uri": uri,
+                    "mimeType": "text/plain",
+                    "text": summary,
+                }]}),
+            ),
+            Ok(None) => error_response(id, -32002, "resource not found"),
+            Err(err) => {
+                eprintln!("memoryd mcp: store error: {err}");
+                error_response(id, -32603, "store error")
+            }
+        };
+    }
+    error_response(id, -32002, "resource not found")
 }
 
 /// Char-boundary-safe truncation for graph payloads: contents longer than
@@ -519,10 +667,8 @@ mod tests {
             "tools capability advertised"
         );
         assert!(
-            response["result"]["capabilities"]
-                .get("resources")
-                .is_none(),
-            "no resources capability"
+            response["result"]["capabilities"]["resources"].is_object(),
+            "resources capability advertised"
         );
         assert!(response["result"]["instructions"].is_string());
         cleanup_db_files(&path);
@@ -561,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_exactly_four_tools() {
+    fn tools_list_returns_exactly_five_tools() {
         let (path, cfg, mut store) = open_fixture("mcp-tools-list");
         let mut initialized = true;
 
@@ -584,6 +730,7 @@ mod tests {
                 "memory_remember",
                 "memory_recall",
                 "memory_stats",
+                "memory_profile",
                 "memory_graph"
             ]
         );
@@ -596,8 +743,9 @@ mod tests {
             serde_json::json!(["query"])
         );
         assert!(tools[2]["inputSchema"].get("required").is_none());
+        assert!(tools[3]["inputSchema"].get("required").is_none());
         assert_eq!(
-            tools[3]["inputSchema"]["required"],
+            tools[4]["inputSchema"]["required"],
             serde_json::json!(["memory_id"])
         );
         cleanup_db_files(&path);
@@ -818,6 +966,223 @@ mod tests {
         cleanup_db_files(&path);
     }
 
+    /// Seed one approved profile fact through the real public flow:
+    /// capture a preference -> dream (extract proposes into approvals) ->
+    /// accept every pending approval (H6 end to end).
+    fn seed_approved_fact_via_flow(store: &mut Store, cfg: &Config, text: &str) {
+        store
+            .capture_event(NewRawEvent {
+                session_id: "profile-seed".to_string(),
+                agent: "claude".to_string(),
+                source: "cli".to_string(),
+                kind: "preference".to_string(),
+                payload: serde_json::json!({ "text": text }),
+                provenance: serde_json::json!({}),
+                ts_ms: 1000,
+            })
+            .expect("capture succeeds");
+        let adapter = memoryd_core::adapters::AdapterKind::from_default_adapter(
+            &cfg.providers.default_adapter,
+        );
+        let opts = memoryd_core::dream::DreamOptions {
+            trigger: "manual",
+            budget_usd: 0.0,
+            max_seconds: 60,
+        };
+        memoryd_core::dream::dream_once(store, &adapter, &cfg.caps, &opts, &|| {
+            crate::unix_ms_now()
+        })
+        .expect("dream succeeds");
+        for pending in store.list_pending_approvals(10).expect("pending listed") {
+            store
+                .decide_approval(&pending.id, true, crate::unix_ms_now())
+                .expect("approval accepted");
+        }
+    }
+
+    /// Chat-capable test double whose distill returns a fixed narrative, so
+    /// the real dream distill phase can mark sessions consolidated.
+    struct DistillDouble;
+    impl memoryd_core::adapters::ProviderAdapter for DistillDouble {
+        fn id(&self) -> &'static str {
+            "openai_compat"
+        }
+        fn model_id(&self) -> &str {
+            "distill-double"
+        }
+        fn embed(
+            &self,
+            texts: &[String],
+        ) -> Result<Vec<Vec<f32>>, memoryd_core::adapters::AdapterError> {
+            Ok(texts.iter().map(|_| vec![0.0f32]).collect())
+        }
+        fn reachable(&self) -> bool {
+            true
+        }
+        fn distill(
+            &self,
+            _texts: &[String],
+        ) -> Result<Option<String>, memoryd_core::adapters::AdapterError> {
+            Ok(Some("did x, decided y".to_string()))
+        }
+    }
+
+    #[test]
+    fn memory_profile_returns_facts_and_themes() {
+        let (path, cfg, mut store) = open_fixture("mcp-profile");
+        seed_approved_fact_via_flow(&mut store, &cfg, "prefers reversible choices");
+        // Two same-session captures -> dream associate builds centrality.
+        capture_text(&mut store, "s1", 1000, "wal busy timeout fix");
+        capture_text(&mut store, "s1", 1001, "vacuum schedule weekly");
+        let adapter = memoryd_core::adapters::AdapterKind::from_default_adapter(
+            &cfg.providers.default_adapter,
+        );
+        let opts = memoryd_core::dream::DreamOptions {
+            trigger: "manual",
+            budget_usd: 0.0,
+            max_seconds: 60,
+        };
+        memoryd_core::dream::dream_once(&mut store, &adapter, &cfg.caps, &opts, &|| {
+            crate::unix_ms_now()
+        })
+        .expect("dream succeeds");
+
+        let mut initialized = true;
+        let response = dispatch(
+            &mut store,
+            &cfg,
+            &mut initialized,
+            &tools_call(21, "memory_profile", serde_json::json!({})),
+        )
+        .expect("tools/call gets a reply");
+        let payload = tool_payload(&response);
+
+        let facts = payload["facts"].as_array().expect("facts array");
+        assert_eq!(facts.len(), 1, "{payload}");
+        assert!(
+            facts[0]["key"]
+                .as_str()
+                .expect("fact key")
+                .starts_with("preference"),
+            "{payload}"
+        );
+        assert!(
+            facts[0]["value"]
+                .as_str()
+                .expect("fact value")
+                .contains("reversible"),
+            "{payload}"
+        );
+        let themes = payload["themes"].as_array().expect("themes array");
+        assert!(
+            !themes.is_empty(),
+            "associated memories carry centrality: {payload}"
+        );
+        assert!(themes[0]["centrality"].as_f64().expect("centrality") > 0.0);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn memory_profile_empty_store_is_valid_and_empty() {
+        let (path, cfg, mut store) = open_fixture("mcp-profile-empty");
+        let mut initialized = true;
+        let response = dispatch(
+            &mut store,
+            &cfg,
+            &mut initialized,
+            &tools_call(22, "memory_profile", serde_json::json!({})),
+        )
+        .expect("tools/call gets a reply");
+        let payload = tool_payload(&response);
+        assert_eq!(payload["facts"], serde_json::json!([]));
+        assert_eq!(payload["themes"], serde_json::json!([]));
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn resources_list_and_read_round_trip() {
+        let (path, cfg, mut store) = open_fixture("mcp-resources");
+        // Three distinct idle events -> real dream distill (with the chat
+        // double) marks the session consolidated with a narrative summary.
+        for index in 0..3 {
+            capture_text(
+                &mut store,
+                "s-done",
+                1000 + index,
+                &format!("distinct work item {index}"),
+            );
+        }
+        let opts = memoryd_core::dream::DreamOptions {
+            trigger: "manual",
+            budget_usd: 0.0,
+            max_seconds: 60,
+        };
+        memoryd_core::dream::dream_once(&mut store, &DistillDouble, &cfg.caps, &opts, &|| {
+            crate::unix_ms_now()
+        })
+        .expect("dream succeeds");
+
+        let mut initialized = true;
+        let listing = dispatch(
+            &mut store,
+            &cfg,
+            &mut initialized,
+            &request(23, "resources/list"),
+        )
+        .expect("resources/list gets a reply");
+        let resources = listing["result"]["resources"]
+            .as_array()
+            .expect("resources array");
+        assert_eq!(resources[0]["uri"], "memory://profile");
+        assert!(
+            resources
+                .iter()
+                .any(|resource| resource["uri"] == "memory://session/s-done"),
+            "distilled session listed: {listing}"
+        );
+
+        let profile = dispatch(
+            &mut store,
+            &cfg,
+            &mut initialized,
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 24, "method": "resources/read",
+                "params": { "uri": "memory://profile" },
+            }),
+        )
+        .expect("read gets a reply");
+        let text = profile["result"]["contents"][0]["text"]
+            .as_str()
+            .expect("profile text");
+        assert!(text.contains("facts"), "{text}");
+
+        let session = dispatch(
+            &mut store,
+            &cfg,
+            &mut initialized,
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 25, "method": "resources/read",
+                "params": { "uri": "memory://session/s-done" },
+            }),
+        )
+        .expect("read gets a reply");
+        assert_eq!(session["result"]["contents"][0]["text"], "did x, decided y");
+
+        let missing = dispatch(
+            &mut store,
+            &cfg,
+            &mut initialized,
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 26, "method": "resources/read",
+                "params": { "uri": "memory://nope" },
+            }),
+        )
+        .expect("read gets a reply");
+        assert_eq!(missing["error"]["code"], -32002);
+        assert_eq!(missing["error"]["message"], "resource not found");
+        cleanup_db_files(&path);
+    }
+
     #[test]
     fn unknown_method_is_method_not_found() {
         let (path, cfg, mut store) = open_fixture("mcp-unknown-method");
@@ -827,7 +1192,7 @@ mod tests {
             &mut store,
             &cfg,
             &mut initialized,
-            &request(13, "resources/list"),
+            &request(13, "prompts/list"),
         )
         .expect("request gets a reply");
 
@@ -878,7 +1243,7 @@ mod tests {
         assert_eq!(second["id"], 2);
         assert_eq!(
             second["result"]["tools"].as_array().expect("tools").len(),
-            4
+            5
         );
         cleanup_db_files(&path);
     }

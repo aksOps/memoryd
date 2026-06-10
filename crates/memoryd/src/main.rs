@@ -630,6 +630,8 @@ struct RememberArgs {
     session_id: String,
     source: String,
     tags: Vec<String>,
+    /// Capture surface stamped into sessions/audit provenance ("cli", "mcp").
+    agent: String,
 }
 
 impl Default for RememberArgs {
@@ -640,6 +642,7 @@ impl Default for RememberArgs {
             session_id: "cli".to_string(),
             source: "cli".to_string(),
             tags: Vec::new(),
+            agent: "cli".to_string(),
         }
     }
 }
@@ -1119,7 +1122,7 @@ impl From<std::io::Error> for CliError {
 fn remember_event(args: RememberArgs) -> NewRawEvent {
     NewRawEvent {
         session_id: args.session_id,
-        agent: "cli".to_string(),
+        agent: args.agent,
         source: args.source,
         kind: "memory".to_string(),
         payload: serde_json::json!({
