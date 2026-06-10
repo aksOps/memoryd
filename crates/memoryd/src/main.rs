@@ -12,7 +12,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -59,8 +59,9 @@ fn main() -> ExitCode {
 fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
     let cli = Cli::parse(args)?;
     match cli.command.clone() {
-        Command::Doctor => doctor(cli),
+        Command::Doctor(args) => doctor(cli, args),
         Command::Stats => stats(cli),
+        Command::Backup(args) => backup(cli, args),
         Command::Serve => serve(cli),
         Command::Remember(args) => remember(cli, args),
         Command::Recall(args) => recall(cli, args),
@@ -75,11 +76,17 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
     }
 }
 
-fn doctor(cli: Cli) -> Result<(), CliError> {
+fn doctor(cli: Cli, args: DoctorArgs) -> Result<(), CliError> {
     let cfg = cli.config()?;
     cfg.validate()?;
 
     let store = Store::open(&cfg.db_path)?;
+    if args.fix {
+        // Safe, reversible repairs only (initial-design doctor --fix):
+        // WAL checkpoint/truncate + planner statistics refresh.
+        store.optimize()?;
+        println!("fix: wal_checkpoint(TRUNCATE) + PRAGMA optimize applied");
+    }
     let report = store.doctor_report()?;
 
     println!("memoryd doctor");
@@ -92,6 +99,10 @@ fn doctor(cli: Cli) -> Result<(), CliError> {
     );
     println!("integrity_check: {}", report.integrity_check);
     println!("missing_tables: {}", report.missing_tables.len());
+    match disk_free_bytes(&cfg.db_path) {
+        Some(bytes) => println!("disk_free_mb: {}", bytes / (1024 * 1024)),
+        None => println!("disk_free_mb: unavailable"),
+    }
     println!("bind: {}", cfg.bind);
     println!("provider: {}", cfg.providers.default_adapter);
     println!("paid_spend_cap_usd: {:.2}", cfg.caps.paid_spend_cap_usd);
@@ -113,6 +124,46 @@ fn stats(cli: Cli) -> Result<(), CliError> {
         println!("{}: {}", stat.table, stat.rows);
     }
     Ok(())
+}
+
+/// Consistent live backup via `VACUUM INTO` — safe while the daemon runs,
+/// compacted, and refuses to overwrite an existing target (roadmap B4).
+fn backup(cli: Cli, args: BackupArgs) -> Result<(), CliError> {
+    let cfg = cli.config()?;
+    cfg.validate()?;
+    if args.to.is_empty() {
+        return Err(CliError::MissingArgument("--to"));
+    }
+    let store = Store::open(&cfg.db_path)?;
+    let target = PathBuf::from(&args.to);
+    store.backup_to(&target)?;
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "backup": target.display().to_string(),
+            "source": cfg.db_path.display().to_string(),
+        }))?
+    );
+    Ok(())
+}
+
+/// Best-effort free-space probe for `doctor` (M0 disk-free evidence): parses
+/// `df -k` output so no platform/libc dependency is needed; `None` when the
+/// probe is unavailable.
+fn disk_free_bytes(db_path: &Path) -> Option<u64> {
+    let dir = db_path.parent().filter(|p| !p.as_os_str().is_empty())?;
+    let output = std::process::Command::new("df")
+        .arg("-k")
+        .arg(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let fields: Vec<&str> = text.lines().nth(1)?.split_whitespace().collect();
+    // df -k: Filesystem 1K-blocks Used Available ...
+    fields.get(3)?.parse::<u64>().ok().map(|kb| kb * 1024)
 }
 
 fn remember(cli: Cli, args: RememberArgs) -> Result<(), CliError> {
@@ -648,8 +699,9 @@ impl AuthThrottle {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Command {
-    Doctor,
+    Doctor(DoctorArgs),
     Stats,
+    Backup(BackupArgs),
     Serve,
     Remember(RememberArgs),
     Recall(RecallArgs),
@@ -658,6 +710,16 @@ enum Command {
     Approve(ApproveArgs),
     Mcp,
     Help,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DoctorArgs {
+    fix: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BackupArgs {
+    to: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -754,8 +816,9 @@ impl Cli {
         let command = match args.next() {
             None => Command::Help,
             Some(raw) => match raw.to_string_lossy().as_ref() {
-                "doctor" => Command::Doctor,
+                "doctor" => Command::Doctor(DoctorArgs::default()),
                 "stats" => Command::Stats,
+                "backup" => Command::Backup(BackupArgs::default()),
                 "serve" => Command::Serve,
                 "remember" => Command::Remember(RememberArgs::default()),
                 "recall" => Command::Recall(RecallArgs::default()),
@@ -787,6 +850,18 @@ impl Cli {
                     bind = value
                         .parse()
                         .map_err(|_| CliError::InvalidBind(value.to_string()))?;
+                }
+                "--fix" => {
+                    let Command::Doctor(doctor) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    doctor.fix = true;
+                }
+                "--to" => {
+                    let Command::Backup(backup) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    backup.to = next_string(&mut args, "--to")?;
                 }
                 "--token" => {
                     bearer_token = Some(next_string(&mut args, "--token")?);
@@ -1062,7 +1137,8 @@ fn print_help() {
     println!(
         "memoryd\n\n\
          Usage:\n\
-            memoryd doctor [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>]\n\
+            memoryd doctor [--fix] [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>]\n\
+            memoryd backup --to <path> [--db <path>]\n\
             memoryd stats  [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>]\n\
             memoryd remember <content> [--kind <kind>] [--session <id>] [--source <source>] [--tags <a,b>] [--db <path>]\n\
             memoryd recall <query> [--k <limit>] [--semantic] [--hops <0|1>] [--index <brute-force|hnsw>] [--db <path>]\n\
@@ -1830,8 +1906,54 @@ mod tests {
             Cli::parse(["memoryd", "doctor", "--db", "/tmp/memoryd-test.db"].map(OsString::from))
                 .expect("cli parses");
 
-        assert_eq!(cli.command, Command::Doctor);
+        assert_eq!(cli.command, Command::Doctor(DoctorArgs::default()));
         assert_eq!(cli.db_path, PathBuf::from("/tmp/memoryd-test.db"));
+    }
+
+    #[test]
+    fn parses_doctor_fix_and_backup_to() {
+        let cli =
+            Cli::parse(["memoryd", "doctor", "--fix"].map(OsString::from)).expect("cli parses");
+        assert_eq!(cli.command, Command::Doctor(DoctorArgs { fix: true }));
+
+        let cli = Cli::parse(["memoryd", "backup", "--to", "/tmp/copy.db"].map(OsString::from))
+            .expect("cli parses");
+        assert_eq!(
+            cli.command,
+            Command::Backup(BackupArgs {
+                to: "/tmp/copy.db".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn backup_creates_consistent_copy_and_refuses_overwrite() {
+        let path = temp_db_path("backup-source");
+        let target = temp_db_path("backup-target");
+        {
+            let mut store = Store::open(&path).expect("store opens");
+            store
+                .capture_event(NewRawEvent {
+                    session_id: "b1".to_string(),
+                    agent: "cli".to_string(),
+                    source: "cli".to_string(),
+                    kind: "memory".to_string(),
+                    payload: serde_json::json!({"text": "backed up"}),
+                    provenance: serde_json::json!({}),
+                    ts_ms: 1000,
+                })
+                .expect("capture succeeds");
+            store.backup_to(&target).expect("backup succeeds");
+            assert!(matches!(
+                store.backup_to(&target),
+                Err(StoreError::BackupTargetExists(_))
+            ));
+        }
+        let copy = Store::open(&target).expect("copy opens");
+        let stats = copy.table_stats().expect("stats");
+        assert_eq!(table_rows(&stats, "raw_events"), 1, "copy is consistent");
+        cleanup_db_files(&path);
+        cleanup_db_files(&target);
     }
 
     #[test]

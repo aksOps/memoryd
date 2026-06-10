@@ -878,6 +878,30 @@ impl Store {
         Ok(batch)
     }
 
+    /// Safe, reversible file hygiene (roadmap B4, initial-design `doctor --fix`):
+    /// checkpoint + truncate the WAL and let SQLite refresh its query-planner
+    /// statistics. No schema or data changes.
+    pub fn optimize(&self) -> Result<(), StoreError> {
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        self.conn.execute_batch("PRAGMA optimize;")?;
+        Ok(())
+    }
+
+    /// Consistent live backup via `VACUUM INTO` (roadmap B4): a compacted,
+    /// transactionally-consistent copy that is safe while the daemon runs.
+    /// Refuses to overwrite an existing file.
+    pub fn backup_to(&self, target: &Path) -> Result<(), StoreError> {
+        if target.exists() {
+            return Err(StoreError::BackupTargetExists(target.display().to_string()));
+        }
+        let target = target.to_str().ok_or_else(|| {
+            StoreError::BackupTargetExists("backup path must be valid UTF-8".to_string())
+        })?;
+        self.conn.execute("VACUUM INTO ?1", params![target])?;
+        Ok(())
+    }
+
     /// Total estimated provider spend recorded since `since_ms` (rolling-window
     /// ledger, roadmap C2). Backed by the `provider_usage` table.
     pub fn provider_spend_since(&self, since_ms: i64) -> Result<f64, StoreError> {
@@ -2754,6 +2778,7 @@ pub enum StoreError {
     ApprovalNotFound(String),
     MalformedApproval(String),
     WriterGone,
+    BackupTargetExists(String),
 }
 
 impl fmt::Display for StoreError {
@@ -2771,6 +2796,9 @@ impl fmt::Display for StoreError {
             Self::ApprovalNotFound(id) => write!(f, "approval not found: {id}"),
             Self::MalformedApproval(msg) => write!(f, "malformed approval: {msg}"),
             Self::WriterGone => write!(f, "store writer thread is gone"),
+            Self::BackupTargetExists(path) => {
+                write!(f, "backup target already exists: {path}")
+            }
         }
     }
 }

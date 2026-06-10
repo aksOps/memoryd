@@ -57,7 +57,7 @@ corpus hygiene, not query latency.
 - `[ ]` B3. Audit-log retention: an explicit policy decision — the table is
   append-only by trigger *by design*, so pruning needs a deliberate
   migration + documented integrity trade-off. Decide; do not silently relax.
-- `[ ]` B4. `doctor --fix` file hygiene: `PRAGMA optimize`,
+- `[x]` B4. `doctor --fix` file hygiene: `PRAGMA optimize`,
   `wal_checkpoint`, and a `VACUUM INTO`-based backup subcommand (also the
   documented safe-copy path while the daemon runs).
 - `[ ]` B5. Persistent full-corpus HNSW (M9 follow-up): only needed if/when
