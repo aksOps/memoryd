@@ -74,10 +74,15 @@ bind; everything else is hardening, defense-in-depth, or planned-work tracking.
   the accept loop is non-blocking and observes the flag within ~50ms, waits
   up to 5s for in-flight connections, and joins the embed worker and dream
   scheduler (sliced sleeps) before exit.
-- `[ ]` Consolidate the three writers (HTTP handler, embed worker, dream
-  loop) onto the planned single-writer `store::Writer` actor
-  (ARCHITECTURE-PLAN §7.1/U5). WAL + `busy_timeout=5000` makes today's shape
-  safe but contention-prone.
+- `[~]` Consolidate writers onto the single-writer `store::Writer` actor
+  (ARCHITECTURE-PLAN §7.1/U5). Shipped: HTTP capture, auth-audit rows, and the
+  embed worker's lease/complete/fail all route through the actor
+  (`crates/memoryd-core/src/writer.rs`, closure-channel `WriterHandle::exec`
+  + `StoreAccess` trait); recall/health use per-connection read stores. The
+  dream loop intentionally remains a direct low-frequency writer because
+  `consolidate_pending` runs inference inside Store methods and would
+  serialize capture latency behind dream passes — splitting compute out of
+  `consolidate_pending` is tracked as follow-up.
 - `[x]` `GET /v1/health` endpoint. Shipped: `{"status":"ok","schema_version"}`;
   auth-exempt for loopback peers only (read-only, supervisor-friendly),
   bearer-gated for everyone else, 405 for non-GET.

@@ -2163,6 +2163,7 @@ pub enum StoreError {
     Adapter(String),
     ApprovalNotFound(String),
     MalformedApproval(String),
+    WriterGone,
 }
 
 impl fmt::Display for StoreError {
@@ -2179,6 +2180,7 @@ impl fmt::Display for StoreError {
             Self::Adapter(msg) => write!(f, "provider adapter error: {msg}"),
             Self::ApprovalNotFound(id) => write!(f, "approval not found: {id}"),
             Self::MalformedApproval(msg) => write!(f, "malformed approval: {msg}"),
+            Self::WriterGone => write!(f, "store writer thread is gone"),
         }
     }
 }

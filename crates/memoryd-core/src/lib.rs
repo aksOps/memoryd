@@ -8,3 +8,4 @@ pub mod localembed;
 pub mod store;
 pub mod vectorindex;
 pub mod worker;
+pub mod writer;

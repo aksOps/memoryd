@@ -7,7 +7,7 @@
 
 use crate::adapters::{AdapterError, ProviderAdapter, prompt_token_estimate};
 use crate::config::Caps;
-use crate::store::{Store, StoreError};
+use crate::store::StoreError;
 
 /// Per-tick counts for observability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -18,8 +18,13 @@ pub struct TickReport {
 }
 
 /// Lease and process one governor-bounded batch of embed jobs.
-pub fn tick_embed<A: ProviderAdapter>(
-    store: &mut Store,
+///
+/// Generic over [`StoreAccess`]: pass a `&mut Store` to run writes inline, or
+/// a [`crate::writer::WriterHandle`] to route them through the single-writer
+/// actor. Adapter inference always runs on the calling thread; only the
+/// lease/complete/fail writes go through `access`.
+pub fn tick_embed<A: ProviderAdapter, S: crate::writer::StoreAccess>(
+    access: &mut S,
     adapter: &A,
     caps: &Caps,
     now_ms: i64,
@@ -27,53 +32,65 @@ pub fn tick_embed<A: ProviderAdapter>(
     let limit = caps.worker_concurrency.max(1);
     let visibility_ms =
         i64::try_from(caps.lease_visibility_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
-    let leased = store.lease_embed_jobs(limit, now_ms, visibility_ms)?;
+    let leased = access.run(move |s| s.lease_embed_jobs(limit, now_ms, visibility_ms))??;
 
     let mut report = TickReport {
         leased: leased.len(),
         ..Default::default()
     };
 
+    let max_attempts = caps.job_max_attempts;
+    let backoff_base_ms = caps.job_backoff_base_ms;
+
     for job in leased {
         match adapter.embed(std::slice::from_ref(&job.content)) {
             Ok(vectors) => match vectors.into_iter().next() {
                 Some(vector) if !vector.is_empty() => {
-                    store.complete_embed_job(
-                        job.job_id,
-                        job.raw_event_id,
-                        crate::store::EmbedProvider {
-                            adapter_id: adapter.id(),
-                            model_id: adapter.model_id(),
-                        },
-                        &vector,
-                        prompt_token_estimate(&job.content),
-                        now_ms,
-                    )?;
+                    let adapter_id = adapter.id();
+                    let model_id = adapter.model_id().to_string();
+                    let prompt_tokens = prompt_token_estimate(&job.content);
+                    access.run(move |s| {
+                        s.complete_embed_job(
+                            job.job_id,
+                            job.raw_event_id,
+                            crate::store::EmbedProvider {
+                                adapter_id,
+                                model_id: &model_id,
+                            },
+                            &vector,
+                            prompt_tokens,
+                            now_ms,
+                        )
+                    })??;
                     report.completed += 1;
                 }
                 _ => {
                     // An adapter that returns no usable vector must not silently
                     // persist a zero-dim embedding and mark the job done.
-                    store.fail_job(
-                        job.job_id,
-                        job.attempts,
-                        "adapter returned no embedding vector",
-                        now_ms,
-                        caps.job_max_attempts,
-                        caps.job_backoff_base_ms,
-                    )?;
+                    access.run(move |s| {
+                        s.fail_job(
+                            job.job_id,
+                            job.attempts,
+                            "adapter returned no embedding vector",
+                            now_ms,
+                            max_attempts,
+                            backoff_base_ms,
+                        )
+                    })??;
                     report.failed += 1;
                 }
             },
             Err(AdapterError::Embed(message)) => {
-                store.fail_job(
-                    job.job_id,
-                    job.attempts,
-                    &message,
-                    now_ms,
-                    caps.job_max_attempts,
-                    caps.job_backoff_base_ms,
-                )?;
+                access.run(move |s| {
+                    s.fail_job(
+                        job.job_id,
+                        job.attempts,
+                        &message,
+                        now_ms,
+                        max_attempts,
+                        backoff_base_ms,
+                    )
+                })??;
                 report.failed += 1;
             }
         }
@@ -86,7 +103,7 @@ pub fn tick_embed<A: ProviderAdapter>(
 mod tests {
     use super::*;
     use crate::adapters::NullAdapter;
-    use crate::store::NewRawEvent;
+    use crate::store::{NewRawEvent, Store};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -185,6 +202,40 @@ mod tests {
         fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, AdapterError> {
             Err(AdapterError::Embed("synthetic adapter failure".to_string()))
         }
+    }
+
+    #[test]
+    fn tick_embed_completes_jobs_through_writer_handle() {
+        let path = temp_db_path("worker-writer-handle");
+        {
+            let mut store = Store::open(&path).expect("store opens");
+            capture_text(&mut store, "s1", 1000, "alpha embed candidate");
+            capture_text(&mut store, "s1", 1001, "beta embed candidate");
+        }
+
+        let (mut handle, join) = crate::writer::Writer::spawn(&path).expect("writer spawns");
+
+        let adapter = NullAdapter::new();
+        let mut caps = Caps::small();
+        caps.worker_concurrency = 2;
+
+        let report =
+            tick_embed(&mut handle, &adapter, &caps, 9_000_000_000_000).expect("tick runs");
+        assert_eq!(report.leased, 2);
+        assert_eq!(report.completed, 2);
+        assert_eq!(report.failed, 0);
+
+        drop(handle);
+        join.join().expect("writer thread exits cleanly");
+
+        // Verify through a separate read store that the writes landed.
+        assert_eq!(embeddings_count(&path), 2);
+        let mut reader = Store::open(&path).expect("read store opens");
+        let after = tick_embed(&mut reader, &adapter, &caps, 9_000_000_000_001)
+            .expect("follow-up tick runs");
+        assert_eq!(after, TickReport::default());
+
+        cleanup_db_files(&path);
     }
 
     #[test]

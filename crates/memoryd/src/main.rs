@@ -5,6 +5,7 @@ use memoryd_core::store::{
     ApprovalDecision, ApprovalRow, CaptureAck, MemoryRecallResult, NewRawEvent, RecallResult,
     Store, StoreError,
 };
+use memoryd_core::writer::WriterHandle;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
@@ -297,35 +298,31 @@ fn serve(cli: Cli) -> Result<(), CliError> {
     let cfg = cli.config()?;
     cfg.validate()?;
 
-    // Fail fast (and run migrations once) before any background thread starts;
-    // connection threads open their own per-connection stores.
-    drop(Store::open(&cfg.db_path)?);
+    // The single-writer actor (ARCHITECTURE-PLAN s7.1/U5): HTTP capture, auth
+    // audit, and the embed worker route writes through this one thread.
+    // Writer::spawn opens the store, so startup still fails fast and runs
+    // migrations before any background thread starts.
+    let (writer, writer_thread) = memoryd_core::writer::Writer::spawn(&cfg.db_path)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         signal_hook::flag::register(signal, Arc::clone(&shutdown))?;
     }
 
-    let worker_db = cfg.db_path.clone();
     let worker_caps = cfg.caps.clone();
     let worker_adapter_kind = cfg.providers.default_adapter.clone();
     let worker_shutdown = Arc::clone(&shutdown);
-    // Consolidating onto the planned single-writer actor (ARCHITECTURE-PLAN
-    // s7.1/U5) is deferred; today this is a second writer that drains its
-    // in-flight tick and exits on shutdown.
+    let mut worker_access = writer.clone();
+    // The embed worker leases/completes jobs through the writer actor; only
+    // the embedding compute runs on this thread. It drains its in-flight tick
+    // and exits on shutdown.
     let worker = std::thread::spawn(move || {
         let adapter =
             memoryd_core::adapters::AdapterKind::from_default_adapter(&worker_adapter_kind);
-        let mut worker_store = match Store::open(&worker_db) {
-            Ok(store) => store,
-            Err(err) => {
-                logging::log_error!("worker store open failed: {err}");
-                return;
-            }
-        };
         while !worker_shutdown.load(Ordering::Acquire) {
             let now = unix_ms_now();
-            match memoryd_core::worker::tick_embed(&mut worker_store, &adapter, &worker_caps, now) {
+            match memoryd_core::worker::tick_embed(&mut worker_access, &adapter, &worker_caps, now)
+            {
                 Ok(report) if report.leased == 0 => {
                     std::thread::sleep(std::time::Duration::from_millis(250));
                 }
@@ -344,6 +341,10 @@ fn serve(cli: Cli) -> Result<(), CliError> {
     let dream_shutdown = Arc::clone(&shutdown);
     // M6: a second governed background loop runs a dream pass on an interval
     // (consolidate + decay), capped by dream_wallclock_secs + paid_spend_cap_usd.
+    // The dream loop intentionally stays a direct low-frequency writer instead
+    // of using the writer actor: consolidate_pending runs inference inside
+    // Store methods, and parking that on the writer thread would serialize
+    // capture latency behind dream passes (see writer.rs module docs).
     // The interval sleep is sliced so shutdown is observed within ~500ms; an
     // in-flight dream pass finishes before the thread exits.
     let dream_worker = std::thread::spawn(move || {
@@ -395,6 +396,7 @@ fn serve(cli: Cli) -> Result<(), CliError> {
         listener,
         Arc::new(cfg),
         Arc::new(AuthThrottle::new()),
+        writer.clone(),
         Arc::clone(&shutdown),
         HTTP_READ_TIMEOUT,
         HTTP_WRITE_TIMEOUT,
@@ -406,6 +408,11 @@ fn serve(cli: Cli) -> Result<(), CliError> {
     }
     if dream_worker.join().is_err() {
         logging::log_error!("dream worker panicked during shutdown");
+    }
+    // Last writer handle drops here; the actor drains its queue and exits.
+    drop(writer);
+    if writer_thread.join().is_err() {
+        logging::log_error!("store writer panicked during shutdown");
     }
     logging::log_info!("shutdown complete");
     result
@@ -421,6 +428,7 @@ fn serve_loop(
     listener: TcpListener,
     cfg: Arc<Config>,
     throttle: Arc<AuthThrottle>,
+    writer: WriterHandle,
     shutdown: Arc<AtomicBool>,
     read_timeout: Duration,
     write_timeout: Duration,
@@ -445,11 +453,13 @@ fn serve_loop(
                 let guard = ConnectionGuard::register(Arc::clone(&active));
                 let cfg = Arc::clone(&cfg);
                 let throttle = Arc::clone(&throttle);
+                let writer = writer.clone();
                 std::thread::spawn(move || {
                     let _guard = guard;
                     if let Err(err) = handle_connection_thread(
                         &cfg,
                         &throttle,
+                        &writer,
                         stream,
                         read_timeout,
                         write_timeout,
@@ -472,19 +482,21 @@ fn serve_loop(
     Ok(())
 }
 
-/// Per-connection entry point: opens this thread's store and delegates. A store
-/// that cannot open still produces an HTTP 500 instead of a silently dropped
-/// connection.
+/// Per-connection entry point: opens this thread's read-only store and
+/// delegates; writes go through the writer actor. A store that cannot open
+/// still produces an HTTP 500 instead of a silently dropped connection.
 fn handle_connection_thread(
     cfg: &Config,
     throttle: &AuthThrottle,
+    writer: &WriterHandle,
     mut stream: TcpStream,
     read_timeout: Duration,
     write_timeout: Duration,
 ) -> Result<(), CliError> {
     match Store::open(&cfg.db_path) {
-        Ok(mut store) => handle_http_connection(
-            &mut store,
+        Ok(store) => handle_http_connection(
+            &store,
+            writer,
             cfg,
             throttle,
             stream,
@@ -1194,7 +1206,8 @@ fn recall_response_value(result: &RecallOutput) -> serde_json::Value {
 }
 
 fn handle_http_connection(
-    store: &mut Store,
+    store: &Store,
+    writer: &WriterHandle,
     cfg: &Config,
     throttle: &AuthThrottle,
     mut stream: TcpStream,
@@ -1223,7 +1236,7 @@ fn handle_http_connection(
     }
 
     let response = match read_http_request(&mut stream) {
-        Ok(request) => handle_http_request(store, cfg, peer, request),
+        Ok(request) => handle_http_request(store, writer, cfg, peer, request),
         Err(err) => HttpResponse::error(err.status, err.code, err.message),
     };
     let status = response.status;
@@ -1239,7 +1252,8 @@ fn handle_http_connection(
 }
 
 fn handle_http_request(
-    store: &mut Store,
+    store: &Store,
+    writer: &WriterHandle,
     cfg: &Config,
     peer: Option<SocketAddr>,
     request: HttpRequest,
@@ -1255,16 +1269,19 @@ fn handle_http_request(
         let peer_loopback = peer.map(|addr| addr.ip().is_loopback());
         let authorization_header_present =
             header_value(&request.headers, "authorization").is_some();
-        if store
-            .record_auth_rejection(
-                &request.method,
-                &request.path,
+        let method = request.method.clone();
+        let path = request.path.clone();
+        let reason = auth_rejection_reason(cfg, peer);
+        let audited = writer.exec(move |s| {
+            s.record_auth_rejection(
+                &method,
+                &path,
                 peer_loopback,
                 authorization_header_present,
-                auth_rejection_reason(cfg, peer),
+                reason,
             )
-            .is_err()
-        {
+        });
+        if !matches!(audited, Ok(Ok(()))) {
             return HttpResponse::error(500, "store_error", "auth audit could not be persisted");
         }
         return HttpResponse::error(401, "unauthorized", "authorization failed");
@@ -1305,7 +1322,7 @@ fn handle_http_request(
         Err(_) => return HttpResponse::error(400, "invalid_json", "request body must be JSON"),
     };
     match request.path.as_str() {
-        "/v1/capture" => handle_http_capture(store, body, cfg.caps.queue_depth_max),
+        "/v1/capture" => handle_http_capture(writer, body, cfg.caps.queue_depth_max),
         "/v1/recall" => handle_http_recall(store, body, &cfg.providers.default_adapter),
         _ => HttpResponse::error(404, "not_found", "route not found"),
     }
@@ -1329,7 +1346,7 @@ fn handle_http_health(store: &Store, request: &HttpRequest) -> HttpResponse {
 }
 
 fn handle_http_capture(
-    store: &mut Store,
+    writer: &WriterHandle,
     body: serde_json::Value,
     max_active_jobs: usize,
 ) -> HttpResponse {
@@ -1338,8 +1355,8 @@ fn handle_http_capture(
         Err(message) => return HttpResponse::error(422, "invalid_request", message),
     };
 
-    match store.capture_event_with_queue_limit(event, max_active_jobs) {
-        Ok(ack) => HttpResponse::json(
+    match writer.exec(move |s| s.capture_event_with_queue_limit(event, max_active_jobs)) {
+        Ok(Ok(ack)) => HttpResponse::json(
             202,
             "Accepted",
             serde_json::json!({
@@ -1350,10 +1367,12 @@ fn handle_http_capture(
                 "processed": ack.processed,
             }),
         ),
-        Err(StoreError::InvalidCaptureField(_)) => {
+        Ok(Err(StoreError::InvalidCaptureField(_))) => {
             HttpResponse::error(422, "invalid_request", "capture fields must not be empty")
         }
-        Err(_) => HttpResponse::error(500, "store_error", "capture could not be persisted"),
+        Ok(Err(_)) | Err(_) => {
+            HttpResponse::error(500, "store_error", "capture could not be persisted")
+        }
     }
 }
 
@@ -2158,10 +2177,12 @@ mod tests {
     fn http_capture_route_persists_event_on_loopback() {
         let path = temp_db_path("http-capture");
         let cfg = Config::with_db_path(path.clone());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2197,10 +2218,12 @@ mod tests {
         let path = temp_db_path("http-capture-queue-full");
         let mut cfg = Config::with_db_path(path.clone());
         cfg.caps.queue_depth_max = 0;
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2236,7 +2259,8 @@ mod tests {
     fn http_capture_100_sequential_requests_p95_stays_under_m1_target() {
         let path = temp_db_path("http-capture-latency");
         let cfg = Config::with_db_path(path.clone());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
         let mut durations = Vec::with_capacity(100);
 
         for index in 0..100 {
@@ -2254,7 +2278,8 @@ mod tests {
             .into_bytes();
             let started = Instant::now();
             let response = handle_http_request(
-                &mut store,
+                &store,
+                &writer,
                 &cfg,
                 Some("127.0.0.1:65000".parse().expect("peer parses")),
                 HttpRequest {
@@ -2285,10 +2310,12 @@ mod tests {
         let path = temp_db_path("http-auth");
         let mut cfg = Config::with_db_path(path.clone());
         cfg.bearer_token = Some("secret".to_string());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2321,10 +2348,12 @@ mod tests {
         let configured_secret = "configuredsupersecretvalue";
         let presented_secret = "presentedsupersecretvalue";
         cfg.bearer_token = Some(configured_secret.to_string());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2364,10 +2393,12 @@ mod tests {
         let path = temp_db_path("http-auth-ok");
         let mut cfg = Config::with_db_path(path.clone());
         cfg.bearer_token = Some("secret".to_string());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2400,10 +2431,12 @@ mod tests {
     fn http_capture_rejects_invalid_json_without_writes() {
         let path = temp_db_path("http-invalid-json");
         let cfg = Config::with_db_path(path.clone());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2427,10 +2460,12 @@ mod tests {
     fn http_capture_rejects_missing_payload_without_writes() {
         let path = temp_db_path("http-missing-payload");
         let cfg = Config::with_db_path(path.clone());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2460,10 +2495,12 @@ mod tests {
     fn http_chunked_transfer_encoding_returns_501() {
         let path = temp_db_path("http-chunked");
         let cfg = Config::with_db_path(path.clone());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2487,10 +2524,12 @@ mod tests {
     fn http_capture_rejects_string_ts_ms() {
         let path = temp_db_path("http-string-ts");
         let cfg = Config::with_db_path(path.clone());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2536,6 +2575,7 @@ mod tests {
         let path = temp_db_path("http-recall");
         let cfg = Config::with_db_path(path.clone());
         let mut store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
         store
             .capture_event(NewRawEvent {
                 session_id: "session-1".to_string(),
@@ -2549,7 +2589,8 @@ mod tests {
             .expect("capture succeeds");
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2574,7 +2615,8 @@ mod tests {
     fn http_capture_redacts_secret_payload_before_recall_returns_it() {
         let path = temp_db_path("http-redacts-before-recall");
         let cfg = Config::with_db_path(path.clone());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
         let bearer = "leakycredentialvalue";
         let api_key = "structuredapikeyvalue";
         let email = "ops@example.test";
@@ -2592,7 +2634,8 @@ mod tests {
         );
 
         let capture_response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2605,7 +2648,8 @@ mod tests {
         assert_eq!(capture_response.status, 202);
 
         let recall_response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2629,7 +2673,8 @@ mod tests {
         assert!(!content.contains(email));
 
         let secret_response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2655,10 +2700,12 @@ mod tests {
     fn http_recall_rejects_empty_query() {
         let path = temp_db_path("http-recall-empty");
         let cfg = Config::with_db_path(path.clone());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2700,6 +2747,14 @@ mod tests {
 
     fn test_ip(last: u8) -> IpAddr {
         IpAddr::from([10, 0, 0, last])
+    }
+
+    /// Writer actor for handler tests. The join handle is dropped; the actor
+    /// thread exits when the returned handle goes out of scope.
+    fn test_writer(path: &Path) -> WriterHandle {
+        let (writer, _thread) =
+            memoryd_core::writer::Writer::spawn(path).expect("writer spawns for test");
+        writer
     }
 
     #[test]
@@ -2793,11 +2848,14 @@ mod tests {
         let throttle = Arc::new(AuthThrottle::new());
         let shutdown = Arc::new(AtomicBool::new(false));
         let loop_shutdown = Arc::clone(&shutdown);
+        let (writer, _writer_thread) =
+            memoryd_core::writer::Writer::spawn(&cfg.db_path).expect("writer spawns for test");
         let handle = std::thread::spawn(move || {
             serve_loop(
                 listener,
                 cfg,
                 throttle,
+                writer,
                 loop_shutdown,
                 Duration::from_millis(200),
                 Duration::from_secs(5),
@@ -2893,6 +2951,44 @@ mod tests {
     }
 
     #[test]
+    fn tcp_concurrent_captures_through_writer_all_persist() {
+        let path = temp_db_path("tcp-writer-concurrent");
+        let (addr, _handle, _shutdown) = spawn_test_server(Config::with_db_path(path.clone()));
+
+        let threads: Vec<_> = (0..8)
+            .map(|index| {
+                std::thread::spawn(move || {
+                    let body = format!(
+                        r#"{{"session_id":"s{index}","agent":"a","source":"hook","kind":"observation","payload":{{"text":"concurrent {index}"}}}}"#
+                    );
+                    let raw = format!(
+                        "POST /v1/capture HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    send_raw_request(addr, &raw)
+                })
+            })
+            .collect();
+        for thread in threads {
+            let response = thread.join().expect("capture thread joins");
+            assert!(
+                response.starts_with("HTTP/1.1 202"),
+                "every concurrent capture is accepted, got: {response}"
+            );
+        }
+
+        let store = Store::open(&path).expect("store opens");
+        let stats = store.table_stats().expect("table stats");
+        assert_eq!(
+            table_rows(&stats, "raw_events"),
+            8,
+            "all writes serialized through the writer actor persisted"
+        );
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
     fn serve_loop_exits_when_shutdown_flag_set() {
         let path = temp_db_path("serve-shutdown");
         let (_addr, handle, shutdown) = spawn_test_server(Config::with_db_path(path.clone()));
@@ -2943,10 +3039,12 @@ mod tests {
         let path = temp_db_path("http-health-loopback");
         let mut cfg = Config::with_db_path(path.clone());
         cfg.bearer_token = Some("configured-token-0123456789".to_string());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2974,10 +3072,12 @@ mod tests {
         let mut cfg = Config::with_db_path(path.clone());
         cfg.bind = "0.0.0.0:7077".parse().expect("bind parses");
         cfg.bearer_token = Some("configured-token-0123456789".to_string());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("203.0.113.9:50000".parse().expect("peer parses")),
             HttpRequest {
@@ -2990,7 +3090,8 @@ mod tests {
         assert_eq!(response.status, 401);
 
         let authorized = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("203.0.113.9:50000".parse().expect("peer parses")),
             HttpRequest {
@@ -3012,10 +3113,12 @@ mod tests {
     fn http_health_rejects_post() {
         let path = temp_db_path("http-health-post");
         let cfg = Config::with_db_path(path.clone());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
