@@ -1755,6 +1755,60 @@ impl Store {
         })
     }
 
+    /// One-hop association walk from a single memory (the MCP `memory_graph` tool).
+    /// Links are stored symmetrically, so a single src lookup yields the full
+    /// neighborhood. Returns `None` when the id is unknown or not in a recallable
+    /// lifecycle state; neighbors in non-recallable states are filtered out.
+    pub fn memory_neighbors(
+        &self,
+        memory_id: &str,
+        limit: usize,
+    ) -> Result<Option<MemoryNeighborhood>, StoreError> {
+        let limit = i64::try_from(limit.clamp(1, 50)).unwrap_or(1);
+        let source: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT kind, content FROM memories
+                 WHERE id = ?1
+                   AND lifecycle_state IN ('active', 'associated', 'decaying', 'dormant')",
+                params![memory_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((kind, content)) = source else {
+            return Ok(None);
+        };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT l.dst_memory_id, m.kind, m.content, l.link_type, l.weight,
+                    l.last_reinforced_at, m.lifecycle_state
+             FROM memory_links l JOIN memories m ON m.id = l.dst_memory_id
+             WHERE l.src_memory_id = ?1
+               AND m.lifecycle_state IN ('active', 'associated', 'decaying', 'dormant')
+             ORDER BY l.weight DESC, l.dst_memory_id LIMIT ?2",
+        )?;
+        let neighbors = stmt
+            .query_map(params![memory_id, limit], |row| {
+                Ok(MemoryNeighbor {
+                    memory_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    content: row.get(2)?,
+                    link_type: row.get(3)?,
+                    link_strength: row.get(4)?,
+                    last_reinforced_at: row.get(5)?,
+                    lifecycle_state: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Some(MemoryNeighborhood {
+            memory_id: memory_id.to_string(),
+            kind,
+            content,
+            neighbors,
+        }))
+    }
+
     /// Fetch or compute+cache the query embedding. `None` => provider returned no
     /// usable vector (caller degrades to lexical). A cache hit makes no provider
     /// call and writes no ledger row.
@@ -2096,6 +2150,28 @@ pub struct MemoryRecallResult {
     pub mode: &'static str,
     /// Number of candidate memory vectors compared (semantic rerank); 0 when lexical.
     pub compared: usize,
+}
+
+/// One linked memory returned by [`Store::memory_neighbors`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryNeighbor {
+    pub memory_id: String,
+    pub kind: String,
+    pub content: String,
+    pub link_type: String,
+    /// The stored link `weight` (symmetric, reinforced over dream runs).
+    pub link_strength: f64,
+    pub last_reinforced_at: i64,
+    pub lifecycle_state: String,
+}
+
+/// Result of [`Store::memory_neighbors`] — a memory plus its one-hop neighborhood.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryNeighborhood {
+    pub memory_id: String,
+    pub kind: String,
+    pub content: String,
+    pub neighbors: Vec<MemoryNeighbor>,
 }
 
 /// A claimed embed job — the unit a worker processes for one lease.
@@ -6437,6 +6513,171 @@ mod tests {
             !result.hits.is_empty(),
             "semantic recall returns the dark-theme memory"
         );
+        cleanup_db_files(&path);
+    }
+
+    // ---- MCP: one-hop neighborhood lookup (memory_neighbors) ----
+
+    #[test]
+    fn memory_neighbors_returns_strongest_links_first() {
+        let path = temp_db_path("neighbors-order");
+        let store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_mem(
+            &store,
+            "a",
+            "observation",
+            "wal fix",
+            Some("s1"),
+            "active",
+            now,
+        );
+        seed_mem(
+            &store,
+            "b",
+            "observation",
+            "vacuum schedule",
+            Some("s1"),
+            "active",
+            now,
+        );
+        seed_mem(
+            &store,
+            "c",
+            "rule",
+            "use flyway",
+            Some("s1"),
+            "associated",
+            now,
+        );
+        seed_link(&store, "a", "b", "co_occurrence", 0.30, now);
+        seed_link(&store, "a", "c", "semantic", 0.80, now + 5);
+
+        let hood = store
+            .memory_neighbors("a", 10)
+            .expect("lookup succeeds")
+            .expect("memory exists");
+
+        assert_eq!(hood.memory_id, "a");
+        assert_eq!(hood.kind, "observation");
+        assert_eq!(hood.content, "wal fix");
+        assert_eq!(hood.neighbors.len(), 2);
+        assert_eq!(hood.neighbors[0].memory_id, "c", "strongest link first");
+        assert_eq!(hood.neighbors[0].link_type, "semantic");
+        assert!((hood.neighbors[0].link_strength - 0.80).abs() < 1e-9);
+        assert_eq!(hood.neighbors[0].last_reinforced_at, now + 5);
+        assert_eq!(hood.neighbors[0].lifecycle_state, "associated");
+        assert_eq!(hood.neighbors[1].memory_id, "b");
+        assert_eq!(hood.neighbors[1].link_type, "co_occurrence");
+        assert!((hood.neighbors[1].link_strength - 0.30).abs() < 1e-9);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn memory_neighbors_unknown_id_returns_none() {
+        let path = temp_db_path("neighbors-unknown");
+        let store = Store::open(&path).expect("store opens");
+
+        assert_eq!(store.memory_neighbors("nope", 10).expect("lookup"), None);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn memory_neighbors_filters_non_recallable_lifecycles() {
+        let path = temp_db_path("neighbors-lifecycle");
+        let store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_mem(
+            &store,
+            "a",
+            "observation",
+            "wal fix",
+            Some("s1"),
+            "active",
+            now,
+        );
+        seed_mem(
+            &store,
+            "b",
+            "observation",
+            "old note",
+            Some("s1"),
+            "archived",
+            now,
+        );
+        seed_mem(
+            &store,
+            "c",
+            "observation",
+            "live note",
+            Some("s1"),
+            "decaying",
+            now,
+        );
+        seed_link(&store, "a", "b", "co_occurrence", 0.90, now);
+        seed_link(&store, "a", "c", "co_occurrence", 0.30, now);
+
+        let hood = store
+            .memory_neighbors("a", 10)
+            .expect("lookup succeeds")
+            .expect("memory exists");
+        assert_eq!(hood.neighbors.len(), 1, "archived neighbor is filtered");
+        assert_eq!(hood.neighbors[0].memory_id, "c");
+
+        // A non-recallable source id behaves like an unknown id.
+        assert_eq!(store.memory_neighbors("b", 10).expect("lookup"), None);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn memory_neighbors_clamps_limit() {
+        let path = temp_db_path("neighbors-clamp");
+        let store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_mem(
+            &store,
+            "a",
+            "observation",
+            "wal fix",
+            Some("s1"),
+            "active",
+            now,
+        );
+        seed_mem(
+            &store,
+            "b",
+            "observation",
+            "first",
+            Some("s1"),
+            "active",
+            now,
+        );
+        seed_mem(
+            &store,
+            "c",
+            "observation",
+            "second",
+            Some("s1"),
+            "active",
+            now,
+        );
+        seed_link(&store, "a", "b", "co_occurrence", 0.80, now);
+        seed_link(&store, "a", "c", "co_occurrence", 0.40, now);
+
+        // limit 0 clamps up to 1 (never an empty/invalid LIMIT).
+        let hood = store
+            .memory_neighbors("a", 0)
+            .expect("lookup succeeds")
+            .expect("memory exists");
+        assert_eq!(hood.neighbors.len(), 1);
+        assert_eq!(hood.neighbors[0].memory_id, "b", "strongest survives clamp");
+
+        // An oversized limit clamps down to 50 (no error, all rows still fit).
+        let hood = store
+            .memory_neighbors("a", 5_000)
+            .expect("lookup succeeds")
+            .expect("memory exists");
+        assert_eq!(hood.neighbors.len(), 2);
         cleanup_db_files(&path);
     }
 }

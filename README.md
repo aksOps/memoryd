@@ -27,7 +27,41 @@ cargo run -p memoryd -- stats --db /tmp/memoryd.db
 cargo run -p memoryd -- remember "Prod migrations use flyway" --kind rule --tags ops,db --db /tmp/memoryd.db
 cargo run -p memoryd -- recall "flyway migrations" --k 5 --db /tmp/memoryd.db
 cargo run -p memoryd -- serve --db /tmp/memoryd.db --bind 127.0.0.1:7077
+cargo run -p memoryd -- mcp --db /tmp/memoryd.db
 ```
+
+## MCP
+
+`memoryd mcp` speaks MCP (protocol revision `2024-11-05`) over stdio — newline-
+delimited JSON-RPC 2.0, no network bind ever — so MCP clients can use the
+memory store and its association graph directly. It exposes four tools:
+`memory_remember`, `memory_recall` (durable-memory recall with one-hop graph
+expansion), `memory_stats`, and `memory_graph` (typed, weighted neighbors of a
+memory over `memory_links`). Client configuration:
+
+```json
+{
+  "mcpServers": {
+    "memoryd": {
+      "command": "memoryd",
+      "args": ["mcp"],
+      "env": { "MEMORYD_DB": "/path/to/memoryd.db" }
+    }
+  }
+}
+```
+
+Smoke test:
+
+```bash
+printf '%s\n%s\n%s\n' \
+ '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
+ '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+ '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+ | memoryd mcp --db /tmp/memoryd.db
+```
+
+See `docs/API.md` for tool schemas, the trust model, and error mapping.
 
 HTTP capture example:
 
@@ -73,9 +107,9 @@ Token handling: prefer `MEMORYD_TOKEN` or `--token-file <path>` over `--token`. 
 
 ## Current Scope
 
-Implemented today: local SQLite schema/migrations, `doctor`, `stats`, `remember`, `recall`, local HTTP capture/recall, redaction before persistence, capture/auth audit rows, CI/security gates, and OpenSSF Best Practices passing evidence.
+Implemented today: local SQLite schema/migrations, `doctor`, `stats`, `remember`, `recall`, local HTTP capture/recall/health, the MCP stdio facade (`memoryd mcp` with graph querying), background embed/dream workers behind the single-writer actor, redaction before persistence, capture/auth audit rows, approval-gated profile facts, graceful shutdown, CI/security gates, and OpenSSF Best Practices passing evidence.
 
-Still planned: background job workers, provider adapters, vector reranking, dreaming/consolidation, MCP/hook facades, approval-gated profile facts, broader worker/provider/profile audit coverage, and npm binary distribution.
+Still planned: remote provider adapters (openai_compat/ollama), hook facades, broader worker/provider/profile audit coverage, and npm binary distribution.
 
 ## Package Manager Rule
 

@@ -42,6 +42,15 @@ Status legend:
   dependency-free, deterministic, unsafe-free second implementation, config-selectable
   (`Caps.vector_index_kind` + `recall --index`), with `BruteForce` as the default and
   oracle; recall@10 within epsilon of BruteForce on a fixture, no API change.
+- `[x]` Security-hardening pass (2026-06): socket timeouts + concurrent
+  connections + auth throttling + token validation, redaction
+  defense-in-depth, protocol strictness, graceful shutdown, `GET /v1/health`,
+  and the single-writer `store::Writer` actor — see
+  `docs/SECURITY-REVIEW-TASKS.md` for the per-item checklist.
+- `[x]` MCP facade (initial slice): `memoryd mcp` stdio server (protocol
+  2024-11-05, tools `memory_remember`/`memory_recall`/`memory_stats`/
+  `memory_graph` over the M7 association graph, no socket bind); resources
+  (`memory://session/{id}`) deferred.
 - `[ ]` M10 (bench/packaging) and the deferred M3 increment remain.
 
 Next implementation target: the deferred M3 increment (openai_compat/ollama adapters,

@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod logging;
+mod mcp;
 
 const MAX_HTTP_LINE_BYTES: usize = 8 * 1024;
 const MAX_HTTP_HEADERS: usize = 64;
@@ -63,6 +64,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
         Command::Import(args) => import(cli, args),
         Command::Dream(args) => dream(cli, args),
         Command::Approve(args) => approve(cli, args),
+        Command::Mcp => mcp::serve_stdio(cli),
         Command::Help => {
             print_help();
             Ok(())
@@ -620,6 +622,7 @@ enum Command {
     Import(ImportArgs),
     Dream(DreamArgs),
     Approve(ApproveArgs),
+    Mcp,
     Help,
 }
 
@@ -719,6 +722,7 @@ impl Cli {
                 "import" => Command::Import(ImportArgs::default()),
                 "dream" => Command::Dream(DreamArgs::default()),
                 "approve" => Command::Approve(ApproveArgs::default()),
+                "mcp" => Command::Mcp,
                 "--help" | "-h" | "help" => Command::Help,
                 other => return Err(CliError::UnknownCommand(other.to_string())),
             },
@@ -1015,6 +1019,7 @@ fn print_help() {
             memoryd import --source jsonl --path <file> [--db <path>]\n\
             memoryd dream [--now] [--budget-usd <n>] [--max-seconds <n>] [--db <path>]\n\
             memoryd approve [--list] [--id <id> --accept|--reject] [--db <path>]\n\
+            memoryd mcp [--db <path>]   (MCP stdio server; no network bind)\n\
             memoryd serve [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>]\n\n\
           Tokens: prefer MEMORYD_TOKEN or --token-file over --token; command-line\n\
           arguments are world-readable via /proc/<pid>/cmdline.\n\n\

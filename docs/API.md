@@ -198,8 +198,8 @@ Error envelope:
 }
 ```
 
-Current status codes: `400`, `401`, `404`, `405`, `413`, `415`, `422`, `431`,
-and `500`.
+Current status codes: `400`, `401`, `404`, `405`, `408`, `413`, `415`, `422`,
+`429`, `431`, `500`, `501`, and `503`.
 
 ### `POST /v1/recall`
 
@@ -236,3 +236,56 @@ Response `200 OK`:
 ```
 
 Empty or punctuation-only queries return `422` with the standard error envelope.
+
+## MCP (stdio)
+
+`memoryd mcp [--db <path>]` runs an MCP server over stdio: newline-delimited
+JSON-RPC 2.0, protocol revision `2024-11-05`. Supported lifecycle methods:
+`initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`.
+Resources are not exposed in this slice (capabilities declare only `tools`).
+
+Trust model: the server reads stdin and writes stdout only — it never binds a
+socket — so trust is inherited from the parent process that spawned it, the
+same boundary as running the CLI. No bearer token applies. All diagnostics go
+to stderr; stdout carries only JSON-RPC lines.
+
+Captures made through `memory_remember` are acknowledged immediately and
+consolidate into recallable durable memories on the next `serve` or `dream`
+run; `mcp` mode runs no background workers itself.
+
+Note on naming: ARCHITECTURE-PLAN §6.5 sketches dotted tool names
+(`memory.remember`); the shipped names use underscores (`memory_remember`)
+because MCP clients enforce `^[a-zA-Z0-9_-]{1,64}$` for tool names (§14.3).
+
+### Tools
+
+- `memory_remember` — `{content (required), kind = "note", session_id = "mcp",
+  source = "mcp", tags []}`. Persists one capture through the normal redaction
+  pipeline; returns `{raw_event_id, session_id, enqueued_job_id,
+  pending_memory, degraded}`.
+- `memory_recall` — `{query (required), k 1–50 = 5, semantic = false,
+  hops 0|1 = 1}`. Durable-memory recall with one-hop graph expansion, falling
+  back to raw-event lexical recall; same result shape as `POST /v1/recall`.
+- `memory_stats` — `{}`. Row counts for every canonical table.
+- `memory_graph` — `{memory_id (required), limit 1–50 = 16}`. Direct
+  association-graph neighbors of a memory over `memory_links`, strongest link
+  first, each with `link_type` (`semantic`, `co_occurrence`, ...),
+  `link_strength`, `last_reinforced_at`, and a content snippet (240 chars).
+
+Example call:
+
+```json
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"memory_graph","arguments":{"memory_id":"27938c38d764..."}}}
+```
+
+### Error mapping
+
+Protocol failures are JSON-RPC errors: `-32700` unparseable line, `-32600`
+invalid request / oversized line, `-32601` unknown method, `-32602` unknown
+tool or invalid tool arguments, `-32002` request before `initialized`,
+`-32603` internal store error (generic message; detail goes to stderr only).
+
+Execution failures are in-band tool results with `isError: true` so the
+calling model can react: blank recall query ("query must contain searchable
+text"), empty capture fields ("capture fields must not be empty"), and unknown
+`memory_id` ("memory not found").
