@@ -49,3 +49,44 @@ jobs:
 
       - name: Verify SBOM exists
         run: test -s crates/memoryd/bom.json
+
+  coverage:
+    runs-on: ubuntu-latest
+    env:
+      # secrets is not a valid context in step-level `if:`; expose the token
+      # through env so the Sonar steps can condition on its presence.
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - name: Checkout (full history for Sonar blame data)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          fetch-depth: 0
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component clippy --component llvm-tools
+
+      - name: Fetch embed model (sha256-pinned; build.rs re-verifies)
+        run: bash scripts/fetch-embed-model.sh
+
+      - name: Bootstrap coverage tooling
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/bootstrap-coverage-tool.sh
+
+      - name: Generate coverage (lcov)
+        run: PATH="$PWD/.tools/coverage/bin:$PATH" cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+
+      - name: Enforce coverage floor (85% lines)
+        run: PATH="$PWD/.tools/coverage/bin:$PATH" cargo llvm-cov report --fail-under-lines 85
+
+      - name: SonarQube scan (quality gate must pass)
+        if: env.SONAR_TOKEN != ''
+        uses: SonarSource/sonarqube-scan-action@713881670b6b3676cda39549040e2d88c70d582e # v8.2.0
+        env:
+          SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          args: -Dsonar.qualitygate.wait=true
+
+      - name: SonarQube scan skipped (no SONAR_TOKEN)
+        if: env.SONAR_TOKEN == ''
+        run: echo "::warning::SONAR_TOKEN secret is not configured; Sonar scan was skipped. Coverage floor was still enforced."

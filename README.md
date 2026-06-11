@@ -165,7 +165,8 @@ curl -sS -X POST http://127.0.0.1:7077/v1/recall \
 ```
 
 See `docs/API.md` for CLI and REST request/response details. See
-`docs/MILESTONE-TASKS.md` for the current roadmap task checklist.
+`docs/MILESTONE-TASKS.md` for the current roadmap task checklist. To keep the
+daemon running under systemd or launchd, see `docs/RUNNING-AS-A-SERVICE.md`.
 
 ## Security Defaults
 
@@ -185,7 +186,7 @@ See `docs/API.md` for CLI and REST request/response details. See
 - Capture appends redacted raw events and queues background work when below the queue-depth cap; saturated captures return degraded instead of calling providers or failing inline.
 - Recall uses local SQLite FTS over redacted captured raw events; it does not call providers inline.
 - Rust `unsafe` code is forbidden at workspace level.
-- CI runs formatting, build, clippy with `-D warnings`, tests, dependency policy, advisory audit, and SBOM generation.
+- CI runs formatting, build, clippy with `-D warnings`, tests, dependency policy, advisory audit, SBOM generation, line-coverage enforcement (85% floor via cargo-llvm-cov), and a SonarQube Cloud scan whose quality gate must pass (one-time SonarCloud setup steps in `docs/PRODUCTION-READINESS-PLAN.md`).
 - `main` is protected with required CI, up-to-date checks, linear history, no force pushes, no deletions, and conversation resolution.
 
 The current redactor is deterministic and best-effort, not a guarantee that every possible secret format is detected. It replaces matched content with `[REDACTED]` before persistence and covers sensitive JSON keys, bearer-style credentials, common API-key prefixes (case-insensitive), private-key markers, emails, long all-digit runs (16+ digits, e.g. card numbers), and high-entropy token-like spans. Known limitation: secrets that arrive percent-encoded are split at `%xx` boundaries and are not decoded or reassembled before matching.
@@ -194,9 +195,9 @@ Token handling: prefer `MEMORYD_TOKEN` or `--token-file <path>` over `--token`. 
 
 ## Current Scope
 
-Implemented today: local SQLite schema/migrations, `doctor`, `stats`, `remember`, `recall`, local HTTP capture/recall/health, the MCP stdio facade (`memoryd mcp` with graph querying), background embed/dream workers behind the single-writer actor, redaction before persistence, capture/auth audit rows, approval-gated profile facts, graceful shutdown, CI/security gates, and OpenSSF Best Practices passing evidence.
+Implemented today: local SQLite schema/migrations, `doctor`, `stats`, `remember`, `recall`, local HTTP capture/recall/health, the MCP stdio facade (`memoryd mcp` with graph querying), the `integrate` command and `hook` handlers (`memoryd hook tool|prompt|session-start`) for wiring coding agents, the generic `openai_compat` provider adapter, background embed/dream workers behind the single-writer actor, redaction before persistence, capture/auth audit rows, approval-gated profile facts, graceful shutdown, CI/security gates, and OpenSSF Best Practices passing evidence.
 
-Still planned: remote provider adapters (openai_compat/ollama), hook facades, broader worker/provider/profile audit coverage, and npm binary distribution.
+Still planned: broader worker/provider/profile audit coverage, npm binary distribution, and release packaging/prebuilt binaries (M10).
 
 ## Package Manager Rule
 

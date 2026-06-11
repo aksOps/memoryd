@@ -48,6 +48,34 @@ const AUTH_THROTTLE_MAX_ENTRIES: usize = 1024;
 /// worker embeds with the local adapter for this long before retrying.
 const ADAPTER_FALLBACK_COOLDOWN_MS: i64 = 60_000;
 
+/// `println!` for CLI stdout that exits quietly when the reader closed the
+/// pipe (e.g. `memoryd doctor | head -5`) instead of panicking, since Rust
+/// ignores SIGPIPE and `println!` panics on EPIPE.
+macro_rules! outln {
+    ($($arg:tt)*) => {
+        $crate::out(std::format_args!($($arg)*))
+    };
+}
+
+/// Write a line to stdout; exit 0 quietly if the reader closed the pipe.
+/// Any other write error is reported to stderr and exits 1. The actual write
+/// lives in [`write_line`] so error classification stays unit-testable.
+fn out(args: fmt::Arguments<'_>) {
+    let stdout = std::io::stdout();
+    if let Err(err) = write_line(&mut stdout.lock(), args) {
+        if err.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        eprintln!("memoryd: failed to write to stdout: {err}");
+        std::process::exit(1);
+    }
+}
+
+/// Inner, exit-free half of [`out`]: write one formatted line to any writer.
+fn write_line<W: Write>(w: &mut W, args: fmt::Arguments<'_>) -> std::io::Result<()> {
+    writeln!(w, "{args}")
+}
+
 fn main() -> ExitCode {
     match run(env::args_os()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -74,6 +102,10 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
         Command::Dream(args) => dream(cli, args),
         Command::Approve(args) => approve(cli, args),
         Command::Mcp => mcp::serve_stdio(cli),
+        Command::Version => {
+            outln!("memoryd {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Command::Help => {
             print_help();
             Ok(())
@@ -90,27 +122,27 @@ fn doctor(cli: Cli, args: DoctorArgs) -> Result<(), CliError> {
         // Safe, reversible repairs only (initial-design doctor --fix):
         // WAL checkpoint/truncate + planner statistics refresh.
         store.optimize()?;
-        println!("fix: wal_checkpoint(TRUNCATE) + PRAGMA optimize applied");
+        outln!("fix: wal_checkpoint(TRUNCATE) + PRAGMA optimize applied");
     }
     let report = store.doctor_report()?;
 
-    println!("memoryd doctor");
-    println!("db_path: {}", report.db_path.display());
-    println!("schema_version: {}", report.schema_version);
-    println!("journal_mode: {}", report.journal_mode);
-    println!(
+    outln!("memoryd doctor");
+    outln!("db_path: {}", report.db_path.display());
+    outln!("schema_version: {}", report.schema_version);
+    outln!("journal_mode: {}", report.journal_mode);
+    outln!(
         "foreign_keys: {}",
         if report.foreign_keys { "on" } else { "off" }
     );
-    println!("integrity_check: {}", report.integrity_check);
-    println!("missing_tables: {}", report.missing_tables.len());
+    outln!("integrity_check: {}", report.integrity_check);
+    outln!("missing_tables: {}", report.missing_tables.len());
     match disk_free_bytes(&cfg.db_path) {
-        Some(bytes) => println!("disk_free_mb: {}", bytes / (1024 * 1024)),
-        None => println!("disk_free_mb: unavailable"),
+        Some(bytes) => outln!("disk_free_mb: {}", bytes / (1024 * 1024)),
+        None => outln!("disk_free_mb: unavailable"),
     }
-    println!("bind: {}", cfg.bind);
-    println!("provider: {}", cfg.providers.default_adapter);
-    println!("paid_spend_cap_usd: {:.2}", cfg.caps.paid_spend_cap_usd);
+    outln!("bind: {}", cfg.bind);
+    outln!("provider: {}", cfg.providers.default_adapter);
+    outln!("paid_spend_cap_usd: {:.2}", cfg.caps.paid_spend_cap_usd);
 
     if report.is_ok() {
         Ok(())
@@ -124,9 +156,9 @@ fn stats(cli: Cli) -> Result<(), CliError> {
     cfg.validate()?;
 
     let store = Store::open(&cfg.db_path)?;
-    println!("memoryd stats");
+    outln!("memoryd stats");
     for stat in store.table_stats()? {
-        println!("{}: {}", stat.table, stat.rows);
+        outln!("{}: {}", stat.table, stat.rows);
     }
     Ok(())
 }
@@ -142,7 +174,7 @@ fn backup(cli: Cli, args: BackupArgs) -> Result<(), CliError> {
     let store = Store::open(&cfg.db_path)?;
     let target = PathBuf::from(&args.to);
     store.backup_to(&target)?;
-    println!(
+    outln!(
         "{}",
         serde_json::to_string(&serde_json::json!({
             "backup": target.display().to_string(),
@@ -205,7 +237,7 @@ fn setup(args: SetupArgs) -> Result<(), CliError> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))?;
     }
-    println!(
+    outln!(
         "{}",
         serde_json::to_string(&serde_json::json!({
             "env_file": target.display().to_string(),
@@ -296,7 +328,7 @@ fn remember(cli: Cli, args: RememberArgs) -> Result<(), CliError> {
     let mut store = Store::open(&cfg.db_path)?;
     let ack =
         store.capture_event_with_queue_limit(remember_event(args), cfg.caps.queue_depth_max)?;
-    println!("{}", remember_response_json(&ack)?);
+    outln!("{}", remember_response_json(&ack)?);
     Ok(())
 }
 
@@ -316,7 +348,7 @@ fn recall(cli: Cli, args: RecallArgs) -> Result<(), CliError> {
     }
     let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(&cfg.providers);
     let result = recall_with_mode(&store, &args, &index_kind, &adapter)?;
-    println!("{}", recall_response_json(&result)?);
+    outln!("{}", recall_response_json(&result)?);
     Ok(())
 }
 
@@ -344,7 +376,7 @@ fn import(cli: Cli, args: ImportArgs) -> Result<(), CliError> {
         &PathBuf::from(&args.path),
         cfg.caps.queue_depth_max,
     )?;
-    println!("{}", import_response_json(&summary)?);
+    outln!("{}", import_response_json(&summary)?);
     Ok(())
 }
 
@@ -369,7 +401,7 @@ fn dream(cli: Cli, args: DreamArgs) -> Result<(), CliError> {
     };
     let outcome =
         memoryd_core::dream::dream_once(&mut store, &adapter, &cfg.caps, &opts, &|| unix_ms_now())?;
-    println!("{}", dream_response_json(&outcome)?);
+    outln!("{}", dream_response_json(&outcome)?);
     Ok(())
 }
 
@@ -393,7 +425,7 @@ fn approve(cli: Cli, args: ApproveArgs) -> Result<(), CliError> {
                 ));
             }
             let decision = store.decide_approval(id, args.accept, unix_ms_now())?;
-            println!("{}", approve_decision_json(id, &decision)?);
+            outln!("{}", approve_decision_json(id, &decision)?);
         }
         None => {
             if args.accept || args.reject {
@@ -402,7 +434,7 @@ fn approve(cli: Cli, args: ApproveArgs) -> Result<(), CliError> {
                 ));
             }
             let pending = store.list_pending_approvals(100)?;
-            println!("{}", approve_list_json(&pending)?);
+            outln!("{}", approve_list_json(&pending)?);
         }
     }
     Ok(())
@@ -835,6 +867,7 @@ enum Command {
     Dream(DreamArgs),
     Approve(ApproveArgs),
     Mcp,
+    Version,
     Help,
 }
 
@@ -971,6 +1004,7 @@ impl Cli {
                 "dream" => Command::Dream(DreamArgs::default()),
                 "approve" => Command::Approve(ApproveArgs::default()),
                 "mcp" => Command::Mcp,
+                "--version" | "-V" | "version" => Command::Version,
                 "--help" | "-h" | "help" => Command::Help,
                 other => return Err(CliError::UnknownCommand(other.to_string())),
             },
@@ -1348,7 +1382,7 @@ fn default_db_path() -> PathBuf {
 }
 
 fn print_help() {
-    println!(
+    outln!(
         "memoryd\n\n\
          Usage:\n\
             memoryd doctor [--fix] [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>]\n\
@@ -1363,7 +1397,8 @@ fn print_help() {
             memoryd dream [--now] [--budget-usd <n>] [--max-seconds <n>] [--db <path>]\n\
             memoryd approve [--list] [--id <id> --accept|--reject] [--db <path>]\n\
             memoryd mcp [--db <path>]   (MCP stdio server; no network bind)\n\
-            memoryd serve [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>] [--adapter <null|local|openai_compat>]\n\n\
+            memoryd serve [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>] [--adapter <null|local|openai_compat>]\n\
+            memoryd version | --version | -V   (print the memoryd version)\n\n\
           Provider env: MEMORYD_ADAPTER, MEMORYD_SPEND_CAP_USD, MEMORYD_OPENAI_BASE_URL,\n\
           MEMORYD_OPENAI_API_KEY[_FILE], MEMORYD_OPENAI_EMBED_MODEL, MEMORYD_OPENAI_CHAT_MODEL,\n\
           MEMORYD_OPENAI_USD_PER_1K.\n\n\
@@ -2180,6 +2215,65 @@ mod tests {
     }
 
     #[test]
+    fn doctor_command_passes_on_fresh_store_with_fix() {
+        let path = temp_db_path("doctor-command");
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "doctor",
+                "--fix",
+                "--db",
+                path.to_str().expect("path is UTF-8"),
+            ]
+            .map(OsString::from),
+        )
+        .expect("cli parses");
+        let Command::Doctor(args) = cli.command.clone() else {
+            panic!("expected doctor command");
+        };
+
+        doctor(cli, args).expect("doctor passes on a fresh store");
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn doctor_command_handles_db_path_without_parent_dir() {
+        // A bare file name has no parent directory, so the `df` disk-free
+        // probe is skipped and doctor reports "disk_free_mb: unavailable".
+        let name = format!("memoryd-doctor-noparent-{}.db", std::process::id());
+        let path = PathBuf::from(&name);
+        let cli = Cli::parse(["memoryd", "doctor", "--db", name.as_str()].map(OsString::from))
+            .expect("cli parses");
+        let Command::Doctor(args) = cli.command.clone() else {
+            panic!("expected doctor command");
+        };
+
+        doctor(cli, args).expect("doctor passes without a disk-free probe");
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn stats_command_prints_table_counts() {
+        let path = temp_db_path("stats-command");
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "stats",
+                "--db",
+                path.to_str().expect("path is UTF-8"),
+            ]
+            .map(OsString::from),
+        )
+        .expect("cli parses");
+
+        stats(cli).expect("stats succeeds on a fresh store");
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
     fn parses_setup_with_out() {
         let cli = Cli::parse(["memoryd", "setup", "--out", "/tmp/m.env"].map(OsString::from))
             .expect("cli parses");
@@ -2253,6 +2347,33 @@ mod tests {
     }
 
     #[test]
+    fn backup_command_writes_copy_via_cli() {
+        let path = temp_db_path("backup-cli-source");
+        let target = temp_db_path("backup-cli-target");
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "backup",
+                "--to",
+                target.to_str().expect("path is UTF-8"),
+                "--db",
+                path.to_str().expect("path is UTF-8"),
+            ]
+            .map(OsString::from),
+        )
+        .expect("cli parses");
+        let Command::Backup(args) = cli.command.clone() else {
+            panic!("expected backup command");
+        };
+
+        backup(cli, args).expect("backup succeeds");
+
+        assert!(target.exists(), "backup target written");
+        cleanup_db_files(&path);
+        cleanup_db_files(&target);
+    }
+
+    #[test]
     fn parses_remember_with_kind_session_source_and_tags() {
         let cli = Cli::parse(
             [
@@ -2287,6 +2408,50 @@ mod tests {
         let cli = Cli::parse(["memoryd", "serve"].map(OsString::from)).expect("cli parses");
 
         assert_eq!(cli.command, Command::Serve);
+    }
+
+    #[test]
+    fn parses_version_flag() {
+        for spelling in ["--version", "-V", "version"] {
+            let cli = Cli::parse(["memoryd", spelling].map(OsString::from)).expect("cli parses");
+            assert_eq!(cli.command, Command::Version, "spelling: {spelling}");
+        }
+    }
+
+    #[test]
+    fn run_version_command_prints_version_and_succeeds() {
+        run(["memoryd", "--version"].map(OsString::from)).expect("version succeeds");
+    }
+
+    #[test]
+    fn print_help_writes_usage_without_panicking() {
+        print_help();
+    }
+
+    /// Writer that always fails with EPIPE, like stdout after `| head` exits.
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_line_appends_newline_and_surfaces_broken_pipe() {
+        let mut buf = Vec::new();
+        write_line(&mut buf, format_args!("memoryd {}", "0.1.0")).expect("vec write succeeds");
+        assert_eq!(buf, b"memoryd 0.1.0\n");
+
+        let mut broken = BrokenPipeWriter;
+        broken.flush().expect("flush is a no-op");
+        let err = write_line(&mut broken, format_args!("memoryd doctor"))
+            .expect_err("broken-pipe writer fails");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
     #[test]
@@ -3874,6 +4039,29 @@ mod tests {
             store.list_pending_approvals(10).expect("list").is_empty(),
             "the approval is no longer pending after the decision"
         );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn approve_list_prints_pending_approvals() {
+        let path = temp_db_path("m8-cli-list");
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "approve",
+                "--list",
+                "--db",
+                path.to_str().unwrap(),
+            ]
+            .map(OsString::from),
+        )
+        .expect("parses");
+        let Command::Approve(args) = cli.command.clone() else {
+            panic!("expected approve")
+        };
+
+        approve(cli, args).expect("listing pending approvals succeeds");
+
         cleanup_db_files(&path);
     }
 

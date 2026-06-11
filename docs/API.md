@@ -109,9 +109,13 @@ Response `200 OK`:
 ```json
 {
   "status": "ok",
-  "schema_version": 2
+  "schema_version": 7
 }
 ```
+
+`schema_version` tracks the binary's current schema version (`SCHEMA_VERSION`
+in `crates/memoryd-core/src/store.rs`); a newer binary reports a higher value
+than this example.
 
 ### `POST /v1/capture`
 
