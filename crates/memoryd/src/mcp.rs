@@ -1309,6 +1309,33 @@ mod tests {
     }
 
     #[test]
+    fn run_loop_accepts_crlf_terminated_lines() {
+        let (path, cfg, mut store) = open_fixture("mcp-crlf");
+        // CRLF-delimited clients: the trailing `\r` must be stripped before
+        // JSON parsing, never surfaced as a -32700 parse error.
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#,
+            "\r\n",
+        );
+        let mut output = Vec::new();
+
+        run_loop(&mut store, &cfg, std::io::Cursor::new(input), &mut output)
+            .expect("run_loop succeeds");
+
+        let text = String::from_utf8(output).expect("output is UTF-8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "one request => one response line");
+        let response: serde_json::Value = serde_json::from_str(lines[0]).expect("line parses");
+        assert!(
+            response.get("error").is_none(),
+            "CRLF line parses cleanly: {response}"
+        );
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
     fn run_loop_rejects_oversized_line_without_buffering_it() {
         let (path, cfg, mut store) = open_fixture("mcp-oversized");
         // A line larger than MAX_MCP_LINE_BYTES followed by a valid request:
