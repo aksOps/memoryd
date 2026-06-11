@@ -17,6 +17,9 @@
 use memoryd_core::store::{NewRawEvent, Store};
 use std::io::Read;
 
+/// Caps bytes read from stdin so a pathological multi-GB tool output cannot
+/// balloon memory before the char-level truncation below applies.
+const STDIN_BYTE_CAP: u64 = 1024 * 1024;
 /// Caps captured text so one giant tool response cannot bloat the store
 /// (redaction and FTS indexing both run over this text).
 const CAPTURE_TEXT_CAP: usize = 4_000;
@@ -46,8 +49,7 @@ pub(crate) fn run(cli: &crate::Cli, args: &HookArgs) -> Result<(), crate::CliErr
 }
 
 fn run_fallible(cli: &crate::Cli, args: &HookArgs) -> Result<(), crate::CliError> {
-    let mut raw = String::new();
-    std::io::stdin().read_to_string(&mut raw)?;
+    let raw = read_stdin_capped(std::io::stdin());
     let payload: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::json!({}));
 
     let cfg = cli.config()?;
@@ -64,6 +66,18 @@ fn run_fallible(cli: &crate::Cli, args: &HookArgs) -> Result<(), crate::CliError
         "session-start" => emit_profile_context(&cfg, &payload),
         other => Err(crate::CliError::UnknownHookVerb(other.to_string())),
     }
+}
+
+/// Read at most `STDIN_BYTE_CAP` bytes from the hook payload stream. Reading
+/// into bytes first keeps a `take()` that lands mid-codepoint from erroring:
+/// `from_utf8_lossy` degrades the split char to U+FFFD instead. Read errors
+/// keep whatever arrived (hooks never fail the agent; detail to stderr).
+fn read_stdin_capped(reader: impl Read) -> String {
+    let mut bytes = Vec::new();
+    if let Err(err) = reader.take(STDIN_BYTE_CAP).read_to_end(&mut bytes) {
+        eprintln!("memoryd hook: stdin read failed: {err}");
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Common envelope fields, tolerant across agents.
@@ -384,6 +398,32 @@ mod tests {
             "SessionStart"
         );
         assert_eq!(envelope["hookSpecificOutput"]["additionalContext"], "ctx");
+    }
+
+    #[test]
+    fn stdin_read_is_byte_capped_and_lossy_at_the_boundary() {
+        // Under the cap: passes through untouched.
+        let small = read_stdin_capped(std::io::Cursor::new(b"{\"prompt\":\"hi\"}".to_vec()));
+        assert_eq!(small, "{\"prompt\":\"hi\"}");
+
+        // Over the cap, with a multi-byte char straddling the cap boundary:
+        // exactly STDIN_BYTE_CAP bytes are read, the split char degrades to
+        // U+FFFD, and nothing past the cap survives.
+        let cap = STDIN_BYTE_CAP as usize;
+        let mut input = vec![b'a'; cap - 1];
+        input.extend_from_slice("é".as_bytes()); // 2 bytes; second falls past the cap
+        input.extend(std::iter::repeat_n(b'b', 100));
+        let out = read_stdin_capped(std::io::Cursor::new(input));
+        assert_eq!(
+            out.chars().count(),
+            cap,
+            "result holds at most cap bytes' worth of chars"
+        );
+        assert!(
+            out.ends_with('\u{FFFD}'),
+            "split char is lossy, not an error"
+        );
+        assert!(!out.contains('b'), "bytes past the cap are never read");
     }
 
     #[test]

@@ -32,7 +32,23 @@ impl Writer {
         let (sender, receiver) = mpsc::channel::<Job>();
         let join = thread::spawn(move || {
             for job in receiver {
-                job(&mut store);
+                // A panicking job must not kill the writer thread: every later
+                // `exec` would fail with `WriterGone` until restart. Catch the
+                // unwind, log, and keep draining. `AssertUnwindSafe` is sound
+                // here: the only state crossing the boundary is `&mut Store`,
+                // and an interrupted rusqlite transaction rolls back when its
+                // guard drops during the unwind, so the database stays
+                // consistent. The panicking job's reply sender is dropped by
+                // the unwind, so that one caller gets `WriterGone` rather
+                // than a hang.
+                if let Err(payload) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&mut store)))
+                {
+                    drop(payload);
+                    eprintln!(
+                        "memoryd: writer job panicked; writer thread continues with next job"
+                    );
+                }
             }
         });
         Ok((WriterHandle(sender), join))
@@ -167,6 +183,43 @@ mod tests {
         assert_eq!(ack.session_id, "s1");
         assert!(ack.enqueued_job_id.is_some());
         assert!(!ack.degraded);
+
+        drop(handle);
+        join.join().expect("writer thread exits cleanly");
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn writer_survives_panicking_job() {
+        let path = temp_db_path("writer-panic");
+        let (handle, join) = Writer::spawn(&path).expect("writer spawns");
+
+        // The panicking job's reply sender is dropped during the unwind, so
+        // this caller gets `WriterGone` instead of hanging.
+        let err = handle
+            .exec(|_store| panic!("writer job panic for test"))
+            .expect_err("panicking job surfaces an error to its caller");
+        assert!(matches!(err, StoreError::WriterGone));
+
+        // The writer thread survived and still executes subsequent jobs.
+        let answer = handle.exec(|_store| 42).expect("writer still alive");
+        assert_eq!(answer, 42);
+
+        let ack = handle
+            .exec(|store| {
+                store.capture_event(NewRawEvent {
+                    session_id: "s-panic".to_string(),
+                    agent: "claude".to_string(),
+                    source: "tool_result".to_string(),
+                    kind: "observation".to_string(),
+                    payload: serde_json::json!({ "text": "written after a panicking job" }),
+                    provenance: serde_json::json!({}),
+                    ts_ms: 1000,
+                })
+            })
+            .expect("exec reaches writer")
+            .expect("capture succeeds after panic");
+        assert_eq!(ack.session_id, "s-panic");
 
         drop(handle);
         join.join().expect("writer thread exits cleanly");

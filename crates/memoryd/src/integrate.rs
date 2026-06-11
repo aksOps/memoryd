@@ -233,8 +233,9 @@ fn dream_command(bin: &Path, db: &Option<PathBuf>) -> String {
 
 /// Merge hook entries (`event` -> shell `command`) into a Claude settings
 /// file. Idempotency is binary-path-independent: any existing memoryd hook
-/// command for the event (recognized by its " dream" / " hook <verb>" tail)
-/// counts as present even if the binary moved.
+/// command for the event (recognized by its " dream" / " hook <verb>" tail
+/// on a command that names `memoryd`) counts as present even if the binary
+/// moved. An unrelated tool whose command merely ends in ` dream` does not.
 fn merge_claude_hooks(path: &Path, entries: &[(&str, String)]) -> Result<Action, crate::CliError> {
     let mut root = read_json_object(path)?;
     let hooks = root
@@ -261,9 +262,9 @@ fn merge_claude_hooks(path: &Path, entries: &[(&str, String)]) -> Result<Action,
                 .and_then(|h| h.as_array())
                 .map(|hs| {
                     hs.iter().any(|h| {
-                        h.get("command")
-                            .and_then(|c| c.as_str())
-                            .is_some_and(|c| c == command || c.ends_with(&tail))
+                        h.get("command").and_then(|c| c.as_str()).is_some_and(|c| {
+                            c == command || (c.contains("memoryd") && c.ends_with(&tail))
+                        })
                     })
                 })
                 .unwrap_or(false)
@@ -349,7 +350,7 @@ fn opencode_plugin(
         });
     }
     let db_arg = match db {
-        Some(db) => format!(" --db \"{}\"", db.display()),
+        Some(db) => format!(" --db \"{}\"", shell_escape_db(&db.display().to_string())),
         None => String::new(),
     };
     let contents = format!(
@@ -376,6 +377,23 @@ fn opencode_plugin(
         what: "session-idle dream plugin",
         already: false,
     })
+}
+
+/// Escape a path for embedding inside a double-quoted string in the generated
+/// JS plugin's shell template literal. Backslash, double-quote, dollar, and
+/// backtick would otherwise terminate the quoted string early or trigger
+/// shell/JS substitution, silently producing a broken plugin.
+/// (The TOML/YAML stanzas interpolate the db path via `{:?}`, whose Debug
+/// formatting already escapes `"` and `\`, so they need no extra treatment.)
+fn shell_escape_db(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if matches!(c, '\\' | '"' | '$' | '`') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 // ---- Codex: TOML MCP + Stop hook (safe append) ---------------------------
@@ -553,7 +571,8 @@ fn to_pretty_json(value: &serde_json::Value) -> Result<String, crate::CliError> 
 
 /// One appendable block for a text config file.
 struct Part {
-    /// Substring whose presence means this part is already installed.
+    /// Substring whose presence — on a line that also names `memoryd` — means
+    /// this part is already installed (see [`marker_present`]).
     present_marker: String,
     /// Top-level key that, when already present (line-anchored) without our
     /// marker, makes appending unsafe (duplicate YAML key) -> Manual. `None`
@@ -576,7 +595,7 @@ fn append_file_parts(path: &Path, parts: &[Part]) -> Result<Vec<Action>, crate::
     let mut actions = Vec::new();
     let mut appended = false;
     for part in parts {
-        if text.contains(&part.present_marker) {
+        if marker_present(&text, &part.present_marker) {
             continue; // already installed
         }
         let conflicted = part
@@ -610,6 +629,16 @@ fn append_file_parts(path: &Path, parts: &[Part]) -> Result<Vec<Action>, crate::
         },
     );
     Ok(actions)
+}
+
+/// A part counts as installed only when some line carries both the marker and
+/// the `memoryd` binary name, so an unrelated user hook whose command happens
+/// to end in e.g. ` dream"` does not suppress installation. Matching stays
+/// binary-path-independent: a hook installed from `/old/path/memoryd` is
+/// still detected after the binary moves.
+fn marker_present(text: &str, marker: &str) -> bool {
+    text.lines()
+        .any(|line| line.contains(marker) && line.contains("memoryd"))
 }
 
 /// Line-anchored top-level key probe (no leading indentation), so a nested
@@ -670,14 +699,18 @@ fn apply_and_report(plans: &[AgentPlan], dry_run: bool) -> Result<(), crate::Cli
 }
 
 /// Atomic-ish write: back up an existing file to `<path><BACKUP_SUFFIX>`, create
-/// parent dirs, write to a temp file, then rename over the target.
+/// parent dirs, write to a temp file, then rename over the target. The backup
+/// is only taken when none exists yet, so repeat `integrate` runs never
+/// overwrite the true pre-memoryd original with an already-modified config.
 fn write_with_backup(path: &Path, contents: &str) -> Result<(), crate::CliError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(crate::CliError::Io)?;
     }
     if path.exists() {
         let backup = PathBuf::from(format!("{}{BACKUP_SUFFIX}", path.display()));
-        std::fs::copy(path, &backup).map_err(crate::CliError::Io)?;
+        if !backup.exists() {
+            std::fs::copy(path, &backup).map_err(crate::CliError::Io)?;
+        }
     }
     let tmp = PathBuf::from(format!("{}.memoryd.tmp", path.display()));
     std::fs::write(&tmp, contents).map_err(crate::CliError::Io)?;
@@ -1108,6 +1141,110 @@ mod tests {
         assert_eq!(cmd[1], "mcp");
         assert_eq!(cmd[2], "--db");
         assert_eq!(cmd[3], "/data/m.db");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn backup_keeps_original_across_repeat_writes() {
+        let home = tmp_home("backup");
+        let path = home.join("config.json");
+        write(&path, "original");
+        write_with_backup(&path, "first edit").unwrap();
+        write_with_backup(&path, "second edit").unwrap();
+        let backup = PathBuf::from(format!("{}{BACKUP_SUFFIX}", path.display()));
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            "original",
+            "backup must keep the pre-memoryd original, not the first edit"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second edit");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn opencode_plugin_escapes_db_path_for_js_and_shell() {
+        let home = tmp_home("opencode-escape");
+        let bin = PathBuf::from("/opt/memoryd");
+        let mut a = args(Scope::User);
+        a.db = Some(PathBuf::from(r#"/da"ta/$mem.db"#));
+        let actions = plan_opencode(&home, &home, &bin, &a).unwrap();
+        let Action::Write { new_contents, .. } = &actions[1] else {
+            panic!("expected plugin write");
+        };
+        assert!(
+            new_contents.contains(r#" --db "/da\"ta/\$mem.db""#),
+            "quote and dollar must be escaped: {new_contents}"
+        );
+        assert!(
+            !new_contents.contains(r#"--db "/da"ta"#),
+            "a raw quote would terminate the embedded string early: {new_contents}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn foreign_dream_hook_does_not_suppress_install() {
+        let home = tmp_home("foreign-hook");
+        let bin = PathBuf::from("/usr/bin/memoryd");
+        let a = args(Scope::User);
+
+        // Claude: an unrelated SessionEnd hook ending in " dream" is not ours.
+        let settings = home.join(".claude/settings.json");
+        write(
+            &settings,
+            r#"{"hooks":{"SessionEnd":[{"matcher":"","hooks":[{"type":"command","command":"/usr/bin/other-tool dream"}]}]}}"#,
+        );
+        let actions = plan_claude(&home, &home, &bin, &a).unwrap();
+        let Action::Write {
+            new_contents,
+            already,
+            ..
+        } = &actions[1]
+        else {
+            panic!("expected hook write");
+        };
+        assert!(!already, "foreign dream hook must not count as installed");
+        let v: serde_json::Value = serde_json::from_str(new_contents).unwrap();
+        assert_eq!(v["hooks"]["SessionEnd"].as_array().unwrap().len(), 2);
+
+        // Codex: a non-memoryd Stop hook ending in ` dream"` is not ours either.
+        let codex = home.join(".codex/config.toml");
+        write(
+            &codex,
+            "[[hooks.Stop]]\n\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = \"/usr/bin/other-tool dream\"\ntimeout = 60\n",
+        );
+        let actions = plan_codex(&home, &bin, &a).unwrap();
+        let Action::Write {
+            new_contents,
+            already,
+            ..
+        } = &actions[0]
+        else {
+            panic!("expected write");
+        };
+        assert!(!already);
+        assert!(
+            new_contents.contains(r#"command = "/usr/bin/memoryd dream""#),
+            "memoryd dream hook must still be appended: {new_contents}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn moved_memoryd_dream_hook_is_still_detected() {
+        let home = tmp_home("moved-hook");
+        let codex = home.join(".codex/config.toml");
+        write(
+            &codex,
+            "[mcp_servers.memoryd]\ncommand = \"/some/old/path/memoryd\"\nargs = [\"mcp\"]\n\n\
+             [[hooks.Stop]]\n\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = \"/some/old/path/memoryd dream\"\ntimeout = 60\n",
+        );
+        let bin = PathBuf::from("/new/path/memoryd");
+        let actions = plan_codex(&home, &bin, &args(Scope::User)).unwrap();
+        let Action::Write { already, .. } = &actions[0] else {
+            panic!("expected write");
+        };
+        assert!(already, "old-path memoryd hook still counts as installed");
         let _ = std::fs::remove_dir_all(&home);
     }
 }
