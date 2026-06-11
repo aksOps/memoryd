@@ -165,7 +165,8 @@ curl -sS -X POST http://127.0.0.1:7077/v1/recall \
 ```
 
 See `docs/API.md` for CLI and REST request/response details. See
-`docs/MILESTONE-TASKS.md` for the current roadmap task checklist.
+`docs/MILESTONE-TASKS.md` for the current roadmap task checklist. To keep the
+daemon running under systemd or launchd, see `docs/RUNNING-AS-A-SERVICE.md`.
 
 ## Security Defaults
 
@@ -194,9 +195,9 @@ Token handling: prefer `MEMORYD_TOKEN` or `--token-file <path>` over `--token`. 
 
 ## Current Scope
 
-Implemented today: local SQLite schema/migrations, `doctor`, `stats`, `remember`, `recall`, local HTTP capture/recall/health, the MCP stdio facade (`memoryd mcp` with graph querying), background embed/dream workers behind the single-writer actor, redaction before persistence, capture/auth audit rows, approval-gated profile facts, graceful shutdown, CI/security gates, and OpenSSF Best Practices passing evidence.
+Implemented today: local SQLite schema/migrations, `doctor`, `stats`, `remember`, `recall`, local HTTP capture/recall/health, the MCP stdio facade (`memoryd mcp` with graph querying), the `integrate` command and `hook` handlers (`memoryd hook tool|prompt|session-start`) for wiring coding agents, the generic `openai_compat` provider adapter, background embed/dream workers behind the single-writer actor, redaction before persistence, capture/auth audit rows, approval-gated profile facts, graceful shutdown, CI/security gates, and OpenSSF Best Practices passing evidence.
 
-Still planned: remote provider adapters (openai_compat/ollama), hook facades, broader worker/provider/profile audit coverage, and npm binary distribution.
+Still planned: broader worker/provider/profile audit coverage, npm binary distribution, and release packaging/prebuilt binaries (M10).
 
 ## Package Manager Rule
 

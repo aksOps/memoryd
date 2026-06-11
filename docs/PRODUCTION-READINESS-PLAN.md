@@ -7,24 +7,24 @@ This plan closes the gaps found by the 2026-06-11 production-readiness audit
 and adds quality/coverage gating to CI. Part B ships with this change; Part A
 items are queued.
 
-## Part A — readiness gaps (queued)
+## Part A — readiness gaps (shipped)
 
-- [ ] **A1. README scope refresh.** `README.md` "Still planned" lists
+- [x] **A1. README scope refresh.** `README.md` "Still planned" lists
   `openai_compat` adapters and hook facades, both of which have shipped.
   Replace with the real remainder: broader worker/provider/profile audit
   coverage, npm binary distribution, release artifacts (M10).
-- [ ] **A2. Daemon-management docs.** Add example `systemd` user unit and
+- [x] **A2. Daemon-management docs.** Add example `systemd` user unit and
   `launchd` plist for running `memoryd serve` long-term (new
   `docs/RUNNING-AS-A-SERVICE.md`, linked from README and OPERATIONS).
-- [ ] **A3. Disk-full behavior note.** OPERATIONS.md: SQLite writes fail with
+- [x] **A3. Disk-full behavior note.** OPERATIONS.md: SQLite writes fail with
   `ENOSPC` → HTTP 500 / CLI error; `doctor` reports `disk_free_mb`; monitor
   proactively.
-- [ ] **A4. `--version` flag.** `memoryd --version` (and `-V`) printing
+- [x] **A4. `--version` flag.** `memoryd --version` (and `-V`) printing
   `memoryd <CARGO_PKG_VERSION>`; today it errors with "unknown command".
-- [ ] **A5. SIGPIPE polish.** `memoryd doctor | head` panics with a
+- [x] **A5. SIGPIPE polish.** `memoryd doctor | head` panics with a
   broken-pipe backtrace after correct output. Route CLI stdout through a
   write that exits 0 on `BrokenPipe`.
-- [ ] **A6. API.md health example.** Shows `"schema_version": 2`; current is
+- [x] **A6. API.md health example.** Shows `"schema_version": 2`; current is
   7. Use a placeholder (`<current schema version>`) so it cannot go stale.
 
 ## Part B — Sonar scan + coverage gate (this change)

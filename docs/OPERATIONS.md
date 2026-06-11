@@ -1,7 +1,8 @@
 # Operations Runbook
 
 Backup, portability, file hygiene, and the negative-test strategy for the
-security gates (roadmap E2 + F2).
+security gates (roadmap E2 + F2). For running the daemon under a supervisor
+(systemd user unit, launchd), see `docs/RUNNING-AS-A-SERVICE.md`.
 
 ## Backup and portability
 
@@ -39,6 +40,15 @@ and the graph fully working while new captures embed with the new model.
 `wal_checkpoint(TRUNCATE)` + `PRAGMA optimize`. `doctor` also reports
 `disk_free_mb` for the database directory. For long-lived stores, enable the
 retention horizons (see README "Retention") rather than pruning by hand.
+
+## Disk full
+
+When the disk fills, SQLite writes fail with ENOSPC. memoryd surfaces this as
+HTTP 500 responses / CLI errors and logs the error to stderr; durable state
+stays consistent because SQLite's WAL journaling never leaves a half-applied
+transaction behind. Monitor proactively: `memoryd doctor` reports free disk
+(`disk_free_mb`), and watch the size of the data directory (the `.db` file
+plus its `-wal`/`-shm` siblings).
 
 ## Negative-test strategy for the dependency gates (M0 evidence)
 
