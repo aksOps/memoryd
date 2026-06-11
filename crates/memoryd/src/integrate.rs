@@ -23,6 +23,19 @@ const SERVER_NAME: &str = "memoryd";
 /// Backup suffix appended before any in-place edit.
 const BACKUP_SUFFIX: &str = ".memoryd.bak";
 
+/// What `integrate` installs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// MCP server registration + a session-end dream hook (default).
+    Mcp,
+    /// No MCP: full hook suite — capture (prompts + tool results), context
+    /// injection (persona at session start, recall per prompt), and the
+    /// session-end dream pass. For agents/users avoiding MCP entirely.
+    Hooks,
+    /// Everything: MCP tools and the full hook suite.
+    All,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Scope {
     /// Per-user global config (default): the agent gets memoryd everywhere.
@@ -36,6 +49,7 @@ pub(crate) struct IntegrateArgs {
     /// `None` = every discovered agent; `Some(name)` = just that one.
     pub agent: Option<String>,
     pub scope: Scope,
+    pub mode: Mode,
     pub dry_run: bool,
     /// Absolute memoryd binary path to register; resolved from current_exe if None.
     pub bin: Option<PathBuf>,
@@ -173,17 +187,41 @@ fn plan_claude(
     };
 
     let mut actions = Vec::new();
-    actions.push(merge_json_mcp(
-        &mcp_path,
-        "mcpServers",
-        &server,
-        "MCP server",
-    )?);
+    if args.mode != Mode::Hooks {
+        actions.push(merge_json_mcp(
+            &mcp_path,
+            "mcpServers",
+            &server,
+            "MCP server",
+        )?);
+    }
 
-    // SessionEnd hook: consolidate the session's captures with a dream pass.
-    let hook_cmd = dream_command(bin, &args.db);
-    actions.push(merge_claude_hook(&settings_path, &hook_cmd)?);
+    // SessionEnd dream hook always; the full capture/inject suite in
+    // hooks/all mode (Claude supports context injection on SessionStart and
+    // UserPromptSubmit, and capture on PostToolUse).
+    let mut entries = vec![("SessionEnd", dream_command(bin, &args.db))];
+    if args.mode != Mode::Mcp {
+        entries.push((
+            "SessionStart",
+            hook_command(bin, "session-start", "claude", &args.db),
+        ));
+        entries.push((
+            "UserPromptSubmit",
+            hook_command(bin, "prompt", "claude", &args.db),
+        ));
+        entries.push(("PostToolUse", hook_command(bin, "tool", "claude", &args.db)));
+    }
+    actions.push(merge_claude_hooks(&settings_path, &entries)?);
     Ok(actions)
+}
+
+/// `memoryd hook <verb> --agent <label>` command line for hook installs.
+fn hook_command(bin: &Path, verb: &str, agent: &str, db: &Option<PathBuf>) -> String {
+    let mut cmd = format!("{} hook {verb} --agent {agent}", bin.display());
+    if let Some(db) = db {
+        cmd.push_str(&format!(" --db {}", db.display()));
+    }
+    cmd
 }
 
 fn dream_command(bin: &Path, db: &Option<PathBuf>) -> String {
@@ -193,9 +231,11 @@ fn dream_command(bin: &Path, db: &Option<PathBuf>) -> String {
     }
 }
 
-/// Merge `{ "hooks": { "SessionEnd": [ { matcher:"", hooks:[command] } ] } }`
-/// into a Claude settings file, idempotent on the memoryd dream command.
-fn merge_claude_hook(path: &Path, command: &str) -> Result<Action, crate::CliError> {
+/// Merge hook entries (`event` -> shell `command`) into a Claude settings
+/// file. Idempotency is binary-path-independent: any existing memoryd hook
+/// command for the event (recognized by its " dream" / " hook <verb>" tail)
+/// counts as present even if the binary moved.
+fn merge_claude_hooks(path: &Path, entries: &[(&str, String)]) -> Result<Action, crate::CliError> {
     let mut root = read_json_object(path)?;
     let hooks = root
         .entry("hooks".to_string())
@@ -203,42 +243,56 @@ fn merge_claude_hook(path: &Path, command: &str) -> Result<Action, crate::CliErr
     let hooks_obj = hooks
         .as_object_mut()
         .ok_or(crate::CliError::IntegrateConflict("hooks is not an object"))?;
-    let session_end = hooks_obj
-        .entry("SessionEnd".to_string())
-        .or_insert_with(|| serde_json::json!([]));
-    let arr = session_end
-        .as_array_mut()
-        .ok_or(crate::CliError::IntegrateConflict(
-            "hooks.SessionEnd is not an array",
-        ))?;
 
-    let already = arr.iter().any(|group| {
-        group
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .map(|hs| {
-                hs.iter().any(|h| {
-                    // Path-independent: any prior memoryd dream hook counts,
-                    // even if the binary path changed between runs.
-                    h.get("command")
-                        .and_then(|c| c.as_str())
-                        .is_some_and(|c| c == command || c.ends_with(" dream"))
+    let mut all_already = true;
+    for (event, command) in entries {
+        let tail = memoryd_command_tail(command);
+        let event_hooks = hooks_obj
+            .entry((*event).to_string())
+            .or_insert_with(|| serde_json::json!([]));
+        let arr = event_hooks
+            .as_array_mut()
+            .ok_or(crate::CliError::IntegrateConflict(
+                "a hooks event entry is not an array",
+            ))?;
+        let already = arr.iter().any(|group| {
+            group
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .map(|hs| {
+                    hs.iter().any(|h| {
+                        h.get("command")
+                            .and_then(|c| c.as_str())
+                            .is_some_and(|c| c == command || c.ends_with(&tail))
+                    })
                 })
-            })
-            .unwrap_or(false)
-    });
-    if !already {
-        arr.push(serde_json::json!({
-            "matcher": "",
-            "hooks": [ { "type": "command", "command": command, "timeout": 60 } ],
-        }));
+                .unwrap_or(false)
+        });
+        if !already {
+            all_already = false;
+            arr.push(serde_json::json!({
+                "matcher": "",
+                "hooks": [ { "type": "command", "command": command, "timeout": 60 } ],
+            }));
+        }
     }
     Ok(Action::Write {
         path: path.to_path_buf(),
         new_contents: to_pretty_json(&serde_json::Value::Object(root))?,
-        what: "SessionEnd dream hook",
-        already,
+        what: "memoryd hooks",
+        already: all_already,
     })
+}
+
+/// The binary-path-independent suffix of a memoryd hook command: everything
+/// from the subcommand onward (" dream", " hook tool --agent claude", ...).
+fn memoryd_command_tail(command: &str) -> String {
+    for marker in [" dream", " hook "] {
+        if let Some(index) = command.find(marker) {
+            return command[index..].to_string();
+        }
+    }
+    command.to_string()
 }
 
 // ---- OpenCode: JSON MCP (no JSON shell hook) ----------------------------
@@ -261,7 +315,10 @@ fn plan_opencode(
         Scope::User => home.join(".config/opencode/opencode.json"),
         Scope::Project => cwd.join("opencode.json"),
     };
-    let mut actions = vec![merge_json_mcp(&path, "mcp", &server, "MCP server")?];
+    let mut actions = Vec::new();
+    if args.mode != Mode::Hooks {
+        actions.push(merge_json_mcp(&path, "mcp", &server, "MCP server")?);
+    }
 
     // OpenCode lifecycle hooks are JS plugins auto-loaded from a plugins dir;
     // installing one is a standalone new file (nothing existing to corrupt).
@@ -346,25 +403,42 @@ fn plan_codex(
         "[[hooks.Stop]]\n\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = {dream:?}\ntimeout = 60\n",
     );
     let path = home.join(".codex/config.toml");
-    append_file_parts(
-        &path,
-        &[
-            Part {
-                present_marker: format!("[mcp_servers.{SERVER_NAME}]"),
+    let mut parts = Vec::new();
+    if args.mode != Mode::Hooks {
+        parts.push(Part {
+            present_marker: format!("[mcp_servers.{SERVER_NAME}]"),
+            conflict_marker: None,
+            stanza: mcp_stanza,
+            what: "MCP server (TOML)",
+        });
+    }
+    parts.push(Part {
+        // Path-independent: one dream hook per file, even if the
+        // binary moved since the last `integrate` run.
+        present_marker: " dream\"".to_string(),
+        conflict_marker: None,
+        stanza: hook_stanza,
+        what: "Stop dream hook (TOML)",
+    });
+    if args.mode != Mode::Mcp {
+        // Codex mirrors Claude's hook model: capture + context injection.
+        for (event, verb) in [
+            ("SessionStart", "session-start"),
+            ("UserPromptSubmit", "prompt"),
+            ("PostToolUse", "tool"),
+        ] {
+            let command = hook_command(bin, verb, "codex", &args.db);
+            parts.push(Part {
+                present_marker: format!(" hook {verb} "),
                 conflict_marker: None,
-                stanza: mcp_stanza,
-                what: "MCP server (TOML)",
-            },
-            Part {
-                // Path-independent: one dream hook per file, even if the
-                // binary moved since the last `integrate` run.
-                present_marker: " dream\"".to_string(),
-                conflict_marker: None,
-                stanza: hook_stanza,
-                what: "Stop dream hook (TOML)",
-            },
-        ],
-    )
+                stanza: format!(
+                    "[[hooks.{event}]]\n\n[[hooks.{event}.hooks]]\ntype = \"command\"\ncommand = {command:?}\ntimeout = 60\n",
+                ),
+                what: "capture/context hooks (TOML)",
+            });
+        }
+    }
+    append_file_parts(&path, &parts)
 }
 
 // ---- Hermes: YAML MCP + on_session_end hook (safe append) ----------------
@@ -385,29 +459,37 @@ fn plan_hermes(
         "mcp_servers:\n  {SERVER_NAME}:\n    command: {:?}\n    args: [{arg_list}]\n",
         cmd[0]
     );
-    // Hermes has a true session-end lifecycle hook.
+    // Hermes has a true session-end lifecycle hook; in hooks/all mode the
+    // post_tool_call capture rides in the SAME stanza (one top-level
+    // `hooks:` key — two appends would be a duplicate-key YAML error).
+    // Hermes documents no context-injection mechanism, so capture-only.
     let dream = dream_command(bin, &args.db);
-    let hook_stanza =
+    let mut hook_stanza =
         format!("hooks:\n  on_session_end:\n    - command: {dream:?}\n      timeout: 60\n");
+    if args.mode != Mode::Mcp {
+        let tool = hook_command(bin, "tool", "hermes", &args.db);
+        hook_stanza.push_str(&format!(
+            "  post_tool_call:\n    - command: {tool:?}\n      timeout: 60\n"
+        ));
+    }
     let path = home.join(".hermes/config.yaml");
-    append_file_parts(
-        &path,
-        &[
-            Part {
-                present_marker: format!("  {SERVER_NAME}:"),
-                conflict_marker: Some("mcp_servers:".to_string()),
-                stanza: mcp_stanza,
-                what: "MCP server (YAML)",
-            },
-            Part {
-                // Path-independent (see plan_codex).
-                present_marker: " dream\"".to_string(),
-                conflict_marker: Some("hooks:".to_string()),
-                stanza: hook_stanza,
-                what: "on_session_end dream hook (YAML)",
-            },
-        ],
-    )
+    let mut parts = Vec::new();
+    if args.mode != Mode::Hooks {
+        parts.push(Part {
+            present_marker: format!("  {SERVER_NAME}:"),
+            conflict_marker: Some("mcp_servers:".to_string()),
+            stanza: mcp_stanza,
+            what: "MCP server (YAML)",
+        });
+    }
+    parts.push(Part {
+        // Path-independent (see plan_codex).
+        present_marker: " dream\"".to_string(),
+        conflict_marker: Some("hooks:".to_string()),
+        stanza: hook_stanza,
+        what: "session hooks (YAML)",
+    });
+    append_file_parts(&path, &parts)
 }
 
 // ---- JSON merge core -----------------------------------------------------
@@ -523,7 +605,7 @@ fn append_file_parts(path: &Path, parts: &[Part]) -> Result<Vec<Action>, crate::
         Action::Write {
             path: path.to_path_buf(),
             new_contents: text,
-            what: "MCP server + dream hook",
+            what: "memoryd config blocks",
             already: !appended,
         },
     );
@@ -624,6 +706,7 @@ mod tests {
         IntegrateArgs {
             agent: None,
             scope,
+            mode: Mode::Mcp,
             dry_run: false,
             bin: Some(PathBuf::from("/usr/local/bin/memoryd")),
             db: None,
@@ -897,6 +980,102 @@ mod tests {
         assert!(new_contents.contains("    command: \"/usr/bin/memoryd\""));
         assert!(new_contents.contains("hooks:\n  on_session_end:"));
         assert!(new_contents.contains("- command: \"/usr/bin/memoryd dream\""));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn hooks_mode_installs_full_suite_without_mcp() {
+        let home = tmp_home("hooks-mode");
+        let bin = PathBuf::from("/usr/bin/memoryd");
+        let mut a = args(Scope::User);
+        a.mode = Mode::Hooks;
+
+        // Claude: no MCP write; settings carry all four events.
+        let actions = plan_claude(&home, &home, &bin, &a).unwrap();
+        assert_eq!(actions.len(), 1, "MCP registration skipped in hooks mode");
+        let Action::Write {
+            new_contents, path, ..
+        } = &actions[0]
+        else {
+            panic!("expected hooks write");
+        };
+        assert!(path.ends_with(".claude/settings.json"));
+        let v: serde_json::Value = serde_json::from_str(new_contents).unwrap();
+        for event in [
+            "SessionEnd",
+            "SessionStart",
+            "UserPromptSubmit",
+            "PostToolUse",
+        ] {
+            assert!(
+                v["hooks"][event].is_array(),
+                "missing {event} in {new_contents}"
+            );
+        }
+        assert_eq!(
+            v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+            "/usr/bin/memoryd hook prompt --agent claude"
+        );
+
+        // Codex: hook tables for the suite, no [mcp_servers.memoryd].
+        let codex = plan_codex(&home, &bin, &a).unwrap();
+        let Action::Write { new_contents, .. } = &codex[0] else {
+            panic!("expected codex write");
+        };
+        assert!(!new_contents.contains("[mcp_servers.memoryd]"));
+        for event in ["Stop", "SessionStart", "UserPromptSubmit", "PostToolUse"] {
+            assert!(
+                new_contents.contains(&format!("[[hooks.{event}]]")),
+                "missing {event}: {new_contents}"
+            );
+        }
+
+        // Hermes: one combined hooks stanza (single top-level key), no MCP.
+        let hermes = plan_hermes(&home, &bin, &a).unwrap();
+        let Action::Write { new_contents, .. } = &hermes[0] else {
+            panic!("expected hermes write");
+        };
+        assert!(!new_contents.contains("mcp_servers:"));
+        assert_eq!(
+            new_contents.matches("hooks:").count(),
+            1,
+            "exactly one top-level hooks key: {new_contents}"
+        );
+        assert!(new_contents.contains("on_session_end:"));
+        assert!(new_contents.contains("post_tool_call:"));
+        assert!(new_contents.contains("hook tool --agent hermes"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn claude_hook_idempotency_is_path_independent_per_event() {
+        let home = tmp_home("hooks-idem");
+        let bin1 = PathBuf::from("/usr/bin/memoryd");
+        let mut a = args(Scope::User);
+        a.mode = Mode::Hooks;
+        let actions = plan_claude(&home, &home, &bin1, &a).unwrap();
+        let Action::Write {
+            new_contents, path, ..
+        } = &actions[0]
+        else {
+            panic!("write");
+        };
+        write(path, new_contents);
+
+        // Second run with a moved binary adds nothing.
+        let bin2 = PathBuf::from("/opt/elsewhere/memoryd");
+        let actions2 = plan_claude(&home, &home, &bin2, &a).unwrap();
+        let Action::Write {
+            new_contents: c2,
+            already,
+            ..
+        } = &actions2[0]
+        else {
+            panic!("write");
+        };
+        assert!(already, "moved binary still counts as installed");
+        let v: serde_json::Value = serde_json::from_str(c2).unwrap();
+        assert_eq!(v["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&home);
     }
 

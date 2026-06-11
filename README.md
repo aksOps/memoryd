@@ -65,17 +65,33 @@ See `docs/API.md` for tool schemas, the trust model, and error mapping.
 
 ### Integrate with coding agents
 
-`memoryd integrate` auto-discovers installed AI coding agents and registers the
-memoryd MCP server into each (Claude Code also gets a SessionEnd hook that runs
-a `dream` pass to consolidate the session's captures):
+`memoryd integrate` auto-discovers installed AI coding agents and wires
+memoryd into each. Three modes:
+
+- `--mode mcp` (default): register the MCP server (deliberate tools:
+  `memory_recall`, `memory_graph`, `memory_profile`, ...) plus a session-end
+  `dream` hook.
+- `--mode hooks`: **no MCP** — the full hook suite instead: automatic capture
+  (every prompt and tool result), automatic context injection (persona at
+  `SessionStart`, recall hits per `UserPromptSubmit`), and the session-end
+  `dream` pass. The agent needs no memory awareness at all.
+- `--mode all`: both.
 
 ```bash
-memoryd integrate                 # all detected agents, user scope
+memoryd integrate                 # all detected agents, user scope, MCP mode
+memoryd integrate --mode hooks    # push-based: capture + inject, no MCP
 memoryd integrate --dry-run       # preview every change, write nothing
 memoryd integrate --agent codex   # just one agent
 memoryd integrate --scope project # write project configs in the cwd
 memoryd integrate --db /path/db   # embed an explicit --db in the registration
 ```
+
+Hook handlers (`memoryd hook tool|prompt|session-start`) read the agent's hook
+JSON on stdin, never fail the host agent (errors exit 0, detail to stderr),
+capture through the normal redaction pipeline, and inject via the
+`hookSpecificOutput.additionalContext` envelope (Claude Code and Codex).
+Hermes gets capture hooks (`post_tool_call`) but documents no injection
+mechanism; OpenCode keeps the `session.idle` dream plugin.
 
 Supported — each agent gets MCP registration plus its native session hook
 running a `dream` consolidation pass: **Claude Code** (`.mcp.json`/

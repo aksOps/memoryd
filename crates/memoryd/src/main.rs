@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod hook;
 mod integrate;
 mod logging;
 mod mcp;
@@ -65,6 +66,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
         Command::Backup(args) => backup(cli, args),
         Command::Setup(args) => setup(args),
         Command::Integrate(args) => integrate::run(&args),
+        Command::Hook(args) => hook::run(&cli, &args),
         Command::Serve => serve(cli),
         Command::Remember(args) => remember(cli, args),
         Command::Recall(args) => recall(cli, args),
@@ -825,6 +827,7 @@ enum Command {
     Backup(BackupArgs),
     Setup(SetupArgs),
     Integrate(integrate::IntegrateArgs),
+    Hook(hook::HookArgs),
     Serve,
     Remember(RememberArgs),
     Recall(RecallArgs),
@@ -949,9 +952,14 @@ impl Cli {
                 "stats" => Command::Stats,
                 "backup" => Command::Backup(BackupArgs::default()),
                 "setup" => Command::Setup(SetupArgs::default()),
+                "hook" => Command::Hook(hook::HookArgs {
+                    verb: String::new(),
+                    agent: "hook".to_string(),
+                }),
                 "integrate" => Command::Integrate(integrate::IntegrateArgs {
                     agent: None,
                     scope: integrate::Scope::User,
+                    mode: integrate::Mode::Mcp,
                     dry_run: false,
                     bin: None,
                     db: None,
@@ -1012,12 +1020,15 @@ impl Cli {
                     };
                     setup.out = next_string(&mut args, "--out")?;
                 }
-                "--agent" => {
-                    let Command::Integrate(integrate) = &mut command else {
-                        return Err(CliError::UnknownFlag(token));
-                    };
-                    integrate.agent = Some(next_string(&mut args, "--agent")?);
-                }
+                "--agent" => match &mut command {
+                    Command::Integrate(integrate) => {
+                        integrate.agent = Some(next_string(&mut args, "--agent")?);
+                    }
+                    Command::Hook(hook) => {
+                        hook.agent = next_string(&mut args, "--agent")?;
+                    }
+                    _ => return Err(CliError::UnknownFlag(token)),
+                },
                 "--scope" => {
                     let Command::Integrate(integrate) = &mut command else {
                         return Err(CliError::UnknownFlag(token));
@@ -1026,6 +1037,17 @@ impl Cli {
                         "user" => integrate::Scope::User,
                         "project" => integrate::Scope::Project,
                         other => return Err(CliError::InvalidScope(other.to_string())),
+                    };
+                }
+                "--mode" => {
+                    let Command::Integrate(integrate) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    integrate.mode = match next_string(&mut args, "--mode")?.as_str() {
+                        "mcp" => integrate::Mode::Mcp,
+                        "hooks" => integrate::Mode::Hooks,
+                        "all" => integrate::Mode::All,
+                        other => return Err(CliError::InvalidMode(other.to_string())),
                     };
                 }
                 "--bin" => {
@@ -1187,8 +1209,10 @@ impl Cli {
                     });
                 }
                 other
-                    if matches!(command, Command::Remember(_) | Command::Recall(_))
-                        && !other.starts_with("--") =>
+                    if matches!(
+                        command,
+                        Command::Remember(_) | Command::Recall(_) | Command::Hook(_)
+                    ) && !other.starts_with("--") =>
                 {
                     let content = raw
                         .into_string()
@@ -1205,6 +1229,12 @@ impl Cli {
                                 return Err(CliError::UnexpectedArgument(content));
                             }
                             recall.query = content;
+                        }
+                        Command::Hook(hook) => {
+                            if !hook.verb.is_empty() {
+                                return Err(CliError::UnexpectedArgument(content));
+                            }
+                            hook.verb = content;
                         }
                         _ => unreachable!("command checked above"),
                     }
@@ -1223,6 +1253,13 @@ impl Cli {
             && recall.query.is_empty()
         {
             return Err(CliError::MissingArgument("query"));
+        }
+        if let Command::Hook(hook) = &command
+            && hook.verb.is_empty()
+        {
+            return Err(CliError::MissingArgument(
+                "hook verb (tool|prompt|session-start)",
+            ));
         }
 
         Ok(Self {
@@ -1317,7 +1354,8 @@ fn print_help() {
             memoryd doctor [--fix] [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>]\n\
             memoryd backup --to <path> [--db <path>]\n\
             memoryd setup [--out <env-file>]\n\
-            memoryd integrate [--agent claude|opencode|codex|hermes] [--scope user|project] [--dry-run] [--bin <path>] [--db <path>]\n\
+            memoryd integrate [--agent claude|opencode|codex|hermes] [--scope user|project] [--mode mcp|hooks|all] [--dry-run] [--bin <path>] [--db <path>]\n\
+            memoryd hook <tool|prompt|session-start> [--agent <label>] [--db <path>]   (reads agent hook JSON on stdin)\n\
             memoryd stats  [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>]\n\
             memoryd remember <content> [--kind <kind>] [--session <id>] [--source <source>] [--tags <a,b>] [--db <path>]\n\
             memoryd recall <query> [--k <limit>] [--semantic] [--hops <0|1>] [--index <brute-force|hnsw>] [--db <path>]\n\
@@ -1354,6 +1392,8 @@ enum CliError {
     IntegrateUnparseable(String),
     IntegrateConflict(&'static str),
     InvalidScope(String),
+    UnknownHookVerb(String),
+    InvalidMode(String),
     Config(memoryd_core::config::ConfigError),
     Store(memoryd_core::store::StoreError),
     Json(serde_json::Error),
@@ -1392,6 +1432,15 @@ impl fmt::Display for CliError {
             }
             Self::InvalidScope(scope) => {
                 write!(f, "invalid scope: {scope} (expected user or project)")
+            }
+            Self::InvalidMode(mode) => {
+                write!(f, "invalid mode: {mode} (expected mcp, hooks, or all)")
+            }
+            Self::UnknownHookVerb(verb) => {
+                write!(
+                    f,
+                    "unknown hook verb: {verb} (expected tool, prompt, or session-start)"
+                )
             }
             Self::TokenFileUnreadable(path) => {
                 write!(f, "could not read token file {path}")

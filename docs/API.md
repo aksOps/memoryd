@@ -312,8 +312,21 @@ text"), empty capture fields ("capture fields must not be empty"), and unknown
 ## Agent integration (`memoryd integrate`)
 
 ```bash
-memoryd integrate [--agent claude|opencode|codex|hermes] [--scope user|project] [--dry-run] [--bin <path>] [--db <path>]
+memoryd integrate [--agent claude|opencode|codex|hermes] [--scope user|project] [--mode mcp|hooks|all] [--dry-run] [--bin <path>] [--db <path>]
+memoryd hook <tool|prompt|session-start> [--agent <label>] [--db <path>]
 ```
+
+`--mode mcp` (default) registers the MCP server + a session-end dream hook.
+`--mode hooks` skips MCP and installs the push-based suite instead — capture
+hooks (`PostToolUse`/`post_tool_call` tool results, `UserPromptSubmit`
+prompts) and context-injection hooks (`SessionStart` persona,
+`UserPromptSubmit` recall) where the agent supports injection (Claude Code,
+Codex). `--mode all` installs both. `memoryd hook` is the handler the
+installed hooks invoke: stdin is the agent's hook payload JSON; stdout is
+empty or a `hookSpecificOutput.additionalContext` envelope; it always exits 0
+so a broken store can never block the host agent. Capture goes through the
+normal redaction pipeline with text capped at 4000 chars; injected context is
+capped at 2000 chars and recall runs locally (no provider calls).
 
 Auto-discovers installed agents (by their config dir under `$HOME`) and
 registers the memoryd MCP server into each. With no `--agent`, every detected
