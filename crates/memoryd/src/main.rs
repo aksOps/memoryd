@@ -1371,7 +1371,12 @@ fn remember_event(args: RememberArgs) -> NewRawEvent {
         session_id: args.session_id,
         agent: args.agent,
         source: args.source,
-        kind: "memory".to_string(),
+        // The user-facing kind IS the raw event kind, exactly like HTTP
+        // capture — so dream consolidation maps it to the right memory kind
+        // (decay half-life, profile extraction, heuristic induction) instead
+        // of flattening every `remember` to an observation. payload.memory_kind
+        // stays for backward compatibility with existing rows.
+        kind: args.kind.clone(),
         payload: serde_json::json!({
             "text": args.content,
             "memory_kind": args.kind.clone(),
