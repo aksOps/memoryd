@@ -77,7 +77,7 @@ corpus hygiene, not query latency.
 - `[x]` C2. Runtime spend ledger: per-window (daily/weekly) spend
   enforcement across passes from `provider_usage`, not just the per-pass
   budget check.
-- `[ ]` C3. `memoryd setup` CLI: interactive first-run config (adapter, base
+- `[x]` C3. `memoryd setup` CLI: interactive first-run config (adapter, base
   URL, key file, spend cap) writing env-file/instructions — the usability
   half of "opt-in providers".
 
