@@ -744,7 +744,7 @@ impl Store {
             let mut stmt = self.conn.prepare(
                 "SELECT s.id FROM sessions s
                  WHERE s.status = 'open'
-                   AND (SELECT MAX(r.ts) FROM raw_events r WHERE r.session_id = s.id) <= ?1
+                   AND COALESCE((SELECT MAX(r.ts) FROM raw_events r WHERE r.session_id = s.id), 0) <= ?1
                    AND NOT EXISTS (
                        SELECT 1 FROM raw_events r2
                        WHERE r2.session_id = s.id AND r2.consolidated_at IS NULL)
@@ -822,7 +822,7 @@ impl Store {
              WHERE id IN (
                 SELECT s.id FROM sessions s
                 WHERE s.status = 'open'
-                  AND (SELECT MAX(r.ts) FROM raw_events r WHERE r.session_id = s.id) <= ?2
+                  AND COALESCE((SELECT MAX(r.ts) FROM raw_events r WHERE r.session_id = s.id), 0) <= ?2
                   AND NOT EXISTS (
                       SELECT 1 FROM raw_events r2
                       WHERE r2.session_id = s.id AND r2.consolidated_at IS NULL)
@@ -1369,8 +1369,16 @@ impl Store {
         // before the write transaction, so no provider latency is held inside it.
         type PreparedFact = (String, String, String, f64, Option<(i64, f64)>);
         let mut prepared_facts: Vec<PreparedFact> = Vec::new();
+        // Since inserts are deferred to the write phase (D1), the `approvals`
+        // probe below cannot see keys chosen earlier in THIS batch; track them
+        // here so two memories with the same derived key don't both propose.
+        let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (mem_id, kind, content, trust) in &cands {
             let fact_key = profile_fact_key(kind, content);
+            if !seen_keys.insert(fact_key.clone()) {
+                batch.skipped += 1;
+                continue;
+            }
             let already_proposed: bool = self
                 .conn
                 .query_row(
@@ -6744,6 +6752,47 @@ mod tests {
     }
 
     #[test]
+    fn distill_close_sweeps_session_whose_raw_events_were_retained() {
+        // A trivial idle session whose raw events were all deleted by retention
+        // has MAX(raw_events.ts) = NULL. Without COALESCE the idle predicate is
+        // UNKNOWN and the session would stay 'open' forever (zombie row).
+        let path = temp_db_path("distill-retained-null");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_consolidated_session(&mut store, "s-gone", 1, now - 3_600_000);
+        // Simulate retention having deleted the session's consolidated raw events.
+        store
+            .conn
+            .execute("DELETE FROM raw_events WHERE session_id = 's-gone'", [])
+            .expect("delete raw events");
+
+        let mut spend = 0.0;
+        let batch = store
+            .distill_sessions(
+                &NullAdapter::new(),
+                0.0,
+                &mut spend,
+                "run-1",
+                &test_distill_policy(),
+                now,
+            )
+            .expect("distill succeeds");
+
+        assert_eq!(
+            batch.sessions_closed, 1,
+            "NULL-ts session still close-swept"
+        );
+        let status: String = store
+            .conn
+            .query_row("SELECT status FROM sessions WHERE id = 's-gone'", [], |r| {
+                r.get(0)
+            })
+            .expect("session row");
+        assert_eq!(status, "closed");
+        cleanup_db_files(&path);
+    }
+
+    #[test]
     fn distill_budget_cap_leaves_session_open() {
         let path = temp_db_path("distill-budget");
         let mut store = Store::open(&path).expect("store opens");
@@ -7356,6 +7405,51 @@ mod tests {
             .unwrap();
         assert_eq!(tt, "profile_fact");
         assert_eq!(tr, "preference:prefers-flyway-for-migrations");
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn extract_dedups_identical_fact_keys_within_one_pass() {
+        // Two memories with the same kind+content derive the same fact_key.
+        // Post-D1, inserts are deferred to the write phase, so the approvals
+        // probe cannot see an earlier candidate from the same batch — the
+        // in-batch seen-set must prevent a duplicate pending approval.
+        let path = temp_db_path("m8-within-pass-dedup");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_mem(
+            &store,
+            "a",
+            "preference",
+            "prefers pnpm",
+            None,
+            "active",
+            now,
+        );
+        seed_mem(
+            &store,
+            "b",
+            "preference",
+            "prefers pnpm",
+            None,
+            "active",
+            now,
+        );
+
+        let mut spend = 0.0;
+        let batch = store
+            .extract_profile_pending(&NullAdapter::new(), 0.0, &mut spend, 500, now)
+            .expect("extract runs");
+
+        assert_eq!(batch.proposed, 1, "duplicate key proposed only once");
+        assert_eq!(batch.skipped, 1);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM approvals WHERE state='pending'"
+            ),
+            1
+        );
         cleanup_db_files(&path);
     }
 

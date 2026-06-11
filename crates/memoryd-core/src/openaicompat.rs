@@ -181,6 +181,18 @@ impl crate::adapters::ProviderAdapter for OpenAiCompatAdapter {
             indexed.push((index, vector));
         }
         indexed.sort_by_key(|(index, _)| *index);
+        // A permissive server could return duplicate `index` values (and skip
+        // another), which the count check above misses — that would silently
+        // misalign vectors with their source texts. Require a 0..n bijection.
+        if indexed
+            .iter()
+            .enumerate()
+            .any(|(position, (index, _))| *index != position)
+        {
+            return Err(AdapterError::Embed(
+                "embeddings response has duplicate or out-of-range index values".to_string(),
+            ));
+        }
         Ok(indexed.into_iter().map(|(_, vector)| vector).collect())
     }
 
@@ -390,6 +402,26 @@ mod tests {
             .embed(&["one".to_string(), "two".to_string()])
             .expect_err("mismatch rejected");
         assert!(err.to_string().contains("count mismatch"));
+    }
+
+    #[test]
+    fn embed_rejects_duplicate_indices() {
+        // Right count (2), but both entries claim index 0 — without the
+        // bijection check this would misalign vectors with their texts.
+        let body = serde_json::json!({
+            "data": [
+                { "index": 0, "embedding": [0.1, 0.2] },
+                { "index": 0, "embedding": [0.3, 0.4] },
+            ]
+        })
+        .to_string();
+        let (base, _seen) = spawn_mock(vec![(200, body)]);
+        let adapter = adapter_for(&base, None);
+
+        let err = adapter
+            .embed(&["one".to_string(), "two".to_string()])
+            .expect_err("duplicate index rejected");
+        assert!(err.to_string().contains("duplicate or out-of-range"));
     }
 
     #[test]
