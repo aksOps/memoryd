@@ -13,7 +13,7 @@ Status legend:
 
 ## Current Position
 
-- `[~]` M0 is mostly complete.
+- `[x]` M0 is complete (closed out 2026-06).
 - `[x]` M1 is complete against this checklist.
 - `[x]` M2 — provider-free `raw_events_fts` lexical recall is the accepted variant;
   durable-memory recall is deferred to M6 (not an M2 gap).
@@ -51,19 +51,22 @@ Status legend:
   2024-11-05, tools `memory_remember`/`memory_recall`/`memory_stats`/
   `memory_graph` over the M7 association graph, no socket bind); resources
   (`memory://session/{id}`) deferred.
-- `[~]` Deferred M3 increment: the generic `openai_compat` adapter is delivered
-  (one adapter for any OpenAI-shaped endpoint — provider-specific
-  `ollama`/`opencode` names removed; embeddings + chat-completions + reachability
-  probe, env-configured, spend-cap-gated, rustls TLS). Failover, the `setup`
-  CLI, and the runtime spend ledger remain.
+- `[x]` Deferred M3 increment: complete (2026-06). The generic `openai_compat`
+  adapter (one adapter for any OpenAI-shaped endpoint; provider-specific
+  `ollama`/`opencode` names removed), reachability failover to the local
+  adapter, the rolling daily spend ledger over `provider_usage`, and the
+  `memoryd setup` CLI are all delivered and gated.
+- `[x]` Secondary-brain slice (2026-06): session distillation, heuristic
+  induction behind approvals, `memory_profile` + `memory://` resources,
+  opt-in retention horizons — see `docs/ROADMAP-GAPS.md`.
 - `[ ]` M10 (bench/packaging) remains.
 
-Next implementation target: the rest of the M3 increment (failover, setup CLI,
-runtime spend ledger) and/or M10.
+Next implementation target: M10 (packaging, prebuilt binaries, npm
+publication) when release infrastructure is ready.
 
 ## M0 — Store Skeleton, Config, CLI Shell, Security Gate
 
-Status: `[~]` Mostly complete.
+Status: `[x]` Complete (closed out 2026-06).
 
 - `[x]` Rust workspace with `memoryd` binary and `memoryd-core` library.
 - `[x]` Canonical SQLite schema created with all 13 durable tables.
@@ -78,11 +81,12 @@ Status: `[~]` Mostly complete.
 - `[x]` Security tooling bootstrap uses hash-pinned prebuilt tools.
 - `[x]` OpenSSF Best Practices passing evidence is recorded.
 - `[x]` `main` is PR-only protected, including admins.
-- `[ ]` `doctor` reports disk-free evidence if we keep that M0 plan requirement.
-- `[ ]` Decide whether to keep the plan's `cargo build --release` exit evidence
-  as an M0 requirement or treat debug CI build as enough for pre-release.
-- `[ ]` Add a documented negative-test strategy for vulnerable dependency/SBOM
-  gates without committing a deliberately vulnerable dependency.
+- `[x]` `doctor` reports disk-free evidence (`disk_free_mb`, 2026-06).
+- `[x]` Decided (2026-06): debug CI build is sufficient pre-release;
+  release-build evidence moves to M10 (recorded in `docs/OPERATIONS.md`).
+- `[x]` Negative-test strategy documented in `docs/OPERATIONS.md` (2026-06):
+  real upstream advisories + the deny.toml exception workflow prove the
+  gates' failure paths without committing a vulnerable dependency.
 
 ## M1 — Fast Capture Path
 

@@ -35,5 +35,15 @@ The project uses Semantic Versioning before the first stable release.
   vLLM, LM Studio), replacing the provider-specific `ollama`/`opencode` stub
   names. Opt-in via `--adapter`/`MEMORYD_ADAPTER` + `MEMORYD_OPENAI_*` env
   settings; requires a non-zero `MEMORYD_SPEND_CAP_USD`; rustls TLS.
+- Added the secondary-brain slice: session distillation (`session_summary`
+  narratives), heuristic induction into the approvals gate, the
+  `memory_profile` MCP tool, and `memory://profile` / `memory://session/{id}`
+  resources.
+- Added opt-in retention horizons (`MEMORYD_RETAIN_RAW_DAYS`,
+  `MEMORYD_RETAIN_RAW_EMBED_DAYS`), provider failover to the local adapter,
+  a rolling daily spend ledger, `doctor --fix`, `memoryd backup`, and
+  `memoryd setup`.
+- Moved all provider inference outside dream write transactions.
+- Added `docs/CAPTURE-GUIDE.md` and `docs/OPERATIONS.md`.
 
 No public runtime vulnerabilities have been fixed in a release yet.

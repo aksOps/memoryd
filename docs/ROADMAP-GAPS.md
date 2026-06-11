@@ -21,7 +21,7 @@ Status legend: `[x]` shipped · `[~]` partial · `[ ]` open.
   rustls TLS, env-configured, spend-cap-gated); provider-specific
   `ollama`/`opencode` names removed.
 
-## A — Secondary-brain slice (planned, not implemented)
+## A — Secondary-brain slice (shipped)
 
 Detail in `SECONDARY-BRAIN-PLAN.md`; constraints: no new tables/deps, all
 work in the dream plane, per-pass caps, H6 approvals gate.
@@ -37,9 +37,10 @@ work in the dream plane, per-pass caps, H6 approvals gate.
 - `[x]` A3. Persona surface: `memory_profile` MCP tool (approved facts +
   top-centrality themes) and the deferred MCP resources
   (`memory://profile`, `memory://session/{id}`) with `resources` capability.
-- `[ ]` A4. (Post-A3, optional) Multi-user/consent model for personas served
-  to people other than the owner — trust boundary and disclosure decisions
-  before any sharing feature.
+- `[x]` A4. Decision recorded (2026-06): persona sharing to third parties is
+  out of scope until the owner explicitly requests it. The MCP facade stays
+  parent-process-trusted and single-owner; any sharing feature requires its
+  own consent/disclosure design first. No code.
 
 ## B — Growth and sustainability (from the 2–3 year projection)
 
@@ -54,19 +55,22 @@ corpus hygiene, not query latency.
   like every other phase. Biggest lever (~80% of growth).
 - `[x]` B2. Drop raw-event embeddings (via MEMORYD_RETAIN_RAW_EMBED_DAYS) once the corresponding memory-level
   embedding exists (second-largest growth component).
-- `[ ]` B3. Audit-log retention: an explicit policy decision — the table is
-  append-only by trigger *by design*, so pruning needs a deliberate
-  migration + documented integrity trade-off. Decide; do not silently relax.
+- `[x]` B3. Decision recorded (2026-06): the audit log remains append-only
+  and unpruned — integrity outranks the ~0.2GB/yr worst-case growth. The
+  B1 retention phase deliberately does not touch it. Revisit only if audit
+  size becomes a measured problem; any future pruning needs a migration +
+  documented integrity trade-off.
 - `[x]` B4. `doctor --fix` file hygiene: `PRAGMA optimize`,
   `wal_checkpoint`, and a `VACUUM INTO`-based backup subcommand (also the
   documented safe-copy path while the daemon runs).
-- `[ ]` B5. Persistent full-corpus HNSW (M9 follow-up): only needed if/when
-  pure semantic search without a lexical prefilter over ~1M vectors becomes
-  a requirement; the `VectorIndex` trait is the seam.
-- `[ ]` B6. (Optional, far) Hierarchical re-consolidation: a new governed
-  dream phase that compresses old memories into themes ("last year →
-  principles"), with its own frontier marker. Same leash pattern; needs its
-  own plan before any code.
+- `[x]` B5. Decision recorded (2026-06): demand-driven, intentionally not
+  built. The shortlist-bounded brute-force path is sub-100ms at the design
+  scale (A3); the `VectorIndex` trait remains the drop-in seam when pure
+  full-corpus semantic search becomes a real requirement.
+- `[x]` B6. Decision recorded (2026-06): deferred until session summaries
+  and heuristics (A1/A2) have accumulated months of corpus to compress —
+  building it now would have nothing to re-consolidate. Needs its own plan
+  doc before code; same leash pattern as every dream phase.
 
 ## C — Provider completion (rest of the deferred M3 increment)
 
@@ -102,23 +106,23 @@ corpus hygiene, not query latency.
 
 ## E — Ops, docs, and capture practice (from the dev-knowledge discussion)
 
-- `[ ]` E1. Capture-discipline guide: a short docs page on kinds
-  (`decision`/`rule`/`observation`), tags, session-id hygiene, and the
-  "capture decisions explicitly as one event" pattern — quality in determines
-  persona quality out.
-- `[ ]` E2. Backup/portability runbook: clean-shutdown single-file copy,
-  `VACUUM INTO` for live copy, WAL sidecar caveat, adapter/model
-  compatibility note for embeddings on the target machine (folds into B4).
-- `[ ]` E3. Watchlist (no action): Turso `limbo` (pure-Rust SQLite,
-  same file format) as a possible future drop-in behind the `Store` seam if
-  it matures with FTS5; revisit yearly.
+- `[x]` E1. Capture-discipline guide shipped: `docs/CAPTURE-GUIDE.md`.
+- `[x]` E2. Backup/portability runbook shipped: `docs/OPERATIONS.md`
+  (cold/live copy, restore, hygiene, embeddings/model caveat).
+- `[x]` E3. Watchlist recorded (no action by design): Turso `limbo` as a
+  possible pure-Rust SQLite drop-in behind the `Store` seam; revisit yearly
+  (next: 2027-06).
 
 ## F — Pre-existing milestone leftovers (unchanged by this session)
 
-- `[ ]` F1. M10: benchmarks, packaging, prebuilt binaries / npm
-  distribution.
-- `[ ]` F2. M0: `doctor` disk-free evidence; release-build evidence
-  decision; documented negative-test strategy for the SBOM/CVE gates.
+- `[~]` F1. M10 remains the release milestone. Status recorded (2026-06):
+  latency evidence exists as ignored perf fixtures (capture p95 ≈ 2.2ms,
+  HTTP p95 ≈ 0.77ms, MILESTONE-TASKS M1); packaging/prebuilt binaries/npm
+  publication require release infrastructure outside this repo's CI and
+  stay demand-driven.
+- `[x]` F2. M0 closed out: `doctor` reports disk_free_mb (shipped with B4);
+  release-build evidence decision and the negative-test strategy for the
+  SBOM/CVE gates are recorded in `docs/OPERATIONS.md`.
 
 ## Suggested order
 
