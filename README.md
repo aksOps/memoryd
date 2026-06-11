@@ -185,7 +185,7 @@ See `docs/API.md` for CLI and REST request/response details. See
 - Capture appends redacted raw events and queues background work when below the queue-depth cap; saturated captures return degraded instead of calling providers or failing inline.
 - Recall uses local SQLite FTS over redacted captured raw events; it does not call providers inline.
 - Rust `unsafe` code is forbidden at workspace level.
-- CI runs formatting, build, clippy with `-D warnings`, tests, dependency policy, advisory audit, and SBOM generation.
+- CI runs formatting, build, clippy with `-D warnings`, tests, dependency policy, advisory audit, SBOM generation, line-coverage enforcement (85% floor via cargo-llvm-cov), and a SonarQube Cloud scan whose quality gate must pass (one-time SonarCloud setup steps in `docs/PRODUCTION-READINESS-PLAN.md`).
 - `main` is protected with required CI, up-to-date checks, linear history, no force pushes, no deletions, and conversation resolution.
 
 The current redactor is deterministic and best-effort, not a guarantee that every possible secret format is detected. It replaces matched content with `[REDACTED]` before persistence and covers sensitive JSON keys, bearer-style credentials, common API-key prefixes (case-insensitive), private-key markers, emails, long all-digit runs (16+ digits, e.g. card numbers), and high-entropy token-like spans. Known limitation: secrets that arrive percent-encoded are split at `%xx` boundaries and are not decoded or reassembled before matching.
