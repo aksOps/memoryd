@@ -308,3 +308,31 @@ Execution failures are in-band tool results with `isError: true` so the
 calling model can react: blank recall query ("query must contain searchable
 text"), empty capture fields ("capture fields must not be empty"), and unknown
 `memory_id` ("memory not found").
+
+## Agent integration (`memoryd integrate`)
+
+```bash
+memoryd integrate [--agent claude|opencode|codex|hermes] [--scope user|project] [--dry-run] [--bin <path>] [--db <path>]
+```
+
+Auto-discovers installed agents (by their config dir under `$HOME`) and
+registers the memoryd MCP server into each. With no `--agent`, every detected
+agent is integrated; naming one integrates it even if discovery missed it.
+`--bin` defaults to the running executable; `--db` (when given) is embedded in
+the registered command and the Claude hook.
+
+Per-agent targets and formats:
+
+| Agent | File (user scope) | MCP key | Shell hook |
+| --- | --- | --- | --- |
+| Claude Code | `~/.claude.json` (project: `.mcp.json`) | `mcpServers` (stdio) | `SessionEnd` → `dream` in `~/.claude/settings.json` |
+| OpenCode | `~/.config/opencode/opencode.json` | `mcp` (`type:"local"`, `command` array) | `plugins/memoryd.js` → `dream` on `session.idle` |
+| Codex | `~/.codex/config.toml` | `[mcp_servers.memoryd]` | `[[hooks.Stop]]` → `dream` on turn stop |
+| Hermes | `~/.hermes/config.yaml` | `mcp_servers` | `hooks.on_session_end` → `dream` |
+
+Safety model: JSON files are parsed and deep-merged (other servers/settings
+preserved, idempotent on re-run); TOML/YAML files are appended only when
+memoryd's section is absent, a no-op when already present, and otherwise the
+exact stanza is printed for manual paste. A present-but-unparseable JSON config
+is an error, never overwritten. Every modified file is backed up to
+`<file>.memoryd.bak`; `--dry-run` previews without writing.

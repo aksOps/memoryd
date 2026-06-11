@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod integrate;
 mod logging;
 mod mcp;
 
@@ -63,6 +64,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
         Command::Stats => stats(cli),
         Command::Backup(args) => backup(cli, args),
         Command::Setup(args) => setup(args),
+        Command::Integrate(args) => integrate::run(&args),
         Command::Serve => serve(cli),
         Command::Remember(args) => remember(cli, args),
         Command::Recall(args) => recall(cli, args),
@@ -822,6 +824,7 @@ enum Command {
     Stats,
     Backup(BackupArgs),
     Setup(SetupArgs),
+    Integrate(integrate::IntegrateArgs),
     Serve,
     Remember(RememberArgs),
     Recall(RecallArgs),
@@ -946,6 +949,13 @@ impl Cli {
                 "stats" => Command::Stats,
                 "backup" => Command::Backup(BackupArgs::default()),
                 "setup" => Command::Setup(SetupArgs::default()),
+                "integrate" => Command::Integrate(integrate::IntegrateArgs {
+                    agent: None,
+                    scope: integrate::Scope::User,
+                    dry_run: false,
+                    bin: None,
+                    db: None,
+                }),
                 "serve" => Command::Serve,
                 "remember" => Command::Remember(RememberArgs::default()),
                 "recall" => Command::Recall(RecallArgs::default()),
@@ -970,7 +980,13 @@ impl Cli {
             let token = raw.to_string_lossy().into_owned();
             match token.as_str() {
                 "--db" => {
-                    db_path = PathBuf::from(next_value(&mut args, "--db")?);
+                    let value = PathBuf::from(next_value(&mut args, "--db")?);
+                    // `integrate` embeds --db in the registered agent command;
+                    // every other command uses it as its own store path.
+                    if let Command::Integrate(integrate) = &mut command {
+                        integrate.db = Some(value.clone());
+                    }
+                    db_path = value;
                 }
                 "--bind" => {
                     let value = next_string(&mut args, "--bind")?;
@@ -995,6 +1011,34 @@ impl Cli {
                         return Err(CliError::UnknownFlag(token));
                     };
                     setup.out = next_string(&mut args, "--out")?;
+                }
+                "--agent" => {
+                    let Command::Integrate(integrate) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    integrate.agent = Some(next_string(&mut args, "--agent")?);
+                }
+                "--scope" => {
+                    let Command::Integrate(integrate) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    integrate.scope = match next_string(&mut args, "--scope")?.as_str() {
+                        "user" => integrate::Scope::User,
+                        "project" => integrate::Scope::Project,
+                        other => return Err(CliError::InvalidScope(other.to_string())),
+                    };
+                }
+                "--bin" => {
+                    let Command::Integrate(integrate) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    integrate.bin = Some(PathBuf::from(next_value(&mut args, "--bin")?));
+                }
+                "--dry-run" => {
+                    let Command::Integrate(integrate) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    integrate.dry_run = true;
                 }
                 "--token" => {
                     bearer_token = Some(next_string(&mut args, "--token")?);
@@ -1273,6 +1317,7 @@ fn print_help() {
             memoryd doctor [--fix] [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>]\n\
             memoryd backup --to <path> [--db <path>]\n\
             memoryd setup [--out <env-file>]\n\
+            memoryd integrate [--agent claude|opencode|codex|hermes] [--scope user|project] [--dry-run] [--bin <path>] [--db <path>]\n\
             memoryd stats  [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>]\n\
             memoryd remember <content> [--kind <kind>] [--session <id>] [--source <source>] [--tags <a,b>] [--db <path>]\n\
             memoryd recall <query> [--k <limit>] [--semantic] [--hops <0|1>] [--index <brute-force|hnsw>] [--db <path>]\n\
@@ -1305,6 +1350,10 @@ enum CliError {
     InvalidNumberFlag(&'static str, String),
     InvalidBind(String),
     TokenFileUnreadable(String),
+    UnknownAgent(String),
+    IntegrateUnparseable(String),
+    IntegrateConflict(&'static str),
+    InvalidScope(String),
     Config(memoryd_core::config::ConfigError),
     Store(memoryd_core::store::StoreError),
     Json(serde_json::Error),
@@ -1328,6 +1377,22 @@ impl fmt::Display for CliError {
                 write!(f, "value for {flag} must be a positive integer: {value}")
             }
             Self::InvalidBind(bind) => write!(f, "invalid bind address: {bind}"),
+            Self::UnknownAgent(agent) => write!(
+                f,
+                "unknown agent: {agent} (expected claude, opencode, codex, or hermes)"
+            ),
+            Self::IntegrateUnparseable(path) => {
+                write!(
+                    f,
+                    "existing config is not valid and was left untouched: {path}"
+                )
+            }
+            Self::IntegrateConflict(detail) => {
+                write!(f, "cannot integrate: {detail}")
+            }
+            Self::InvalidScope(scope) => {
+                write!(f, "invalid scope: {scope} (expected user or project)")
+            }
             Self::TokenFileUnreadable(path) => {
                 write!(f, "could not read token file {path}")
             }
