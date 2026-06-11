@@ -5,20 +5,46 @@ use memoryd_core::store::{
     ApprovalDecision, ApprovalRow, CaptureAck, MemoryRecallResult, NewRawEvent, RecallResult,
     Store, StoreError,
 };
+use memoryd_core::writer::WriterHandle;
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::io::{BufRead, Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+mod logging;
+mod mcp;
 
 const MAX_HTTP_LINE_BYTES: usize = 8 * 1024;
 const MAX_HTTP_HEADERS: usize = 64;
 const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
 /// How often the `serve` dream scheduler runs a consolidate+decay pass.
 const DREAM_INTERVAL_SECS: u64 = 300;
+/// Socket deadlines for each accepted connection. Without these a client that
+/// connects and never sends (or dribbles) bytes would pin its handler thread
+/// forever — the classic slowloris. 10s is generous for a local daemon.
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound on concurrently handled connections; excess connections get an
+/// immediate 503 instead of an unbounded thread pile-up.
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+/// Auth throttle policy: this many 401s within the window locks the peer IP out
+/// for the lockout duration. A successful request clears the peer's state.
+const AUTH_FAIL_LIMIT: u32 = 5;
+const AUTH_FAIL_WINDOW_MS: i64 = 60_000;
+const AUTH_LOCKOUT_MS: i64 = 60_000;
+/// Memory bound for the throttle map; expired entries are dropped first, then
+/// the entry with the oldest failure is evicted.
+const AUTH_THROTTLE_MAX_ENTRIES: usize = 1024;
+/// After a failed embed tick against an unreachable remote provider, the
+/// worker embeds with the local adapter for this long before retrying.
+const ADAPTER_FALLBACK_COOLDOWN_MS: i64 = 60_000;
 
 fn main() -> ExitCode {
     match run(env::args_os()) {
@@ -33,14 +59,17 @@ fn main() -> ExitCode {
 fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
     let cli = Cli::parse(args)?;
     match cli.command.clone() {
-        Command::Doctor => doctor(cli),
+        Command::Doctor(args) => doctor(cli, args),
         Command::Stats => stats(cli),
+        Command::Backup(args) => backup(cli, args),
+        Command::Setup(args) => setup(args),
         Command::Serve => serve(cli),
         Command::Remember(args) => remember(cli, args),
         Command::Recall(args) => recall(cli, args),
         Command::Import(args) => import(cli, args),
         Command::Dream(args) => dream(cli, args),
         Command::Approve(args) => approve(cli, args),
+        Command::Mcp => mcp::serve_stdio(cli),
         Command::Help => {
             print_help();
             Ok(())
@@ -48,11 +77,17 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
     }
 }
 
-fn doctor(cli: Cli) -> Result<(), CliError> {
+fn doctor(cli: Cli, args: DoctorArgs) -> Result<(), CliError> {
     let cfg = cli.config()?;
     cfg.validate()?;
 
     let store = Store::open(&cfg.db_path)?;
+    if args.fix {
+        // Safe, reversible repairs only (initial-design doctor --fix):
+        // WAL checkpoint/truncate + planner statistics refresh.
+        store.optimize()?;
+        println!("fix: wal_checkpoint(TRUNCATE) + PRAGMA optimize applied");
+    }
     let report = store.doctor_report()?;
 
     println!("memoryd doctor");
@@ -65,6 +100,10 @@ fn doctor(cli: Cli) -> Result<(), CliError> {
     );
     println!("integrity_check: {}", report.integrity_check);
     println!("missing_tables: {}", report.missing_tables.len());
+    match disk_free_bytes(&cfg.db_path) {
+        Some(bytes) => println!("disk_free_mb: {}", bytes / (1024 * 1024)),
+        None => println!("disk_free_mb: unavailable"),
+    }
     println!("bind: {}", cfg.bind);
     println!("provider: {}", cfg.providers.default_adapter);
     println!("paid_spend_cap_usd: {:.2}", cfg.caps.paid_spend_cap_usd);
@@ -86,6 +125,164 @@ fn stats(cli: Cli) -> Result<(), CliError> {
         println!("{}: {}", stat.table, stat.rows);
     }
     Ok(())
+}
+
+/// Consistent live backup via `VACUUM INTO` — safe while the daemon runs,
+/// compacted, and refuses to overwrite an existing target (roadmap B4).
+fn backup(cli: Cli, args: BackupArgs) -> Result<(), CliError> {
+    let cfg = cli.config()?;
+    cfg.validate()?;
+    if args.to.is_empty() {
+        return Err(CliError::MissingArgument("--to"));
+    }
+    let store = Store::open(&cfg.db_path)?;
+    let target = PathBuf::from(&args.to);
+    store.backup_to(&target)?;
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "backup": target.display().to_string(),
+            "source": cfg.db_path.display().to_string(),
+        }))?
+    );
+    Ok(())
+}
+
+/// Interactive first-run configuration (roadmap C3): asks for the provider
+/// settings and writes them as an env file (0600 on unix) that the shell can
+/// `source` before running memoryd. Pure generation lives in
+/// `setup_env_contents` for testability; this function only does I/O.
+fn setup(args: SetupArgs) -> Result<(), CliError> {
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    let mut ask = |prompt: &str, default: &str| -> Result<String, CliError> {
+        if default.is_empty() {
+            eprint!("{prompt}: ");
+        } else {
+            eprint!("{prompt} [{default}]: ");
+        }
+        let _ = std::io::stderr().flush();
+        let answer = lines.next().transpose()?.unwrap_or_default();
+        let answer = answer.trim();
+        Ok(if answer.is_empty() {
+            default.to_string()
+        } else {
+            answer.to_string()
+        })
+    };
+
+    let adapter = ask("adapter (null|local|openai_compat)", "local")?;
+    let mut answers = SetupAnswers {
+        adapter: adapter.clone(),
+        ..SetupAnswers::default()
+    };
+    if adapter == "openai_compat" {
+        answers.base_url = ask("base URL", "https://api.openai.com/v1")?;
+        answers.api_key_file = ask("API key file path (empty for keyless local runtimes)", "")?;
+        answers.embed_model = ask("embed model", "text-embedding-3-small")?;
+        answers.chat_model = ask("chat model", "gpt-4o-mini")?;
+        answers.usd_per_1k = ask("USD per 1k prompt tokens (0 = free)", "0")?;
+        answers.spend_cap = ask("daily spend cap USD (must be > 0)", "1.00")?;
+    }
+    answers.retain_raw_days = ask("retain raw events for N days (0 = forever)", "0")?;
+
+    let contents = setup_env_contents(&answers);
+    let target = if args.out.is_empty() {
+        default_env_file_path()
+    } else {
+        PathBuf::from(&args.out)
+    };
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&target, &contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))?;
+    }
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "env_file": target.display().to_string(),
+            "usage": format!("set -a; source {}; set +a; memoryd serve", target.display()),
+        }))?
+    );
+    Ok(())
+}
+
+/// Answers collected by `setup`; empty strings mean "omit that variable".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SetupAnswers {
+    adapter: String,
+    base_url: String,
+    api_key_file: String,
+    embed_model: String,
+    chat_model: String,
+    usd_per_1k: String,
+    spend_cap: String,
+    retain_raw_days: String,
+}
+
+/// Render the env file. Comments document each knob; only non-empty,
+/// non-default answers emit variables so the file stays minimal.
+fn setup_env_contents(answers: &SetupAnswers) -> String {
+    let mut out = String::from(
+        "# memoryd environment (generated by `memoryd setup`)\n# Load with: set -a; source <this file>; set +a\n",
+    );
+    let mut push = |key: &str, value: &str| {
+        if !value.is_empty() {
+            out.push_str(key);
+            out.push('=');
+            out.push_str(value);
+            out.push('\n');
+        }
+    };
+    push("MEMORYD_ADAPTER", &answers.adapter);
+    if answers.adapter == "openai_compat" {
+        push("MEMORYD_OPENAI_BASE_URL", &answers.base_url);
+        push("MEMORYD_OPENAI_API_KEY_FILE", &answers.api_key_file);
+        push("MEMORYD_OPENAI_EMBED_MODEL", &answers.embed_model);
+        push("MEMORYD_OPENAI_CHAT_MODEL", &answers.chat_model);
+        push("MEMORYD_OPENAI_USD_PER_1K", &answers.usd_per_1k);
+        push("MEMORYD_SPEND_CAP_USD", &answers.spend_cap);
+    }
+    if !answers.retain_raw_days.is_empty() && answers.retain_raw_days != "0" {
+        push("MEMORYD_RETAIN_RAW_DAYS", &answers.retain_raw_days);
+    }
+    out
+}
+
+fn default_env_file_path() -> PathBuf {
+    if let Some(config) = env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(config).join("memoryd").join("env");
+    }
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".config")
+            .join("memoryd")
+            .join("env");
+    }
+    PathBuf::from("memoryd.env")
+}
+
+/// Best-effort free-space probe for `doctor` (M0 disk-free evidence): parses
+/// `df -k` output so no platform/libc dependency is needed; `None` when the
+/// probe is unavailable.
+fn disk_free_bytes(db_path: &Path) -> Option<u64> {
+    let dir = db_path.parent().filter(|p| !p.as_os_str().is_empty())?;
+    let output = std::process::Command::new("df")
+        .arg("-k")
+        .arg(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let fields: Vec<&str> = text.lines().nth(1)?.split_whitespace().collect();
+    // df -k: Filesystem 1K-blocks Used Available ...
+    fields.get(3)?.parse::<u64>().ok().map(|kb| kb * 1024)
 }
 
 fn remember(cli: Cli, args: RememberArgs) -> Result<(), CliError> {
@@ -113,7 +310,8 @@ fn recall(cli: Cli, args: RecallArgs) -> Result<(), CliError> {
             memoryd_core::config::ConfigError::UnknownVectorIndex { kind: index_kind },
         ));
     }
-    let result = recall_with_mode(&store, &args, &index_kind, &cfg.providers.default_adapter)?;
+    let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(&cfg.providers);
+    let result = recall_with_mode(&store, &args, &index_kind, &adapter)?;
     println!("{}", recall_response_json(&result)?);
     Ok(())
 }
@@ -155,8 +353,11 @@ fn dream(cli: Cli, args: DreamArgs) -> Result<(), CliError> {
     cfg.validate()?;
 
     let mut store = Store::open(&cfg.db_path)?;
-    let adapter =
-        memoryd_core::adapters::AdapterKind::from_default_adapter(&cfg.providers.default_adapter);
+    let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(&cfg.providers);
+    let (adapter, degraded) = adapter.effective_for_pass();
+    if degraded {
+        eprintln!("memoryd: provider unreachable; dream pass uses the local adapter");
+    }
     let opts = memoryd_core::dream::DreamOptions {
         trigger: "manual",
         budget_usd: args.budget_usd.unwrap_or(cfg.caps.paid_spend_cap_usd),
@@ -232,21 +433,20 @@ fn approve_decision_json(id: &str, decision: &ApprovalDecision) -> Result<String
     }))?)
 }
 
-/// Run semantic recall when requested, else lexical. Only the no-spend `null`
-/// adapter ships today, and it self-degrades to lexical (`embeds_semantically`
-/// is false), so `--semantic` is safe by default; a configured non-`null` embedding
-/// provider (deferred M3 increment) activates real rerank with no caller change.
+/// Run semantic recall when requested, else lexical. The `null` adapter
+/// self-degrades to lexical (`embeds_semantically` is false), so `--semantic`
+/// is safe by default; `local` and a configured `openai_compat` endpoint
+/// activate real rerank with no caller change.
 fn recall_with_mode(
     store: &Store,
     args: &RecallArgs,
     index_kind: &str,
-    adapter_kind: &str,
+    adapter: &memoryd_core::adapters::AdapterKind,
 ) -> Result<RecallOutput, StoreError> {
-    let adapter = memoryd_core::adapters::AdapterKind::from_default_adapter(adapter_kind);
     // Prefer durable memory + graph recall; fall back to raw-event recall when the
     // memory corpus has no match (e.g. before any dream run) so M2 behavior is preserved.
     let memory =
-        store.recall_memories(&args.query, args.limit, args.hops, &adapter, unix_ms_now())?;
+        store.recall_memories(&args.query, args.limit, args.hops, adapter, unix_ms_now())?;
     if !memory.hits.is_empty() {
         return Ok(RecallOutput::Memory(memory));
     }
@@ -255,7 +455,7 @@ fn recall_with_mode(
         store.recall_semantic(
             &args.query,
             args.limit,
-            &adapter,
+            adapter,
             index.as_ref(),
             unix_ms_now(),
         )?
@@ -276,33 +476,59 @@ fn serve(cli: Cli) -> Result<(), CliError> {
     let cfg = cli.config()?;
     cfg.validate()?;
 
-    let mut store = Store::open(&cfg.db_path)?;
+    // The single-writer actor (ARCHITECTURE-PLAN s7.1/U5): HTTP capture, auth
+    // audit, and the embed worker route writes through this one thread.
+    // Writer::spawn opens the store, so startup still fails fast and runs
+    // migrations before any background thread starts.
+    let (writer, writer_thread) = memoryd_core::writer::Writer::spawn(&cfg.db_path)?;
 
-    let worker_db = cfg.db_path.clone();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        signal_hook::flag::register(signal, Arc::clone(&shutdown))?;
+    }
+
     let worker_caps = cfg.caps.clone();
-    let worker_adapter_kind = cfg.providers.default_adapter.clone();
-    // Detached for M3: the worker runs for the process lifetime. Graceful shutdown
-    // (draining in-flight jobs) and consolidating onto the planned single-writer
-    // actor (ARCHITECTURE-PLAN s7.1/U5) are deferred; today it is a second writer.
-    let _worker = std::thread::spawn(move || {
-        let adapter =
-            memoryd_core::adapters::AdapterKind::from_default_adapter(&worker_adapter_kind);
-        let mut worker_store = match Store::open(&worker_db) {
-            Ok(store) => store,
-            Err(err) => {
-                eprintln!("memoryd: worker store open failed: {err}");
-                return;
-            }
-        };
-        loop {
+    let worker_providers = cfg.providers.clone();
+    let worker_shutdown = Arc::clone(&shutdown);
+    let mut worker_access = writer.clone();
+    // The embed worker leases/completes jobs through the writer actor; only
+    // the embedding compute runs on this thread. It drains its in-flight tick
+    // and exits on shutdown.
+    let worker = std::thread::spawn(move || {
+        let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(&worker_providers);
+        // Failover circuit breaker (roadmap C1): after a failed tick against an
+        // unreachable remote endpoint, embed with the in-process local adapter
+        // for a cooldown instead of burning job retries; then re-try primary.
+        let mut fallback_until = 0_i64;
+        while !worker_shutdown.load(Ordering::Acquire) {
             let now = unix_ms_now();
-            match memoryd_core::worker::tick_embed(&mut worker_store, &adapter, &worker_caps, now) {
+            let pass_adapter = if now < fallback_until {
+                memoryd_core::adapters::AdapterKind::from_default_adapter("local")
+            } else {
+                adapter.clone()
+            };
+            match memoryd_core::worker::tick_embed(
+                &mut worker_access,
+                &pass_adapter,
+                &worker_caps,
+                now,
+            ) {
                 Ok(report) if report.leased == 0 => {
                     std::thread::sleep(std::time::Duration::from_millis(250));
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    eprintln!("memoryd: worker tick failed: {err}");
+                    logging::log_warn!("worker tick failed: {err}");
+                    if now >= fallback_until {
+                        let (_, degraded) = adapter.effective_for_pass();
+                        if degraded {
+                            fallback_until = now + ADAPTER_FALLBACK_COOLDOWN_MS;
+                            logging::log_warn!(
+                                "provider unreachable; embedding with local adapter for {}s",
+                                ADAPTER_FALLBACK_COOLDOWN_MS / 1000
+                            );
+                        }
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
             }
@@ -311,18 +537,22 @@ fn serve(cli: Cli) -> Result<(), CliError> {
 
     let dream_db = cfg.db_path.clone();
     let dream_caps = cfg.caps.clone();
-    let dream_adapter_kind = cfg.providers.default_adapter.clone();
+    let dream_providers = cfg.providers.clone();
+    let dream_shutdown = Arc::clone(&shutdown);
     // M6: a second governed background loop runs a dream pass on an interval
-    // (consolidate + decay), capped by dream_wallclock_secs + paid_spend_cap_usd. Like
-    // the embed worker it is a detached writer for now (the single-writer actor is
-    // deferred, ARCHITECTURE-PLAN s7.1/U5).
-    let _dream_worker = std::thread::spawn(move || {
-        let adapter =
-            memoryd_core::adapters::AdapterKind::from_default_adapter(&dream_adapter_kind);
+    // (consolidate + decay), capped by dream_wallclock_secs + paid_spend_cap_usd.
+    // The dream loop intentionally stays a direct low-frequency writer instead
+    // of using the writer actor: consolidate_pending runs inference inside
+    // Store methods, and parking that on the writer thread would serialize
+    // capture latency behind dream passes (see writer.rs module docs).
+    // The interval sleep is sliced so shutdown is observed within ~500ms; an
+    // in-flight dream pass finishes before the thread exits.
+    let dream_worker = std::thread::spawn(move || {
+        let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(&dream_providers);
         let mut dream_store = match Store::open(&dream_db) {
             Ok(store) => store,
             Err(err) => {
-                eprintln!("memoryd: dream store open failed: {err}");
+                logging::log_error!("dream store open failed: {err}");
                 return;
             }
         };
@@ -331,52 +561,291 @@ fn serve(cli: Cli) -> Result<(), CliError> {
             budget_usd: dream_caps.paid_spend_cap_usd,
             max_seconds: dream_caps.dream_wallclock_secs,
         };
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(DREAM_INTERVAL_SECS));
+        'outer: loop {
+            let mut slept = std::time::Duration::ZERO;
+            let interval = std::time::Duration::from_secs(DREAM_INTERVAL_SECS);
+            while slept < interval {
+                if dream_shutdown.load(Ordering::Acquire) {
+                    break 'outer;
+                }
+                let slice = std::time::Duration::from_millis(500).min(interval - slept);
+                std::thread::sleep(slice);
+                slept += slice;
+            }
+            // One reachability probe per pass (roadmap C1): a dead remote
+            // endpoint degrades this pass to the local adapter instead of
+            // failing every LLM phase.
+            let (pass_adapter, degraded) = adapter.effective_for_pass();
+            if degraded {
+                logging::log_warn!("provider unreachable; dream pass uses the local adapter");
+            }
             if let Err(err) = memoryd_core::dream::dream_once(
                 &mut dream_store,
-                &adapter,
+                &pass_adapter,
                 &dream_caps,
                 &opts,
                 &|| unix_ms_now(),
             ) {
-                eprintln!("memoryd: dream tick failed: {err}");
+                logging::log_warn!("dream tick failed: {err}");
             }
         }
     });
 
     let listener = TcpListener::bind(cfg.bind)?;
-    println!("memoryd serve");
-    println!("bind: {}", cfg.bind);
-    println!("db_path: {}", cfg.db_path.display());
-    println!("worker: embed ({} adapter)", cfg.providers.default_adapter);
-    println!("dream: scheduled every {DREAM_INTERVAL_SECS}s");
+    logging::log_info!("serve starting");
+    logging::log_info!("bind: {}", cfg.bind);
+    logging::log_info!("db_path: {}", cfg.db_path.display());
+    logging::log_info!("worker: embed ({} adapter)", cfg.providers.default_adapter);
+    logging::log_info!("dream: scheduled every {DREAM_INTERVAL_SECS}s");
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                if let Err(err) = handle_http_connection(&mut store, &cfg, stream) {
-                    eprintln!("memoryd: request failed: {err}");
+    let result = serve_loop(
+        listener,
+        Arc::new(cfg),
+        Arc::new(AuthThrottle::new()),
+        writer.clone(),
+        Arc::clone(&shutdown),
+        HTTP_READ_TIMEOUT,
+        HTTP_WRITE_TIMEOUT,
+    );
+
+    logging::log_info!("shutdown: draining background workers");
+    if worker.join().is_err() {
+        logging::log_error!("embed worker panicked during shutdown");
+    }
+    if dream_worker.join().is_err() {
+        logging::log_error!("dream worker panicked during shutdown");
+    }
+    // Last writer handle drops here; the actor drains its queue and exits.
+    drop(writer);
+    if writer_thread.join().is_err() {
+        logging::log_error!("store writer panicked during shutdown");
+    }
+    logging::log_info!("shutdown complete");
+    result
+}
+
+/// Accept loop: each connection is handled on its own thread with its own
+/// store, so one slow or stalled client cannot serialize other callers. The
+/// active-connection counter bounds the thread count; peers past the cap get
+/// an immediate 503. The listener is non-blocking so the shutdown flag is
+/// observed within ~50ms; on shutdown the loop waits up to 5s for in-flight
+/// connections to drain (socket timeouts bound their lifetime regardless).
+fn serve_loop(
+    listener: TcpListener,
+    cfg: Arc<Config>,
+    throttle: Arc<AuthThrottle>,
+    writer: WriterHandle,
+    shutdown: Arc<AtomicBool>,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> Result<(), CliError> {
+    listener.set_nonblocking(true)?;
+    let active = Arc::new(AtomicUsize::new(0));
+    while !shutdown.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                // Hand the socket back to blocking mode; per-connection
+                // deadlines come from read/write timeouts, not non-blocking IO.
+                if stream.set_nonblocking(false).is_err() {
+                    continue;
                 }
+                if active.load(Ordering::Acquire) >= MAX_CONCURRENT_CONNECTIONS {
+                    let response =
+                        HttpResponse::error(503, "server_busy", "too many concurrent connections");
+                    let _ = stream.set_write_timeout(Some(write_timeout));
+                    let _ = write_http_response(&mut stream, response);
+                    continue;
+                }
+                let guard = ConnectionGuard::register(Arc::clone(&active));
+                let cfg = Arc::clone(&cfg);
+                let throttle = Arc::clone(&throttle);
+                let writer = writer.clone();
+                std::thread::spawn(move || {
+                    let _guard = guard;
+                    if let Err(err) = handle_connection_thread(
+                        &cfg,
+                        &throttle,
+                        &writer,
+                        stream,
+                        read_timeout,
+                        write_timeout,
+                    ) {
+                        logging::log_warn!("request failed: {err}");
+                    }
+                });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
             }
             Err(err) => return Err(CliError::Io(err)),
         }
     }
 
+    let drain_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while active.load(Ordering::Acquire) > 0 && std::time::Instant::now() < drain_deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     Ok(())
+}
+
+/// Per-connection entry point: opens this thread's read-only store and
+/// delegates; writes go through the writer actor. A store that cannot open
+/// still produces an HTTP 500 instead of a silently dropped connection.
+fn handle_connection_thread(
+    cfg: &Config,
+    throttle: &AuthThrottle,
+    writer: &WriterHandle,
+    mut stream: TcpStream,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> Result<(), CliError> {
+    match Store::open(&cfg.db_path) {
+        Ok(store) => handle_http_connection(
+            &store,
+            writer,
+            cfg,
+            throttle,
+            stream,
+            read_timeout,
+            write_timeout,
+        ),
+        Err(err) => {
+            let _ = stream.set_write_timeout(Some(write_timeout));
+            let _ = write_http_response(
+                &mut stream,
+                HttpResponse::error(500, "store_error", "store could not be opened"),
+            );
+            Err(CliError::Store(err))
+        }
+    }
+}
+
+/// RAII registration in the active-connection counter; decrements on drop so
+/// panics and early returns cannot leak a slot.
+struct ConnectionGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl ConnectionGuard {
+    fn register(active: Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::AcqRel);
+        Self { active }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Per-IP fixed-window auth throttle: `AUTH_FAIL_LIMIT` 401s within
+/// `AUTH_FAIL_WINDOW_MS` lock the peer out for `AUTH_LOCKOUT_MS`. State is
+/// in-memory only and bounded by `AUTH_THROTTLE_MAX_ENTRIES`. Callers inject
+/// `now_ms` so tests control the clock.
+struct AuthThrottle {
+    inner: Mutex<HashMap<IpAddr, FailState>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FailState {
+    failures: u32,
+    window_start_ms: i64,
+    locked_until_ms: i64,
+    last_failure_ms: i64,
+}
+
+impl AuthThrottle {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn is_throttled(&self, ip: IpAddr, now_ms: i64) -> bool {
+        let map = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        map.get(&ip)
+            .map(|state| state.locked_until_ms > now_ms)
+            .unwrap_or(false)
+    }
+
+    fn record_failure(&self, ip: IpAddr, now_ms: i64) {
+        let mut map = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        if !map.contains_key(&ip) && map.len() >= AUTH_THROTTLE_MAX_ENTRIES {
+            Self::evict(&mut map, now_ms);
+        }
+        let state = map.entry(ip).or_insert(FailState {
+            failures: 0,
+            window_start_ms: now_ms,
+            locked_until_ms: 0,
+            last_failure_ms: now_ms,
+        });
+        if now_ms.saturating_sub(state.window_start_ms) > AUTH_FAIL_WINDOW_MS {
+            state.failures = 0;
+            state.window_start_ms = now_ms;
+        }
+        state.failures += 1;
+        state.last_failure_ms = now_ms;
+        if state.failures >= AUTH_FAIL_LIMIT {
+            state.locked_until_ms = now_ms + AUTH_LOCKOUT_MS;
+            state.failures = 0;
+            state.window_start_ms = now_ms;
+        }
+    }
+
+    fn record_success(&self, ip: IpAddr) {
+        let mut map = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        map.remove(&ip);
+    }
+
+    /// Drop entries that are neither locked out nor recently failing; if none
+    /// expired, evict the entry with the oldest failure so the map stays bounded.
+    fn evict(map: &mut HashMap<IpAddr, FailState>, now_ms: i64) {
+        map.retain(|_, state| {
+            state.locked_until_ms > now_ms
+                || now_ms.saturating_sub(state.last_failure_ms) <= AUTH_FAIL_WINDOW_MS
+        });
+        if map.len() >= AUTH_THROTTLE_MAX_ENTRIES
+            && let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, state)| state.last_failure_ms)
+                .map(|(ip, _)| *ip)
+        {
+            map.remove(&oldest);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum Command {
-    Doctor,
+    Doctor(DoctorArgs),
     Stats,
+    Backup(BackupArgs),
+    Setup(SetupArgs),
     Serve,
     Remember(RememberArgs),
     Recall(RecallArgs),
     Import(ImportArgs),
     Dream(DreamArgs),
     Approve(ApproveArgs),
+    Mcp,
     Help,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DoctorArgs {
+    fix: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BackupArgs {
+    to: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SetupArgs {
+    /// Target env-file path; empty = $XDG_CONFIG_HOME/memoryd/env fallback.
+    out: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,6 +855,8 @@ struct RememberArgs {
     session_id: String,
     source: String,
     tags: Vec<String>,
+    /// Capture surface stamped into sessions/audit provenance ("cli", "mcp").
+    agent: String,
 }
 
 impl Default for RememberArgs {
@@ -396,6 +867,7 @@ impl Default for RememberArgs {
             session_id: "cli".to_string(),
             source: "cli".to_string(),
             tags: Vec::new(),
+            agent: "cli".to_string(),
         }
     }
 }
@@ -458,6 +930,9 @@ struct Cli {
     db_path: PathBuf,
     bind: SocketAddr,
     bearer_token: Option<String>,
+    /// Provider adapter override (null|local|openai_compat); also settable
+    /// via MEMORYD_ADAPTER. Endpoint details come from MEMORYD_OPENAI_*.
+    adapter: Option<String>,
 }
 
 impl Cli {
@@ -467,14 +942,17 @@ impl Cli {
         let command = match args.next() {
             None => Command::Help,
             Some(raw) => match raw.to_string_lossy().as_ref() {
-                "doctor" => Command::Doctor,
+                "doctor" => Command::Doctor(DoctorArgs::default()),
                 "stats" => Command::Stats,
+                "backup" => Command::Backup(BackupArgs::default()),
+                "setup" => Command::Setup(SetupArgs::default()),
                 "serve" => Command::Serve,
                 "remember" => Command::Remember(RememberArgs::default()),
                 "recall" => Command::Recall(RecallArgs::default()),
                 "import" => Command::Import(ImportArgs::default()),
                 "dream" => Command::Dream(DreamArgs::default()),
                 "approve" => Command::Approve(ApproveArgs::default()),
+                "mcp" => Command::Mcp,
                 "--help" | "-h" | "help" => Command::Help,
                 other => return Err(CliError::UnknownCommand(other.to_string())),
             },
@@ -486,6 +964,7 @@ impl Cli {
             .parse()
             .expect("DEFAULT_BIND must be a valid socket address");
         let mut bearer_token = env::var("MEMORYD_TOKEN").ok();
+        let mut adapter: Option<String> = None;
 
         while let Some(raw) = args.next() {
             let token = raw.to_string_lossy().into_owned();
@@ -499,8 +978,39 @@ impl Cli {
                         .parse()
                         .map_err(|_| CliError::InvalidBind(value.to_string()))?;
                 }
+                "--fix" => {
+                    let Command::Doctor(doctor) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    doctor.fix = true;
+                }
+                "--to" => {
+                    let Command::Backup(backup) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    backup.to = next_string(&mut args, "--to")?;
+                }
+                "--out" => {
+                    let Command::Setup(setup) = &mut command else {
+                        return Err(CliError::UnknownFlag(token));
+                    };
+                    setup.out = next_string(&mut args, "--out")?;
+                }
                 "--token" => {
                     bearer_token = Some(next_string(&mut args, "--token")?);
+                }
+                "--adapter" => {
+                    adapter = Some(next_string(&mut args, "--adapter")?);
+                }
+                "--token-file" => {
+                    // Preferred over --token for real tokens: argv is
+                    // world-readable via /proc/<pid>/cmdline, a file can be
+                    // chmod 0600. Last of --token/--token-file wins; both
+                    // override MEMORYD_TOKEN.
+                    let path = next_string(&mut args, "--token-file")?;
+                    let contents = std::fs::read_to_string(&path)
+                        .map_err(|_| CliError::TokenFileUnreadable(path))?;
+                    bearer_token = Some(contents.trim_end_matches(['\r', '\n']).to_string());
                 }
                 "--kind" => {
                     let Command::Remember(remember) = &mut command else {
@@ -543,9 +1053,19 @@ impl Cli {
                         return Err(CliError::UnknownFlag(token));
                     };
                     let value = next_string(&mut args, "--max-seconds")?;
-                    dream.max_seconds = Some(value.parse::<u64>().map_err(|_| {
+                    let seconds = value.parse::<u64>().map_err(|_| {
                         CliError::InvalidNumberFlag("--max-seconds", value.to_string())
-                    })?);
+                    })?;
+                    if seconds > memoryd_core::config::MAX_DURATION_SECS {
+                        return Err(CliError::Config(
+                            memoryd_core::config::ConfigError::CapDurationTooLarge {
+                                field: "--max-seconds",
+                                value: seconds,
+                                max: memoryd_core::config::MAX_DURATION_SECS,
+                            },
+                        ));
+                    }
+                    dream.max_seconds = Some(seconds);
                 }
                 "--now" => {
                     if !matches!(command, Command::Dream(_)) {
@@ -619,6 +1139,7 @@ impl Cli {
                         db_path,
                         bind,
                         bearer_token,
+                        adapter,
                     });
                 }
                 other
@@ -665,6 +1186,7 @@ impl Cli {
             db_path,
             bind,
             bearer_token,
+            adapter,
         })
     }
 
@@ -672,6 +1194,10 @@ impl Cli {
         let mut cfg = Config::with_db_path(self.db_path.clone());
         cfg.bind = self.bind;
         cfg.bearer_token = self.bearer_token.clone();
+        cfg.apply_env()?;
+        if let Some(adapter) = &self.adapter {
+            cfg.providers.default_adapter = adapter.clone();
+        }
         Ok(cfg)
     }
 }
@@ -744,14 +1270,22 @@ fn print_help() {
     println!(
         "memoryd\n\n\
          Usage:\n\
-            memoryd doctor [--db <path>] [--bind <addr:port>] [--token <token>]\n\
-            memoryd stats  [--db <path>] [--bind <addr:port>] [--token <token>]\n\
+            memoryd doctor [--fix] [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>]\n\
+            memoryd backup --to <path> [--db <path>]\n\
+            memoryd setup [--out <env-file>]\n\
+            memoryd stats  [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>]\n\
             memoryd remember <content> [--kind <kind>] [--session <id>] [--source <source>] [--tags <a,b>] [--db <path>]\n\
             memoryd recall <query> [--k <limit>] [--semantic] [--hops <0|1>] [--index <brute-force|hnsw>] [--db <path>]\n\
             memoryd import --source jsonl --path <file> [--db <path>]\n\
             memoryd dream [--now] [--budget-usd <n>] [--max-seconds <n>] [--db <path>]\n\
             memoryd approve [--list] [--id <id> --accept|--reject] [--db <path>]\n\
-            memoryd serve [--db <path>] [--bind <addr:port>] [--token <token>]\n\n\
+            memoryd mcp [--db <path>]   (MCP stdio server; no network bind)\n\
+            memoryd serve [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>] [--adapter <null|local|openai_compat>]\n\n\
+          Provider env: MEMORYD_ADAPTER, MEMORYD_SPEND_CAP_USD, MEMORYD_OPENAI_BASE_URL,\n\
+          MEMORYD_OPENAI_API_KEY[_FILE], MEMORYD_OPENAI_EMBED_MODEL, MEMORYD_OPENAI_CHAT_MODEL,\n\
+          MEMORYD_OPENAI_USD_PER_1K.\n\n\
+          Tokens: prefer MEMORYD_TOKEN or --token-file over --token; command-line\n\
+          arguments are world-readable via /proc/<pid>/cmdline.\n\n\
           Defaults:\n\
             bind: {DEFAULT_BIND}\n\
             provider: null\n\
@@ -770,6 +1304,7 @@ enum CliError {
     InvalidUtf8Argument(&'static str),
     InvalidNumberFlag(&'static str, String),
     InvalidBind(String),
+    TokenFileUnreadable(String),
     Config(memoryd_core::config::ConfigError),
     Store(memoryd_core::store::StoreError),
     Json(serde_json::Error),
@@ -793,6 +1328,9 @@ impl fmt::Display for CliError {
                 write!(f, "value for {flag} must be a positive integer: {value}")
             }
             Self::InvalidBind(bind) => write!(f, "invalid bind address: {bind}"),
+            Self::TokenFileUnreadable(path) => {
+                write!(f, "could not read token file {path}")
+            }
             Self::Config(err) => write!(f, "configuration error: {err}"),
             Self::Store(err) => write!(f, "{err}"),
             Self::Json(err) => write!(f, "JSON error: {err}"),
@@ -831,9 +1369,14 @@ impl From<std::io::Error> for CliError {
 fn remember_event(args: RememberArgs) -> NewRawEvent {
     NewRawEvent {
         session_id: args.session_id,
-        agent: "cli".to_string(),
+        agent: args.agent,
         source: args.source,
-        kind: "memory".to_string(),
+        // The user-facing kind IS the raw event kind, exactly like HTTP
+        // capture — so dream consolidation maps it to the right memory kind
+        // (decay half-life, profile extraction, heuristic induction) instead
+        // of flattening every `remember` to an observation. payload.memory_kind
+        // stays for backward compatibility with existing rows.
+        kind: args.kind.clone(),
         payload: serde_json::json!({
             "text": args.content,
             "memory_kind": args.kind.clone(),
@@ -851,9 +1394,11 @@ fn dream_response_json(outcome: &memoryd_core::dream::DreamOutcome) -> Result<St
     Ok(serde_json::to_string(&serde_json::json!({
         "run_id": outcome.run_id,
         "consolidated": outcome.consolidated,
+        "distilled": outcome.distilled,
         "associated": outcome.associated,
         "proposed": outcome.proposed,
         "decayed": outcome.decayed,
+        "retained": outcome.retained,
         "tokens_used": outcome.tokens_used,
         "status": outcome.status,
     }))?)
@@ -936,42 +1481,103 @@ fn recall_response_value(result: &RecallOutput) -> serde_json::Value {
 }
 
 fn handle_http_connection(
-    store: &mut Store,
+    store: &Store,
+    writer: &WriterHandle,
     cfg: &Config,
+    throttle: &AuthThrottle,
     mut stream: TcpStream,
+    read_timeout: Duration,
+    write_timeout: Duration,
 ) -> Result<(), CliError> {
+    stream.set_read_timeout(Some(read_timeout))?;
+    stream.set_write_timeout(Some(write_timeout))?;
     let peer = stream.peer_addr().ok();
+    let peer_ip = peer.map(|addr| addr.ip());
+
+    // Throttled peers are rejected before any request byte is read: cheapest
+    // possible path for a brute-forcing client, and no parser work.
+    if let Some(ip) = peer_ip
+        && throttle.is_throttled(ip, unix_ms_now())
+    {
+        write_http_response(
+            &mut stream,
+            HttpResponse::error(
+                429,
+                "rate_limited",
+                "too many failed authentication attempts; retry later",
+            ),
+        )?;
+        return Ok(());
+    }
+
     let response = match read_http_request(&mut stream) {
-        Ok(request) => handle_http_request(store, cfg, peer, request),
+        Ok(request) => handle_http_request(store, writer, cfg, peer, request),
         Err(err) => HttpResponse::error(err.status, err.code, err.message),
     };
+    let status = response.status;
     write_http_response(&mut stream, response)?;
+    if let Some(ip) = peer_ip {
+        if status == 401 {
+            throttle.record_failure(ip, unix_ms_now());
+        } else if (200..300).contains(&status) {
+            throttle.record_success(ip);
+        }
+    }
     Ok(())
 }
 
 fn handle_http_request(
-    store: &mut Store,
+    store: &Store,
+    writer: &WriterHandle,
     cfg: &Config,
     peer: Option<SocketAddr>,
     request: HttpRequest,
 ) -> HttpResponse {
+    // GET /v1/health is auth-exempt for loopback peers only: it is read-only
+    // and leaks nothing beyond the schema version, so local supervisors can
+    // probe liveness without the bearer token. Remote probes still need auth.
+    if request.path == "/v1/health" && peer.map(|addr| addr.ip().is_loopback()).unwrap_or(false) {
+        return handle_http_health(store, &request);
+    }
+
     if !is_authorized(cfg, peer, &request.headers) {
         let peer_loopback = peer.map(|addr| addr.ip().is_loopback());
         let authorization_header_present =
             header_value(&request.headers, "authorization").is_some();
-        if store
-            .record_auth_rejection(
-                &request.method,
-                &request.path,
+        let method = request.method.clone();
+        let path = request.path.clone();
+        let reason = auth_rejection_reason(cfg, peer);
+        let audited = writer.exec(move |s| {
+            s.record_auth_rejection(
+                &method,
+                &path,
                 peer_loopback,
                 authorization_header_present,
-                auth_rejection_reason(cfg, peer),
+                reason,
             )
-            .is_err()
-        {
+        });
+        if !matches!(audited, Ok(Ok(()))) {
             return HttpResponse::error(500, "store_error", "auth audit could not be persisted");
         }
         return HttpResponse::error(401, "unauthorized", "authorization failed");
+    }
+
+    // The parser only supports Content-Length framing; a chunked request would
+    // otherwise parse as a zero-length body and return a misleading JSON error.
+    if header_value(&request.headers, "transfer-encoding")
+        .map(|value| value.to_ascii_lowercase().contains("chunked"))
+        .unwrap_or(false)
+    {
+        return HttpResponse::error(
+            501,
+            "not_implemented",
+            "Transfer-Encoding is not supported; send Content-Length",
+        );
+    }
+
+    // Authorized non-loopback callers reach health here.
+    if request.path == "/v1/health" {
+        return handle_http_health(store, &request);
     }
 
     if request.path != "/v1/capture" && request.path != "/v1/recall" {
@@ -991,14 +1597,31 @@ fn handle_http_request(
         Err(_) => return HttpResponse::error(400, "invalid_json", "request body must be JSON"),
     };
     match request.path.as_str() {
-        "/v1/capture" => handle_http_capture(store, body, cfg.caps.queue_depth_max),
-        "/v1/recall" => handle_http_recall(store, body, &cfg.providers.default_adapter),
+        "/v1/capture" => handle_http_capture(writer, body, cfg.caps.queue_depth_max),
+        "/v1/recall" => handle_http_recall(store, body, &cfg.providers),
         _ => HttpResponse::error(404, "not_found", "route not found"),
     }
 }
 
+fn handle_http_health(store: &Store, request: &HttpRequest) -> HttpResponse {
+    if request.method != "GET" {
+        return HttpResponse::error(405, "method_not_allowed", "GET required");
+    }
+    match store.schema_version() {
+        Ok(schema_version) => HttpResponse::json(
+            200,
+            "OK",
+            serde_json::json!({
+                "status": "ok",
+                "schema_version": schema_version,
+            }),
+        ),
+        Err(_) => HttpResponse::error(500, "store_error", "health check could not read the store"),
+    }
+}
+
 fn handle_http_capture(
-    store: &mut Store,
+    writer: &WriterHandle,
     body: serde_json::Value,
     max_active_jobs: usize,
 ) -> HttpResponse {
@@ -1007,8 +1630,8 @@ fn handle_http_capture(
         Err(message) => return HttpResponse::error(422, "invalid_request", message),
     };
 
-    match store.capture_event_with_queue_limit(event, max_active_jobs) {
-        Ok(ack) => HttpResponse::json(
+    match writer.exec(move |s| s.capture_event_with_queue_limit(event, max_active_jobs)) {
+        Ok(Ok(ack)) => HttpResponse::json(
             202,
             "Accepted",
             serde_json::json!({
@@ -1019,14 +1642,20 @@ fn handle_http_capture(
                 "processed": ack.processed,
             }),
         ),
-        Err(StoreError::InvalidCaptureField(_)) => {
+        Ok(Err(StoreError::InvalidCaptureField(_))) => {
             HttpResponse::error(422, "invalid_request", "capture fields must not be empty")
         }
-        Err(_) => HttpResponse::error(500, "store_error", "capture could not be persisted"),
+        Ok(Err(_)) | Err(_) => {
+            HttpResponse::error(500, "store_error", "capture could not be persisted")
+        }
     }
 }
 
-fn handle_http_recall(store: &Store, body: serde_json::Value, adapter_kind: &str) -> HttpResponse {
+fn handle_http_recall(
+    store: &Store,
+    body: serde_json::Value,
+    providers: &memoryd_core::config::ProviderConfig,
+) -> HttpResponse {
     let args = match recall_request_from_json(body) {
         Ok(args) => args,
         Err(message) => return HttpResponse::error(422, "invalid_request", message),
@@ -1036,7 +1665,8 @@ fn handle_http_recall(store: &Store, body: serde_json::Value, adapter_kind: &str
     // CLI-only override, and HNSW is not yet a latency win (it builds per call over the
     // shortlist — see vectorindex.rs / ARCHITECTURE-PLAN §21.12). Revisit when the
     // persistent full-corpus index lands.
-    match recall_with_mode(store, &args, "brute-force", adapter_kind) {
+    let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(providers);
+    match recall_with_mode(store, &args, "brute-force", &adapter) {
         Ok(result) => HttpResponse::json(200, "OK", recall_response_value(&result)),
         Err(StoreError::InvalidRecallQuery) => {
             HttpResponse::error(422, "invalid_request", "query must contain searchable text")
@@ -1079,8 +1709,12 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, HttpParseErr
                 ));
             }
             let mut body = vec![0; body_len];
-            stream.read_exact(&mut body).map_err(|_| {
-                HttpParseError::new(400, "bad_request", "could not read request body")
+            stream.read_exact(&mut body).map_err(|err| {
+                if is_timeout(&err) {
+                    http_timeout_error()
+                } else {
+                    HttpParseError::new(400, "bad_request", "could not read request body")
+                }
             })?;
             return Ok(HttpRequest {
                 method: method.to_string(),
@@ -1133,6 +1767,7 @@ fn read_http_line(stream: &mut TcpStream) -> Result<String, HttpParseError> {
                     break;
                 }
             }
+            Err(err) if is_timeout(&err) => return Err(http_timeout_error()),
             Err(_) => {
                 return Err(HttpParseError::new(
                     400,
@@ -1156,6 +1791,23 @@ fn read_http_line(stream: &mut TcpStream) -> Result<String, HttpParseError> {
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
+/// Socket read timeouts surface as `WouldBlock` or `TimedOut` depending on the
+/// platform; both mean the client did not deliver bytes within the deadline.
+fn is_timeout(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+fn http_timeout_error() -> HttpParseError {
+    HttpParseError::new(
+        408,
+        "request_timeout",
+        "client did not send a complete request in time",
+    )
+}
+
 fn capture_event_from_json(value: serde_json::Value) -> Result<NewRawEvent, &'static str> {
     let object = value
         .as_object()
@@ -1174,7 +1826,6 @@ fn capture_event_from_json(value: serde_json::Value) -> Result<NewRawEvent, &'st
         .unwrap_or_else(|| serde_json::json!({}));
     let ts_ms = match object.get("ts_ms").or_else(|| object.get("ts")) {
         Some(value) if value.is_number() => value.as_i64().ok_or("timestamp is out of range")?,
-        Some(value) if value.is_string() => unix_ms_now(),
         Some(_) => return Err("ts_ms must be integer milliseconds"),
         None => unix_ms_now(),
     };
@@ -1341,11 +1992,14 @@ impl HttpResponse {
             401 => "Unauthorized",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            408 => "Request Timeout",
             413 => "Payload Too Large",
             415 => "Unsupported Media Type",
             422 => "Unprocessable Entity",
+            429 => "Too Many Requests",
             431 => "Request Header Fields Too Large",
             500 => "Internal Server Error",
+            503 => "Service Unavailable",
             _ => "Error",
         };
         Self::json(
@@ -1391,8 +2045,97 @@ mod tests {
             Cli::parse(["memoryd", "doctor", "--db", "/tmp/memoryd-test.db"].map(OsString::from))
                 .expect("cli parses");
 
-        assert_eq!(cli.command, Command::Doctor);
+        assert_eq!(cli.command, Command::Doctor(DoctorArgs::default()));
         assert_eq!(cli.db_path, PathBuf::from("/tmp/memoryd-test.db"));
+    }
+
+    #[test]
+    fn parses_doctor_fix_and_backup_to() {
+        let cli =
+            Cli::parse(["memoryd", "doctor", "--fix"].map(OsString::from)).expect("cli parses");
+        assert_eq!(cli.command, Command::Doctor(DoctorArgs { fix: true }));
+
+        let cli = Cli::parse(["memoryd", "backup", "--to", "/tmp/copy.db"].map(OsString::from))
+            .expect("cli parses");
+        assert_eq!(
+            cli.command,
+            Command::Backup(BackupArgs {
+                to: "/tmp/copy.db".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parses_setup_with_out() {
+        let cli = Cli::parse(["memoryd", "setup", "--out", "/tmp/m.env"].map(OsString::from))
+            .expect("cli parses");
+        assert_eq!(
+            cli.command,
+            Command::Setup(SetupArgs {
+                out: "/tmp/m.env".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn setup_env_contents_renders_minimal_and_full_profiles() {
+        let local = setup_env_contents(&SetupAnswers {
+            adapter: "local".to_string(),
+            retain_raw_days: "0".to_string(),
+            ..SetupAnswers::default()
+        });
+        assert!(local.contains("MEMORYD_ADAPTER=local"));
+        assert!(!local.contains("MEMORYD_OPENAI"), "{local}");
+        assert!(!local.contains("RETAIN"), "0 days omitted: {local}");
+
+        let remote = setup_env_contents(&SetupAnswers {
+            adapter: "openai_compat".to_string(),
+            base_url: "http://127.0.0.1:11434/v1".to_string(),
+            api_key_file: String::new(),
+            embed_model: "nomic-embed-text".to_string(),
+            chat_model: "llama3.2".to_string(),
+            usd_per_1k: "0".to_string(),
+            spend_cap: "0.50".to_string(),
+            retain_raw_days: "180".to_string(),
+        });
+        assert!(remote.contains("MEMORYD_ADAPTER=openai_compat"));
+        assert!(remote.contains("MEMORYD_OPENAI_BASE_URL=http://127.0.0.1:11434/v1"));
+        assert!(
+            !remote.contains("API_KEY_FILE"),
+            "empty key file omitted: {remote}"
+        );
+        assert!(remote.contains("MEMORYD_SPEND_CAP_USD=0.50"));
+        assert!(remote.contains("MEMORYD_RETAIN_RAW_DAYS=180"));
+    }
+
+    #[test]
+    fn backup_creates_consistent_copy_and_refuses_overwrite() {
+        let path = temp_db_path("backup-source");
+        let target = temp_db_path("backup-target");
+        {
+            let mut store = Store::open(&path).expect("store opens");
+            store
+                .capture_event(NewRawEvent {
+                    session_id: "b1".to_string(),
+                    agent: "cli".to_string(),
+                    source: "cli".to_string(),
+                    kind: "memory".to_string(),
+                    payload: serde_json::json!({"text": "backed up"}),
+                    provenance: serde_json::json!({}),
+                    ts_ms: 1000,
+                })
+                .expect("capture succeeds");
+            store.backup_to(&target).expect("backup succeeds");
+            assert!(matches!(
+                store.backup_to(&target),
+                Err(StoreError::BackupTargetExists(_))
+            ));
+        }
+        let copy = Store::open(&target).expect("copy opens");
+        let stats = copy.table_stats().expect("stats");
+        assert_eq!(table_rows(&stats, "raw_events"), 1, "copy is consistent");
+        cleanup_db_files(&path);
+        cleanup_db_files(&target);
     }
 
     #[test]
@@ -1430,6 +2173,45 @@ mod tests {
         let cli = Cli::parse(["memoryd", "serve"].map(OsString::from)).expect("cli parses");
 
         assert_eq!(cli.command, Command::Serve);
+    }
+
+    #[test]
+    fn parses_token_file_flag() {
+        let token_path = temp_db_path("token-file").with_extension("token");
+        fs::write(&token_path, "file-token-0123456789\n").expect("token file written");
+
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "serve",
+                "--token-file",
+                token_path.to_str().expect("path is UTF-8"),
+            ]
+            .map(OsString::from),
+        )
+        .expect("cli parses");
+
+        assert_eq!(
+            cli.bearer_token.as_deref(),
+            Some("file-token-0123456789"),
+            "token read from file with trailing newline trimmed"
+        );
+        let _ = fs::remove_file(&token_path);
+    }
+
+    #[test]
+    fn token_file_missing_is_an_error() {
+        let missing = temp_db_path("token-file-missing").with_extension("absent");
+        let result = Cli::parse(
+            [
+                "memoryd",
+                "serve",
+                "--token-file",
+                missing.to_str().expect("path is UTF-8"),
+            ]
+            .map(OsString::from),
+        );
+        assert!(matches!(result, Err(CliError::TokenFileUnreadable(_))));
     }
 
     #[test]
@@ -1604,8 +2386,13 @@ mod tests {
             hops: 1,
             index_kind: None,
         };
-        let result =
-            recall_with_mode(&store, &args, "brute-force", "null").expect("recall succeeds");
+        let result = recall_with_mode(
+            &store,
+            &args,
+            "brute-force",
+            &memoryd_core::adapters::AdapterKind::from_default_adapter("null"),
+        )
+        .expect("recall succeeds");
 
         // No memory exists (no dream run), so recall falls back to raw-event recall.
         // The only shipped adapter is null, which self-degrades
@@ -1764,10 +2551,12 @@ mod tests {
     fn http_capture_route_persists_event_on_loopback() {
         let path = temp_db_path("http-capture");
         let cfg = Config::with_db_path(path.clone());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -1803,10 +2592,12 @@ mod tests {
         let path = temp_db_path("http-capture-queue-full");
         let mut cfg = Config::with_db_path(path.clone());
         cfg.caps.queue_depth_max = 0;
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -1842,7 +2633,8 @@ mod tests {
     fn http_capture_100_sequential_requests_p95_stays_under_m1_target() {
         let path = temp_db_path("http-capture-latency");
         let cfg = Config::with_db_path(path.clone());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
         let mut durations = Vec::with_capacity(100);
 
         for index in 0..100 {
@@ -1860,7 +2652,8 @@ mod tests {
             .into_bytes();
             let started = Instant::now();
             let response = handle_http_request(
-                &mut store,
+                &store,
+                &writer,
                 &cfg,
                 Some("127.0.0.1:65000".parse().expect("peer parses")),
                 HttpRequest {
@@ -1891,10 +2684,12 @@ mod tests {
         let path = temp_db_path("http-auth");
         let mut cfg = Config::with_db_path(path.clone());
         cfg.bearer_token = Some("secret".to_string());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -1927,10 +2722,12 @@ mod tests {
         let configured_secret = "configuredsupersecretvalue";
         let presented_secret = "presentedsupersecretvalue";
         cfg.bearer_token = Some(configured_secret.to_string());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -1970,10 +2767,12 @@ mod tests {
         let path = temp_db_path("http-auth-ok");
         let mut cfg = Config::with_db_path(path.clone());
         cfg.bearer_token = Some("secret".to_string());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2006,10 +2805,12 @@ mod tests {
     fn http_capture_rejects_invalid_json_without_writes() {
         let path = temp_db_path("http-invalid-json");
         let cfg = Config::with_db_path(path.clone());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2033,10 +2834,12 @@ mod tests {
     fn http_capture_rejects_missing_payload_without_writes() {
         let path = temp_db_path("http-missing-payload");
         let cfg = Config::with_db_path(path.clone());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2063,10 +2866,90 @@ mod tests {
     }
 
     #[test]
+    fn http_chunked_transfer_encoding_returns_501() {
+        let path = temp_db_path("http-chunked");
+        let cfg = Config::with_db_path(path.clone());
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
+
+        let response = handle_http_request(
+            &store,
+            &writer,
+            &cfg,
+            Some("127.0.0.1:65000".parse().expect("peer parses")),
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/v1/capture".to_string(),
+                headers: vec![
+                    ("content-type".to_string(), "application/json".to_string()),
+                    ("transfer-encoding".to_string(), "Chunked".to_string()),
+                ],
+                body: Vec::new(),
+            },
+        );
+
+        assert_eq!(response.status, 501);
+        assert_eq!(response.body["error"]["code"], "not_implemented");
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn http_capture_rejects_string_ts_ms() {
+        let path = temp_db_path("http-string-ts");
+        let cfg = Config::with_db_path(path.clone());
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
+
+        let response = handle_http_request(
+            &store,
+            &writer,
+            &cfg,
+            Some("127.0.0.1:65000".parse().expect("peer parses")),
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/v1/capture".to_string(),
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: br#"{
+                    "session_id":"session-1",
+                    "agent":"claude",
+                    "source":"tool_result",
+                    "kind":"observation",
+                    "payload":{"text":"x"},
+                    "ts_ms":"1234"
+                }"#
+                .to_vec(),
+            },
+        );
+
+        assert_eq!(response.status, 422);
+        assert_eq!(
+            response.body["error"]["message"],
+            "ts_ms must be integer milliseconds"
+        );
+        let stats = store.table_stats().expect("table stats");
+        assert_eq!(table_rows(&stats, "raw_events"), 0);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn dream_cli_rejects_max_seconds_over_one_day() {
+        let result = Cli::parse(["memoryd", "dream", "--max-seconds", "86401"].map(OsString::from));
+        assert!(matches!(
+            result,
+            Err(CliError::Config(
+                memoryd_core::config::ConfigError::CapDurationTooLarge { .. }
+            ))
+        ));
+    }
+
+    #[test]
     fn http_recall_returns_lexical_matches_without_provider_usage() {
         let path = temp_db_path("http-recall");
         let cfg = Config::with_db_path(path.clone());
         let mut store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
         store
             .capture_event(NewRawEvent {
                 session_id: "session-1".to_string(),
@@ -2080,7 +2963,8 @@ mod tests {
             .expect("capture succeeds");
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2105,7 +2989,8 @@ mod tests {
     fn http_capture_redacts_secret_payload_before_recall_returns_it() {
         let path = temp_db_path("http-redacts-before-recall");
         let cfg = Config::with_db_path(path.clone());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
         let bearer = "leakycredentialvalue";
         let api_key = "structuredapikeyvalue";
         let email = "ops@example.test";
@@ -2123,7 +3008,8 @@ mod tests {
         );
 
         let capture_response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2136,7 +3022,8 @@ mod tests {
         assert_eq!(capture_response.status, 202);
 
         let recall_response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2160,7 +3047,8 @@ mod tests {
         assert!(!content.contains(email));
 
         let secret_response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2186,10 +3074,12 @@ mod tests {
     fn http_recall_rejects_empty_query() {
         let path = temp_db_path("http-recall-empty");
         let cfg = Config::with_db_path(path.clone());
-        let mut store = Store::open(&path).expect("store opens");
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
 
         let response = handle_http_request(
-            &mut store,
+            &store,
+            &writer,
             &cfg,
             Some("127.0.0.1:65000".parse().expect("peer parses")),
             HttpRequest {
@@ -2227,6 +3117,394 @@ mod tests {
             .expect("system clock after unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("memoryd-{name}-{}-{nanos}.db", std::process::id()))
+    }
+
+    fn test_ip(last: u8) -> IpAddr {
+        IpAddr::from([10, 0, 0, last])
+    }
+
+    /// Writer actor for handler tests. The join handle is dropped; the actor
+    /// thread exits when the returned handle goes out of scope.
+    fn test_writer(path: &Path) -> WriterHandle {
+        let (writer, _thread) =
+            memoryd_core::writer::Writer::spawn(path).expect("writer spawns for test");
+        writer
+    }
+
+    #[test]
+    fn auth_throttle_allows_under_limit() {
+        let throttle = AuthThrottle::new();
+        let ip = test_ip(1);
+        for _ in 0..(AUTH_FAIL_LIMIT - 1) {
+            throttle.record_failure(ip, 0);
+        }
+        assert!(!throttle.is_throttled(ip, 1_000));
+    }
+
+    #[test]
+    fn auth_throttle_blocks_after_limit_failures_in_window() {
+        let throttle = AuthThrottle::new();
+        let ip = test_ip(2);
+        for _ in 0..AUTH_FAIL_LIMIT {
+            throttle.record_failure(ip, 0);
+        }
+        assert!(throttle.is_throttled(ip, 1_000));
+    }
+
+    #[test]
+    fn auth_throttle_unblocks_after_lockout_expires() {
+        let throttle = AuthThrottle::new();
+        let ip = test_ip(3);
+        for _ in 0..AUTH_FAIL_LIMIT {
+            throttle.record_failure(ip, 0);
+        }
+        let after_lockout = AUTH_LOCKOUT_MS + 1_000;
+        assert!(!throttle.is_throttled(ip, after_lockout));
+        // The failure count was reset at lockout; one new failure must not re-lock.
+        throttle.record_failure(ip, after_lockout);
+        assert!(!throttle.is_throttled(ip, after_lockout + 1));
+    }
+
+    #[test]
+    fn auth_throttle_success_clears_failures() {
+        let throttle = AuthThrottle::new();
+        let ip = test_ip(4);
+        for _ in 0..(AUTH_FAIL_LIMIT - 1) {
+            throttle.record_failure(ip, 0);
+        }
+        throttle.record_success(ip);
+        for _ in 0..(AUTH_FAIL_LIMIT - 1) {
+            throttle.record_failure(ip, 1);
+        }
+        assert!(!throttle.is_throttled(ip, 2));
+    }
+
+    #[test]
+    fn auth_throttle_evicts_oldest_when_full() {
+        let throttle = AuthThrottle::new();
+        // Lock out every entry so eviction cannot reclaim them as expired.
+        for index in 0..AUTH_THROTTLE_MAX_ENTRIES {
+            let ip = IpAddr::from([
+                10,
+                1,
+                u8::try_from(index / 256).expect("index fits"),
+                u8::try_from(index % 256).expect("index fits"),
+            ]);
+            for _ in 0..AUTH_FAIL_LIMIT {
+                throttle.record_failure(ip, index as i64);
+            }
+        }
+        let newcomer = IpAddr::from([10, 2, 0, 1]);
+        throttle.record_failure(newcomer, 10);
+        let map = throttle.inner.lock().expect("throttle lock");
+        assert!(map.len() <= AUTH_THROTTLE_MAX_ENTRIES);
+        assert!(map.contains_key(&newcomer), "newcomer was admitted");
+        assert!(
+            !map.contains_key(&IpAddr::from([10, 1, 0, 0])),
+            "oldest entry was evicted"
+        );
+    }
+
+    /// Spawn `serve_loop` on an ephemeral loopback port with short timeouts so
+    /// socket-level behavior (slowloris, throttling, shutdown) is testable end
+    /// to end. Returns the bound address, the loop's join handle, and the
+    /// shutdown flag.
+    fn spawn_test_server(
+        cfg: Config,
+    ) -> (
+        SocketAddr,
+        std::thread::JoinHandle<Result<(), CliError>>,
+        Arc<AtomicBool>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener binds");
+        let addr = listener.local_addr().expect("listener has local addr");
+        let cfg = Arc::new(cfg);
+        let throttle = Arc::new(AuthThrottle::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let loop_shutdown = Arc::clone(&shutdown);
+        let (writer, _writer_thread) =
+            memoryd_core::writer::Writer::spawn(&cfg.db_path).expect("writer spawns for test");
+        let handle = std::thread::spawn(move || {
+            serve_loop(
+                listener,
+                cfg,
+                throttle,
+                writer,
+                loop_shutdown,
+                Duration::from_millis(200),
+                Duration::from_secs(5),
+            )
+        });
+        (addr, handle, shutdown)
+    }
+
+    fn send_raw_request(addr: SocketAddr, raw: &str) -> String {
+        let mut stream = TcpStream::connect(addr).expect("test client connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        stream
+            .write_all(raw.as_bytes())
+            .expect("test client writes");
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        response
+    }
+
+    fn capture_request_raw(token: &str) -> String {
+        let body = r#"{"session_id":"s1","agent":"a","source":"hook","kind":"observation","payload":{"text":"tcp test"}}"#;
+        format!(
+            "POST /v1/capture HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn tcp_idle_connection_receives_408_timeout() {
+        let path = temp_db_path("tcp-idle-408");
+        let (addr, _handle, _shutdown) = spawn_test_server(Config::with_db_path(path.clone()));
+
+        let mut stream = TcpStream::connect(addr).expect("test client connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        // Send nothing: the server's read deadline must produce a 408.
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        assert!(
+            response.starts_with("HTTP/1.1 408"),
+            "idle connection should time out with 408, got: {response}"
+        );
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn tcp_slow_client_does_not_block_concurrent_request() {
+        let path = temp_db_path("tcp-slowloris");
+        let (addr, _handle, _shutdown) = spawn_test_server(Config::with_db_path(path.clone()));
+
+        // Hold an idle connection open, then issue a real request on a second
+        // connection; it must complete promptly despite the stalled peer.
+        let _idle = TcpStream::connect(addr).expect("idle connection connects");
+        let started = Instant::now();
+        let response = send_raw_request(addr, &capture_request_raw("unused"));
+        assert!(
+            response.starts_with("HTTP/1.1 202"),
+            "concurrent capture should succeed, got: {response}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "concurrent request must not wait behind the idle connection"
+        );
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn tcp_repeated_auth_failures_return_429() {
+        let path = temp_db_path("tcp-auth-throttle");
+        let mut cfg = Config::with_db_path(path.clone());
+        cfg.bearer_token = Some("correct-horse-battery-staple".to_string());
+        let (addr, _handle, _shutdown) = spawn_test_server(cfg);
+
+        for attempt in 0..AUTH_FAIL_LIMIT {
+            let response = send_raw_request(addr, &capture_request_raw("wrong-token"));
+            assert!(
+                response.starts_with("HTTP/1.1 401"),
+                "attempt {attempt} should be 401, got: {response}"
+            );
+        }
+        let response = send_raw_request(addr, &capture_request_raw("wrong-token"));
+        assert!(
+            response.starts_with("HTTP/1.1 429"),
+            "post-limit attempt should be throttled, got: {response}"
+        );
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn tcp_concurrent_captures_through_writer_all_persist() {
+        let path = temp_db_path("tcp-writer-concurrent");
+        let (addr, _handle, _shutdown) = spawn_test_server(Config::with_db_path(path.clone()));
+
+        let threads: Vec<_> = (0..8)
+            .map(|index| {
+                std::thread::spawn(move || {
+                    let body = format!(
+                        r#"{{"session_id":"s{index}","agent":"a","source":"hook","kind":"observation","payload":{{"text":"concurrent {index}"}}}}"#
+                    );
+                    let raw = format!(
+                        "POST /v1/capture HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    send_raw_request(addr, &raw)
+                })
+            })
+            .collect();
+        for thread in threads {
+            let response = thread.join().expect("capture thread joins");
+            assert!(
+                response.starts_with("HTTP/1.1 202"),
+                "every concurrent capture is accepted, got: {response}"
+            );
+        }
+
+        let store = Store::open(&path).expect("store opens");
+        let stats = store.table_stats().expect("table stats");
+        assert_eq!(
+            table_rows(&stats, "raw_events"),
+            8,
+            "all writes serialized through the writer actor persisted"
+        );
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn serve_loop_exits_when_shutdown_flag_set() {
+        let path = temp_db_path("serve-shutdown");
+        let (_addr, handle, shutdown) = spawn_test_server(Config::with_db_path(path.clone()));
+
+        shutdown.store(true, Ordering::Release);
+        let started = Instant::now();
+        let result = handle.join().expect("serve loop thread joins");
+        assert!(result.is_ok(), "serve loop exits cleanly on shutdown");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown must be observed promptly"
+        );
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn serve_loop_finishes_inflight_request_during_shutdown() {
+        let path = temp_db_path("serve-shutdown-inflight");
+        let (addr, handle, shutdown) = spawn_test_server(Config::with_db_path(path.clone()));
+
+        // Open the connection first, signal shutdown, then send the request:
+        // the already-accepted (or about-to-be-accepted) work must still get a
+        // response while the loop drains.
+        let mut stream = TcpStream::connect(addr).expect("test client connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        let raw = capture_request_raw("unused");
+        stream
+            .write_all(raw.as_bytes())
+            .expect("test client writes");
+        std::thread::sleep(Duration::from_millis(100));
+        shutdown.store(true, Ordering::Release);
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        assert!(
+            response.starts_with("HTTP/1.1 202"),
+            "in-flight request still answered, got: {response}"
+        );
+        assert!(handle.join().expect("loop joins").is_ok());
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn http_health_get_on_loopback_bypasses_bearer_auth() {
+        let path = temp_db_path("http-health-loopback");
+        let mut cfg = Config::with_db_path(path.clone());
+        cfg.bearer_token = Some("configured-token-0123456789".to_string());
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
+
+        let response = handle_http_request(
+            &store,
+            &writer,
+            &cfg,
+            Some("127.0.0.1:65000".parse().expect("peer parses")),
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/v1/health".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        );
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["status"], "ok");
+        assert!(
+            response.body["schema_version"].is_i64(),
+            "schema_version is an integer: {}",
+            response.body
+        );
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn http_health_requires_bearer_for_non_loopback() {
+        let path = temp_db_path("http-health-remote");
+        let mut cfg = Config::with_db_path(path.clone());
+        cfg.bind = "0.0.0.0:7077".parse().expect("bind parses");
+        cfg.bearer_token = Some("configured-token-0123456789".to_string());
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
+
+        let response = handle_http_request(
+            &store,
+            &writer,
+            &cfg,
+            Some("203.0.113.9:50000".parse().expect("peer parses")),
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/v1/health".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        );
+        assert_eq!(response.status, 401);
+
+        let authorized = handle_http_request(
+            &store,
+            &writer,
+            &cfg,
+            Some("203.0.113.9:50000".parse().expect("peer parses")),
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/v1/health".to_string(),
+                headers: vec![(
+                    "authorization".to_string(),
+                    "Bearer configured-token-0123456789".to_string(),
+                )],
+                body: Vec::new(),
+            },
+        );
+        assert_eq!(authorized.status, 200);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn http_health_rejects_post() {
+        let path = temp_db_path("http-health-post");
+        let cfg = Config::with_db_path(path.clone());
+        let store = Store::open(&path).expect("store opens");
+        let writer = test_writer(&path);
+
+        let response = handle_http_request(
+            &store,
+            &writer,
+            &cfg,
+            Some("127.0.0.1:65000".parse().expect("peer parses")),
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/v1/health".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        );
+        assert_eq!(response.status, 405);
+
+        cleanup_db_files(&path);
     }
 
     fn cleanup_db_files(path: &Path) {
@@ -2311,9 +3589,13 @@ mod tests {
             hops: 1,
             index_kind: None,
         };
-        let RecallOutput::Memory(result) =
-            recall_with_mode(&store, &args, "brute-force", "null").expect("recall")
-        else {
+        let RecallOutput::Memory(result) = recall_with_mode(
+            &store,
+            &args,
+            "brute-force",
+            &memoryd_core::adapters::AdapterKind::from_default_adapter("null"),
+        )
+        .expect("recall") else {
             panic!("memory corpus exists, so recall should return memories");
         };
         assert_eq!(result.mode, "memory+graph");
@@ -2339,9 +3621,13 @@ mod tests {
             hops: 0,
             index_kind: None,
         };
-        let RecallOutput::Memory(direct) =
-            recall_with_mode(&store, &args0, "brute-force", "null").expect("recall")
-        else {
+        let RecallOutput::Memory(direct) = recall_with_mode(
+            &store,
+            &args0,
+            "brute-force",
+            &memoryd_core::adapters::AdapterKind::from_default_adapter("null"),
+        )
+        .expect("recall") else {
             panic!("expected memories");
         };
         assert!(

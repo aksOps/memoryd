@@ -1,8 +1,9 @@
 use crate::adapters::{AdapterError, ProviderAdapter, prompt_token_estimate};
 use crate::dream::{
     ARCHIVE_GRACE_MS, ASSOCIATE_FANOUT_CAP, CO_OCCUR_BASE, CO_OCCUR_GROUP_CAP, CO_OCCUR_REINFORCE,
-    SEM_LINK_THRESHOLD, WEAK_LINK_FLOOR, centrality_for, decay_score, half_life_ms, lifecycle_for,
-    memory_kind_for, next_decay_at, normalize, score_base, trust_for_source,
+    DISTILL_LINK_WEIGHT, SEM_LINK_THRESHOLD, WEAK_LINK_FLOOR, centrality_for, decay_score,
+    half_life_ms, lifecycle_for, memory_kind_for, next_decay_at, normalize, score_base,
+    trust_for_source,
 };
 use crate::import::{ImportError, ImportSummary, ImportUnit, content_hash, parse_jsonl};
 use crate::vectorindex::{Candidate, VectorIndex};
@@ -35,6 +36,10 @@ const REDACTED: &str = "[REDACTED]";
 const AUDIT_ACTOR: &str = "memoryd";
 const HIGH_ENTROPY_MIN_LEN: usize = 20;
 const HIGH_ENTROPY_MIN_BITS_PER_CHAR: f64 = 4.0;
+/// All-digit runs at least this long are treated as secrets (PANs, numeric
+/// tokens). 16 catches full card numbers while leaving unix-millisecond
+/// timestamps (13 digits) alone.
+const DIGIT_SECRET_MIN_LEN: usize = 16;
 
 pub struct Store {
     conn: Connection,
@@ -585,44 +590,60 @@ impl Store {
             entry.ids.push(id);
         }
 
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut memories_created = 0usize;
+        // Compute phase — D1: all provider inference happens BEFORE the write
+        // transaction opens, so other writers (capture via the actor) are never
+        // blocked behind a network call. Usage rows are written afterwards with
+        // the same amounts.
+        let price = adapter.usd_per_1k_prompt_tokens();
+        let mut prepared: Vec<(String, Option<(i64, f64)>)> = Vec::with_capacity(order.len());
         let mut tokens = 0i64;
         let mut budget_hit = false;
         for key in &order {
             let cluster = &clusters[key];
-            let price = adapter.usd_per_1k_prompt_tokens();
             let tokens_est = prompt_token_estimate(&cluster.text);
-            let content = if price > 0.0 {
+            let (content, usage) = if price > 0.0 {
                 let est_cost = tokens_est as f64 / 1000.0 * price;
                 if *window_spend + est_cost <= budget_usd {
                     match adapter.summarize(std::slice::from_ref(&cluster.text))? {
                         Some(summary) => {
-                            tx.execute(
-                                "INSERT INTO provider_usage
-                                    (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
-                                 VALUES (?1, ?2, ?3, 'complete', ?4, 0, ?5, NULL)",
-                                params![now_ms, adapter.id(), adapter.model_id(), tokens_est, est_cost],
-                            )?;
                             *window_spend += est_cost;
                             tokens += tokens_est;
-                            summary
+                            (summary, Some((tokens_est, est_cost)))
                         }
-                        None => cluster.text.clone(),
+                        None => (cluster.text.clone(), None),
                     }
                 } else {
                     // Spend cap would be exceeded: degrade this and subsequent clusters.
                     budget_hit = true;
-                    cluster.text.clone()
+                    (cluster.text.clone(), None)
                 }
             } else {
                 // Free / null adapter: try summarize (None for null), no spend impact.
-                adapter
-                    .summarize(std::slice::from_ref(&cluster.text))?
-                    .unwrap_or_else(|| cluster.text.clone())
+                (
+                    adapter
+                        .summarize(std::slice::from_ref(&cluster.text))?
+                        .unwrap_or_else(|| cluster.text.clone()),
+                    None,
+                )
             };
+            prepared.push((content, usage));
+        }
+
+        // Write phase: one short IMMEDIATE transaction, no inference inside.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut memories_created = 0usize;
+        for (key, (content, usage)) in order.iter().zip(prepared) {
+            let cluster = &clusters[key];
+            if let Some((tokens_est, est_cost)) = usage {
+                tx.execute(
+                    "INSERT INTO provider_usage
+                        (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
+                     VALUES (?1, ?2, ?3, 'complete', ?4, 0, ?5, NULL)",
+                    params![now_ms, adapter.id(), adapter.model_id(), tokens_est, est_cost],
+                )?;
+            }
 
             let mem_kind = memory_kind_for(&cluster.kind);
             let trust = trust_for_source(&cluster.source, &cluster.kind);
@@ -697,6 +718,311 @@ impl Store {
             tokens,
             budget_hit,
         })
+    }
+
+    /// Distill idle, fully-consolidated sessions into one `session_summary`
+    /// memory each (the secondary-brain raw material: what was done, decided,
+    /// and why). Bounded per pass; LLM-only — without a chat adapter, rich
+    /// sessions stay `open` so a later configured provider can distill them.
+    /// Idle sessions below `min_memories` are swept to `closed` so the
+    /// sessions table reflects reality even with no LLM configured.
+    pub(crate) fn distill_sessions<A: ProviderAdapter>(
+        &mut self,
+        adapter: &A,
+        budget_usd: f64,
+        window_spend: &mut f64,
+        run_id: &str,
+        policy: &DistillPolicy,
+        now_ms: i64,
+    ) -> Result<DistillBatch, StoreError> {
+        let mut batch = DistillBatch::default();
+        let idle_cutoff = now_ms.saturating_sub(policy.idle_ms);
+
+        // Read phase (no transaction): select candidates and their members.
+        let limit_i = i64::try_from(policy.sessions_per_pass).unwrap_or(i64::MAX);
+        let candidates: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT s.id FROM sessions s
+                 WHERE s.status = 'open'
+                   AND (SELECT MAX(r.ts) FROM raw_events r WHERE r.session_id = s.id) <= ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM raw_events r2
+                       WHERE r2.session_id = s.id AND r2.consolidated_at IS NULL)
+                   AND (SELECT COUNT(*) FROM memories m
+                        WHERE m.source_session = s.id
+                          AND m.kind <> 'session_summary') >= ?2
+                 ORDER BY s.started_at ASC, s.id ASC LIMIT ?3",
+            )?;
+            let mapped = stmt
+                .query_map(params![idle_cutoff, policy.min_memories, limit_i], |row| {
+                    row.get::<_, String>(0)
+                })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        let member_cap_i = i64::try_from(policy.member_cap).unwrap_or(i64::MAX);
+        let mut sessions: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        for session_id in candidates {
+            let members: Vec<(String, String)> = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, content FROM memories
+                     WHERE source_session = ?1 AND kind <> 'session_summary'
+                       AND lifecycle_state IN ('active', 'associated', 'decaying', 'dormant')
+                     ORDER BY created_at DESC, id DESC LIMIT ?2",
+                )?;
+                let mapped = stmt.query_map(params![session_id, member_cap_i], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                mapped.collect::<Result<Vec<_>, _>>()?
+            };
+            if !members.is_empty() {
+                sessions.push((session_id, members));
+            }
+        }
+
+        // Compute phase — D1: provider inference outside any transaction.
+        let price = adapter.usd_per_1k_prompt_tokens();
+        type PreparedSession = (String, Vec<(String, String)>, String, Option<(i64, f64)>);
+        let mut prepared: Vec<PreparedSession> = Vec::new();
+        for (session_id, members) in sessions {
+            let texts: Vec<String> = members.iter().map(|(_, content)| content.clone()).collect();
+            let tokens_est: i64 = texts.iter().map(|text| prompt_token_estimate(text)).sum();
+            let mut usage = None;
+            if price > 0.0 {
+                let est_cost = tokens_est as f64 / 1000.0 * price;
+                if *window_spend + est_cost > budget_usd {
+                    // Spend cap binds: leave this and later sessions open for
+                    // the next pass instead of degrading to junk summaries.
+                    batch.budget_hit = true;
+                    break;
+                }
+                usage = Some((tokens_est, est_cost));
+            }
+            let Some(summary) = adapter.distill(&texts)? else {
+                // No chat capability: nothing in this phase can progress.
+                break;
+            };
+            if let Some((tokens_est, est_cost)) = usage {
+                *window_spend += est_cost;
+                batch.tokens += tokens_est;
+            }
+            // Defense in depth: provider output must not introduce a secret.
+            let summary = redact_inline_string_with_count(&summary).value;
+            prepared.push((session_id, members, summary, usage));
+        }
+
+        // Write phase: one short IMMEDIATE transaction, no inference inside.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Close-sweep: idle, fully consolidated, but too small to distill.
+        // Deterministic and adapter-independent (covers roadmap item D3).
+        batch.sessions_closed = tx.execute(
+            "UPDATE sessions SET status = 'closed', ended_at = ?1
+             WHERE id IN (
+                SELECT s.id FROM sessions s
+                WHERE s.status = 'open'
+                  AND (SELECT MAX(r.ts) FROM raw_events r WHERE r.session_id = s.id) <= ?2
+                  AND NOT EXISTS (
+                      SELECT 1 FROM raw_events r2
+                      WHERE r2.session_id = s.id AND r2.consolidated_at IS NULL)
+                  AND (SELECT COUNT(*) FROM memories m
+                       WHERE m.source_session = s.id
+                         AND m.kind <> 'session_summary') < ?3
+                LIMIT 64)",
+            params![now_ms, idle_cutoff, policy.min_memories],
+        )?;
+
+        for (session_id, members, summary, usage) in prepared {
+            if let Some((tokens_est, est_cost)) = usage {
+                tx.execute(
+                    "INSERT INTO provider_usage
+                        (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
+                     VALUES (?1, ?2, ?3, 'complete', ?4, 0, ?5, NULL)",
+                    params![now_ms, adapter.id(), adapter.model_id(), tokens_est, est_cost],
+                )?;
+            }
+
+            let trust = 0.70;
+            let decay_at = half_life_ms("session_summary").map(|hl| now_ms + hl);
+            let base = score_base(1.0, 0, trust, "active", 0.0);
+            let mem_id: String =
+                tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+            let ver_id: String =
+                tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+            tx.execute(
+                "INSERT INTO memories
+                    (id, current_version_id, kind, content, lifecycle_state, relevance_score,
+                     last_accessed_at, access_count, decay_at, created_at,
+                     source_trust, decay_score, decay_recomputed_at, source_session)
+                 VALUES (?1, ?2, 'session_summary', ?3, 'active', ?4, ?5, 0, ?6, ?5, ?7, 1.0, ?5, ?8)",
+                params![mem_id, ver_id, summary, base, now_ms, decay_at, trust, session_id],
+            )?;
+            tx.execute(
+                "INSERT INTO memories_fts (memory_id, content) VALUES (?1, ?2)",
+                params![mem_id, summary],
+            )?;
+            let reason = format!("distill:session={session_id} members={}", members.len());
+            tx.execute(
+                "INSERT INTO memory_versions
+                    (id, memory_id, version_no, content, reason, created_by_job, created_at)
+                 VALUES (?1, ?2, 1, ?3, ?4, NULL, ?5)",
+                params![ver_id, mem_id, summary, reason, now_ms],
+            )?;
+            for (member_id, _) in &members {
+                for (src, dst) in [(&mem_id, member_id), (member_id, &mem_id)] {
+                    let link_id: String =
+                        tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+                    tx.execute(
+                        "INSERT INTO memory_links
+                            (id, src_memory_id, dst_memory_id, link_type, weight, last_reinforced_at)
+                         VALUES (?1, ?2, ?3, 'temporal', ?4, ?5)
+                         ON CONFLICT(src_memory_id, dst_memory_id, link_type) DO UPDATE SET
+                            weight = MAX(weight, excluded.weight),
+                            last_reinforced_at = excluded.last_reinforced_at",
+                        params![link_id, src, dst, DISTILL_LINK_WEIGHT, now_ms],
+                    )?;
+                }
+            }
+            tx.execute(
+                "UPDATE sessions SET status = 'consolidated', summary = ?1, ended_at = ?2
+                 WHERE id = ?3",
+                params![summary, now_ms, session_id],
+            )?;
+            let detail = serde_json::to_string(&serde_json::json!({
+                "dream_run": run_id,
+                "session_id": session_id,
+                "members": members.len(),
+            }))?;
+            insert_audit_log(
+                &tx,
+                AUDIT_ACTOR,
+                "dream.distill",
+                "memory",
+                Some(mem_id.as_str()),
+                Some(detail.as_str()),
+                now_ms,
+            )?;
+            batch.sessions_distilled += 1;
+        }
+        tx.commit()?;
+        Ok(batch)
+    }
+
+    /// Safe, reversible file hygiene (roadmap B4, initial-design `doctor --fix`):
+    /// checkpoint + truncate the WAL and let SQLite refresh its query-planner
+    /// statistics. No schema or data changes.
+    pub fn optimize(&self) -> Result<(), StoreError> {
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        self.conn.execute_batch("PRAGMA optimize;")?;
+        Ok(())
+    }
+
+    /// Consistent live backup via `VACUUM INTO` (roadmap B4): a compacted,
+    /// transactionally-consistent copy that is safe while the daemon runs.
+    /// Refuses to overwrite an existing file.
+    pub fn backup_to(&self, target: &Path) -> Result<(), StoreError> {
+        if target.exists() {
+            return Err(StoreError::BackupTargetExists(target.display().to_string()));
+        }
+        let target = target.to_str().ok_or_else(|| {
+            StoreError::BackupTargetExists("backup path must be valid UTF-8".to_string())
+        })?;
+        self.conn.execute("VACUUM INTO ?1", params![target])?;
+        Ok(())
+    }
+
+    /// Total estimated provider spend recorded since `since_ms` (rolling-window
+    /// ledger, roadmap C2). Backed by the `provider_usage` table.
+    pub fn provider_spend_since(&self, since_ms: i64) -> Result<f64, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(SUM(est_cost), 0.0) FROM provider_usage WHERE ts > ?1",
+            params![since_ms],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Governed retention sweep (roadmap B1+B2): physically delete up to
+    /// `batch` consolidated raw events older than the raw horizon (their FTS
+    /// rows and embeddings go with them), and raw-event embeddings older than
+    /// the embedding horizon. Memories, the association graph, sessions, and
+    /// the audit log are untouched — the corpus keeps distilled knowledge and
+    /// sheds raw traffic. Both horizons are owner opt-in (0 = keep forever).
+    pub(crate) fn retain_expired(
+        &mut self,
+        policy: &RetainPolicy,
+        now_ms: i64,
+    ) -> Result<RetainBatch, StoreError> {
+        let mut batch = RetainBatch::default();
+        if policy.raw_horizon_ms == 0 && policy.embed_horizon_ms == 0 {
+            return Ok(batch);
+        }
+        let limit = i64::try_from(policy.batch).unwrap_or(i64::MAX);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if policy.raw_horizon_ms > 0 {
+            let cutoff = now_ms.saturating_sub(policy.raw_horizon_ms);
+            let ids: Vec<i64> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM raw_events
+                     WHERE consolidated_at IS NOT NULL AND ts <= ?1
+                     ORDER BY id ASC LIMIT ?2",
+                )?;
+                let mapped = stmt.query_map(params![cutoff, limit], |row| row.get::<_, i64>(0))?;
+                mapped.collect::<Result<Vec<_>, _>>()?
+            };
+            for id in &ids {
+                let id_text = id.to_string();
+                tx.execute(
+                    "DELETE FROM embeddings WHERE owner_type = 'raw_event' AND owner_id = ?1",
+                    params![id_text],
+                )?;
+                tx.execute(
+                    "DELETE FROM raw_events_fts WHERE raw_event_id = ?1",
+                    params![id],
+                )?;
+                tx.execute("DELETE FROM raw_events WHERE id = ?1", params![id])?;
+            }
+            batch.raw_events_deleted = ids.len();
+        }
+
+        if policy.embed_horizon_ms > 0 {
+            let cutoff = now_ms.saturating_sub(policy.embed_horizon_ms);
+            batch.embeddings_deleted = tx.execute(
+                "DELETE FROM embeddings
+                 WHERE owner_type = 'raw_event'
+                   AND id IN (
+                       SELECT e.id FROM embeddings e
+                       JOIN raw_events r ON r.id = CAST(e.owner_id AS INTEGER)
+                       WHERE e.owner_type = 'raw_event'
+                         AND r.consolidated_at IS NOT NULL AND r.ts <= ?1
+                       LIMIT ?2)",
+                params![cutoff, limit],
+            )?;
+        }
+
+        if batch.raw_events_deleted + batch.embeddings_deleted > 0 {
+            let detail = serde_json::to_string(&serde_json::json!({
+                "raw_events_deleted": batch.raw_events_deleted,
+                "embeddings_deleted": batch.embeddings_deleted,
+                "raw_horizon_ms": policy.raw_horizon_ms,
+                "embed_horizon_ms": policy.embed_horizon_ms,
+            }))?;
+            insert_audit_log(
+                &tx,
+                AUDIT_ACTOR,
+                "retention.sweep",
+                "raw_event",
+                None,
+                Some(detail.as_str()),
+                now_ms,
+            )?;
+        }
+        tx.commit()?;
+        Ok(batch)
     }
 
     /// Recompute decay + lifecycle for up to `limit` *due* memories (those whose
@@ -1038,12 +1364,15 @@ impl Store {
         }
 
         let mut batch = ExtractBatch::default();
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Compute phase — D1: dedup probes and the gated LLM refinement run
+        // before the write transaction, so no provider latency is held inside it.
+        type PreparedFact = (String, String, String, f64, Option<(i64, f64)>);
+        let mut prepared_facts: Vec<PreparedFact> = Vec::new();
         for (mem_id, kind, content, trust) in &cands {
             let fact_key = profile_fact_key(kind, content);
-            let already_proposed: bool = tx
+            let already_proposed: bool = self
+                .conn
                 .query_row(
                     "SELECT 1 FROM approvals
                      WHERE target_type = 'profile_fact' AND target_ref = ?1 LIMIT 1",
@@ -1052,7 +1381,8 @@ impl Store {
                 )
                 .optional()?
                 .is_some();
-            let already_active: bool = tx
+            let already_active: bool = self
+                .conn
                 .query_row(
                     "SELECT 1 FROM profile_facts WHERE fact_key = ?1 AND state = 'active' LIMIT 1",
                     params![fact_key],
@@ -1068,19 +1398,15 @@ impl Store {
             // Optional gated LLM refinement of the fact value (mirrors consolidation).
             let price = adapter.usd_per_1k_prompt_tokens();
             let tokens_est = prompt_token_estimate(content);
+            let mut usage = None;
             let fact_value = if price > 0.0 {
                 let est_cost = tokens_est as f64 / 1000.0 * price;
                 if *window_spend + est_cost <= budget_usd {
                     match adapter.summarize(std::slice::from_ref(content))? {
                         Some(summary) => {
-                            tx.execute(
-                                "INSERT INTO provider_usage
-                                    (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
-                                 VALUES (?1, ?2, ?3, 'complete', ?4, 0, ?5, NULL)",
-                                params![now_ms, adapter.id(), adapter.model_id(), tokens_est, est_cost],
-                            )?;
                             *window_spend += est_cost;
                             batch.tokens += tokens_est;
+                            usage = Some((tokens_est, est_cost));
                             summary
                         }
                         None => content.clone(),
@@ -1094,7 +1420,26 @@ impl Store {
                     .summarize(std::slice::from_ref(content))?
                     .unwrap_or_else(|| content.clone())
             };
+            // Defense in depth: memory content was redacted at capture, but a
+            // provider summary (or any upstream miss) must not introduce a
+            // secret into approvals/audit rows.
+            let fact_value = redact_inline_string_with_count(&fact_value).value;
+            prepared_facts.push((mem_id.clone(), fact_key, fact_value, *trust, usage));
+        }
 
+        // Write phase: one short IMMEDIATE transaction, no inference inside.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (mem_id, fact_key, fact_value, trust, usage) in prepared_facts {
+            if let Some((tokens_est, est_cost)) = usage {
+                tx.execute(
+                    "INSERT INTO provider_usage
+                        (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
+                     VALUES (?1, ?2, ?3, 'complete', ?4, 0, ?5, NULL)",
+                    params![now_ms, adapter.id(), adapter.model_id(), tokens_est, est_cost],
+                )?;
+            }
             let proposed_change = serde_json::to_string(&serde_json::json!({
                 "fact_key": fact_key,
                 "fact_value": fact_value,
@@ -1113,6 +1458,151 @@ impl Store {
                 &tx,
                 AUDIT_ACTOR,
                 "propose_profile_fact",
+                "approval",
+                Some(approval_id.as_str()),
+                Some(proposed_change.as_str()),
+                now_ms,
+            )?;
+            batch.proposed += 1;
+        }
+        tx.commit()?;
+        Ok(batch)
+    }
+
+    /// Induce recurring decision principles ("how the owner thinks") from a
+    /// bounded window of recent `decision` and `session_summary` memories and
+    /// propose them as `heuristic.*` facts into `approvals(pending)` — never
+    /// writing `profile_facts` directly (H6: the owner's approve/reject IS the
+    /// training signal). Strictly LLM-only; inert under `null`/`local`.
+    /// Incremental: only memories newer than the latest prior `heuristic.*`
+    /// proposal are considered, so the phase never rescans the corpus.
+    pub(crate) fn extract_heuristics_pending<A: ProviderAdapter>(
+        &mut self,
+        adapter: &A,
+        budget_usd: f64,
+        window_spend: &mut f64,
+        policy: &HeuristicPolicy,
+        now_ms: i64,
+    ) -> Result<HeuristicBatch, StoreError> {
+        let mut batch = HeuristicBatch::default();
+
+        // Read phase (no transaction): frontier + evidence window.
+        let since: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(requested_at), 0) FROM approvals
+                 WHERE target_type = 'profile_fact' AND target_ref LIKE 'heuristic.%'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+
+        let input_cap = i64::try_from(policy.input_cap).unwrap_or(i64::MAX);
+        let inputs: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT content FROM memories
+                 WHERE kind IN ('decision', 'session_summary')
+                   AND created_at > ?1
+                   AND lifecycle_state IN ('active', 'associated', 'decaying', 'dormant')
+                 ORDER BY created_at DESC, id DESC LIMIT ?2",
+            )?;
+            let mapped =
+                stmt.query_map(params![since, input_cap], |row| row.get::<_, String>(0))?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        if inputs.len() < policy.min_inputs {
+            // Patterns need evidence; no provider call, no spend.
+            return Ok(batch);
+        }
+
+        // Compute phase — D1: the provider call happens before any transaction.
+        let price = adapter.usd_per_1k_prompt_tokens();
+        let tokens_est: i64 = inputs.iter().map(|text| prompt_token_estimate(text)).sum();
+        if price > 0.0 {
+            let est_cost = tokens_est as f64 / 1000.0 * price;
+            if *window_spend + est_cost > budget_usd {
+                batch.budget_hit = true;
+                return Ok(batch);
+            }
+        }
+        let Some(induced) = adapter.induce_heuristics(&inputs)? else {
+            return Ok(batch);
+        };
+
+        // Write phase: one short IMMEDIATE transaction, no inference inside.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if price > 0.0 {
+            let est_cost = tokens_est as f64 / 1000.0 * price;
+            tx.execute(
+                "INSERT INTO provider_usage
+                    (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
+                 VALUES (?1, ?2, ?3, 'complete', ?4, 0, ?5, NULL)",
+                params![
+                    now_ms,
+                    adapter.id(),
+                    adapter.model_id(),
+                    tokens_est,
+                    est_cost
+                ],
+            )?;
+            *window_spend += est_cost;
+            batch.tokens += tokens_est;
+        }
+
+        // Evidence-scaled confidence: a fuller input window means stronger support.
+        let confidence = (inputs.len() as f64 / policy.input_cap.max(1) as f64).clamp(0.25, 0.90);
+        for line in induced
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .take(policy.max_proposals)
+        {
+            // Defense in depth: provider output must not introduce a secret.
+            let principle = redact_inline_string_with_count(line).value;
+            let fact_key = format!("heuristic.{}", heuristic_slug(&principle));
+            let already_proposed: bool = tx
+                .query_row(
+                    "SELECT 1 FROM approvals
+                     WHERE target_type = 'profile_fact' AND target_ref = ?1 LIMIT 1",
+                    params![fact_key],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            let already_active: bool = tx
+                .query_row(
+                    "SELECT 1 FROM profile_facts WHERE fact_key = ?1 AND state = 'active' LIMIT 1",
+                    params![fact_key],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if already_proposed || already_active {
+                // A rejected heuristic is also signal: its key never re-proposes.
+                batch.skipped += 1;
+                continue;
+            }
+            let proposed_change = serde_json::to_string(&serde_json::json!({
+                "fact_key": fact_key,
+                "fact_value": principle,
+                "confidence": confidence,
+                "evidence_count": inputs.len(),
+            }))?;
+            let approval_id: String =
+                tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+            tx.execute(
+                "INSERT INTO approvals
+                    (id, target_type, target_ref, proposed_change, state, requested_at)
+                 VALUES (?1, 'profile_fact', ?2, ?3, 'pending', ?4)",
+                params![approval_id, fact_key, proposed_change, now_ms],
+            )?;
+            insert_audit_log(
+                &tx,
+                AUDIT_ACTOR,
+                "propose_heuristic",
                 "approval",
                 Some(approval_id.as_str()),
                 Some(proposed_change.as_str()),
@@ -1188,6 +1678,7 @@ impl Store {
                 already_decided: true,
             });
         }
+        let mut fact_value_redactions = 0usize;
         let (new_state, committed_fact) = if accept {
             tx.execute(
                 "UPDATE approvals SET state = 'approved', decided_at = ?1 WHERE id = ?2",
@@ -1199,10 +1690,19 @@ impl Store {
                     .get("fact_key")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let fact_value = change
-                    .get("fact_value")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                // Defense in depth: the fact value derives from memory content
+                // that was redacted at capture, but anything upstream ever
+                // misses must not be re-persisted (and audit-logged) here.
+                let RedactedString {
+                    value: fact_value,
+                    redactions,
+                } = redact_inline_string_with_count(
+                    change
+                        .get("fact_value")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                );
+                fact_value_redactions = redactions;
                 if fact_key.is_empty() {
                     return Err(StoreError::MalformedApproval(format!(
                         "approval {approval_id} has no fact_key"
@@ -1254,13 +1754,21 @@ impl Store {
         } else {
             "approve"
         };
+        let detail = if fact_value_redactions > 0 {
+            Some(serde_json::to_string(&serde_json::json!({
+                "fact_value_redactions": fact_value_redactions,
+                "replacement": REDACTED,
+            }))?)
+        } else {
+            None
+        };
         insert_audit_log(
             &tx,
             AUDIT_ACTOR,
             action,
             "approval",
             Some(approval_id),
-            None,
+            detail.as_deref(),
             now_ms,
         )?;
         tx.commit()?;
@@ -1313,6 +1821,13 @@ impl Store {
     pub fn table_stats(&self) -> Result<Vec<TableStats>, StoreError> {
         let mut stats = Vec::with_capacity(CANONICAL_TABLES.len());
         for table in CANONICAL_TABLES {
+            // This is the single interpolated-SQL site in the store and must
+            // never take dynamic input: identifiers cannot be bound as
+            // parameters, so safety rests on the hardcoded const list.
+            debug_assert!(
+                CANONICAL_TABLES.contains(&table),
+                "table_stats must only interpolate canonical table names"
+            );
             let sql = format!("SELECT COUNT(*) FROM {table}");
             let rows = self.conn.query_row(&sql, [], |row| row.get::<_, i64>(0))?;
             stats.push(TableStats {
@@ -1722,6 +2237,139 @@ impl Store {
         })
     }
 
+    /// One-hop association walk from a single memory (the MCP `memory_graph` tool).
+    /// Links are stored symmetrically, so a single src lookup yields the full
+    /// neighborhood. Returns `None` when the id is unknown or not in a recallable
+    /// lifecycle state; neighbors in non-recallable states are filtered out.
+    pub fn memory_neighbors(
+        &self,
+        memory_id: &str,
+        limit: usize,
+    ) -> Result<Option<MemoryNeighborhood>, StoreError> {
+        let limit = i64::try_from(limit.clamp(1, 50)).unwrap_or(1);
+        let source: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT kind, content FROM memories
+                 WHERE id = ?1
+                   AND lifecycle_state IN ('active', 'associated', 'decaying', 'dormant')",
+                params![memory_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((kind, content)) = source else {
+            return Ok(None);
+        };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT l.dst_memory_id, m.kind, m.content, l.link_type, l.weight,
+                    l.last_reinforced_at, m.lifecycle_state
+             FROM memory_links l JOIN memories m ON m.id = l.dst_memory_id
+             WHERE l.src_memory_id = ?1
+               AND m.lifecycle_state IN ('active', 'associated', 'decaying', 'dormant')
+             ORDER BY l.weight DESC, l.dst_memory_id LIMIT ?2",
+        )?;
+        let neighbors = stmt
+            .query_map(params![memory_id, limit], |row| {
+                Ok(MemoryNeighbor {
+                    memory_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    content: row.get(2)?,
+                    link_type: row.get(3)?,
+                    link_strength: row.get(4)?,
+                    last_reinforced_at: row.get(5)?,
+                    lifecycle_state: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Some(MemoryNeighborhood {
+            memory_id: memory_id.to_string(),
+            kind,
+            content,
+            neighbors,
+        }))
+    }
+
+    /// Active (approved, not superseded/retracted) profile facts, key-ordered —
+    /// the owner-curated persona kernel served by `memory_profile` and
+    /// `memory://profile` (secondary-brain A3). Read-only, index-backed.
+    pub fn active_profile_facts(&self, limit: usize) -> Result<Vec<ProfileFact>, StoreError> {
+        let limit = i64::try_from(limit.clamp(1, 200)).unwrap_or(1);
+        let mut stmt = self.conn.prepare(
+            "SELECT fact_key, fact_value, confidence FROM profile_facts
+             WHERE state = 'active' ORDER BY fact_key ASC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                Ok(ProfileFact {
+                    fact_key: row.get(0)?,
+                    fact_value: row.get(1)?,
+                    confidence: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Recall-eligible memories ranked by graph centrality — the themes the
+    /// owner's sessions return to most (the association graph's "thinking
+    /// fingerprint"). Read-only, bounded.
+    pub fn top_central_memories(&self, limit: usize) -> Result<Vec<CentralMemory>, StoreError> {
+        let limit = i64::try_from(limit.clamp(1, 50)).unwrap_or(1);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, content, centrality FROM memories
+             WHERE lifecycle_state IN ('active', 'associated', 'decaying', 'dormant')
+               AND centrality > 0.0
+             ORDER BY centrality DESC, id ASC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                Ok(CentralMemory {
+                    memory_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    content: row.get(2)?,
+                    centrality: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Distilled sessions (newest first) for the `memory://session/{id}` MCP
+    /// resource listing: id, narrative summary, and when the session ended.
+    pub fn distilled_sessions(&self, limit: usize) -> Result<Vec<DistilledSession>, StoreError> {
+        let limit = i64::try_from(limit.clamp(1, 100)).unwrap_or(1);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, summary, ended_at FROM sessions
+             WHERE status = 'consolidated' AND summary IS NOT NULL
+             ORDER BY ended_at DESC, id ASC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                Ok(DistilledSession {
+                    session_id: row.get(0)?,
+                    summary: row.get(1)?,
+                    ended_at: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// One distilled session's narrative by id (`memory://session/{id}` read).
+    pub fn distilled_session(&self, session_id: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT summary FROM sessions
+                 WHERE id = ?1 AND status = 'consolidated' AND summary IS NOT NULL",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// Fetch or compute+cache the query embedding. `None` => provider returned no
     /// usable vector (caller degrades to lexical). A cache hit makes no provider
     /// call and writes no ledger row.
@@ -2065,6 +2713,53 @@ pub struct MemoryRecallResult {
     pub compared: usize,
 }
 
+/// One linked memory returned by [`Store::memory_neighbors`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryNeighbor {
+    pub memory_id: String,
+    pub kind: String,
+    pub content: String,
+    pub link_type: String,
+    /// The stored link `weight` (symmetric, reinforced over dream runs).
+    pub link_strength: f64,
+    pub last_reinforced_at: i64,
+    pub lifecycle_state: String,
+}
+
+/// One approved profile fact (see [`Store::active_profile_facts`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileFact {
+    pub fact_key: String,
+    pub fact_value: String,
+    pub confidence: f64,
+}
+
+/// One high-centrality memory (see [`Store::top_central_memories`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CentralMemory {
+    pub memory_id: String,
+    pub kind: String,
+    pub content: String,
+    pub centrality: f64,
+}
+
+/// One distilled session (see [`Store::distilled_sessions`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DistilledSession {
+    pub session_id: String,
+    pub summary: String,
+    pub ended_at: Option<i64>,
+}
+
+/// Result of [`Store::memory_neighbors`] — a memory plus its one-hop neighborhood.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryNeighborhood {
+    pub memory_id: String,
+    pub kind: String,
+    pub content: String,
+    pub neighbors: Vec<MemoryNeighbor>,
+}
+
 /// A claimed embed job — the unit a worker processes for one lease.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeasedJob {
@@ -2130,6 +2825,8 @@ pub enum StoreError {
     Adapter(String),
     ApprovalNotFound(String),
     MalformedApproval(String),
+    WriterGone,
+    BackupTargetExists(String),
 }
 
 impl fmt::Display for StoreError {
@@ -2146,6 +2843,10 @@ impl fmt::Display for StoreError {
             Self::Adapter(msg) => write!(f, "provider adapter error: {msg}"),
             Self::ApprovalNotFound(id) => write!(f, "approval not found: {id}"),
             Self::MalformedApproval(msg) => write!(f, "malformed approval: {msg}"),
+            Self::WriterGone => write!(f, "store writer thread is gone"),
+            Self::BackupTargetExists(path) => {
+                write!(f, "backup target already exists: {path}")
+            }
         }
     }
 }
@@ -2307,6 +3008,11 @@ fn is_sensitive_key(key: &str) -> bool {
         || normalized.contains("privatekey")
 }
 
+/// Known limitation (decision recorded): secrets that arrive percent-encoded
+/// are split at `%xx` boundaries by the span collectors and are not reassembled
+/// or decoded before matching; decoding arbitrary text risks false positives
+/// and double-decode bugs for marginal gain on a local-first daemon. See the
+/// README "Security Defaults" known-limitations note.
 fn redact_inline_string_with_count(input: &str) -> RedactedString {
     if input.contains("-----BEGIN") && input.contains("PRIVATE KEY-----") {
         let redactions = usize::from(input != REDACTED);
@@ -2351,7 +3057,9 @@ fn collect_known_secret_prefix_spans(input: &str, spans: &mut Vec<(usize, usize)
         "ASIA",
     ] {
         let mut offset = 0;
-        while let Some(relative) = input[offset..].find(prefix) {
+        // Case-insensitive: providers emit canonical casing, but secrets pasted
+        // through shells/editors can arrive case-mangled and must still match.
+        while let Some(relative) = find_ascii_case_insensitive(&input[offset..], prefix) {
             let start = offset + relative;
             let end = find_secret_end(input, start);
             let min_len = if matches!(prefix, "AKIA" | "ASIA") {
@@ -2405,6 +3113,18 @@ fn push_high_entropy_span(input: &str, start: usize, end: usize, spans: &mut Vec
         && candidate.bytes().any(|byte| byte.is_ascii_alphabetic())
         && candidate.bytes().any(|byte| byte.is_ascii_digit())
         && shannon_entropy(candidate) >= HIGH_ENTROPY_MIN_BITS_PER_CHAR
+    {
+        spans.push((start, end));
+        return;
+    }
+    // All-digit secrets (card numbers, numeric tokens) carry too little
+    // Shannon entropy per character to clear the mixed-content gate above, so
+    // they get a dedicated length-only rule. Dash/space-grouped digit runs are
+    // split by the tokenizer and stay out of scope; ~19-digit nanosecond
+    // timestamps will be redacted, which is the acceptable direction of error
+    // for a redactor.
+    if candidate.len() >= DIGIT_SECRET_MIN_LEN
+        && candidate.bytes().all(|byte| byte.is_ascii_digit())
     {
         spans.push((start, end));
     }
@@ -2989,6 +3709,82 @@ pub struct ConsolidateBatch {
     pub raw_consumed: usize,
     pub tokens: i64,
     pub budget_hit: bool,
+}
+
+/// Selection policy for one session-distillation batch (see the
+/// `DISTILL_*` constants in `dream.rs` for production values).
+#[derive(Debug, Clone, Copy)]
+pub struct DistillPolicy {
+    pub sessions_per_pass: usize,
+    pub idle_ms: i64,
+    pub min_memories: i64,
+    pub member_cap: usize,
+}
+
+/// Counts from one session-distillation batch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DistillBatch {
+    pub sessions_distilled: usize,
+    pub sessions_closed: usize,
+    pub tokens: i64,
+    pub budget_hit: bool,
+}
+
+/// Selection policy for one heuristic-induction batch (production values are
+/// the `HEURISTIC_*` constants in `dream.rs`).
+#[derive(Debug, Clone, Copy)]
+pub struct HeuristicPolicy {
+    /// Newest decision/session_summary memories fed to the induction prompt.
+    pub input_cap: usize,
+    /// Below this much evidence, no provider call is made at all.
+    pub min_inputs: usize,
+    /// Upper bound on proposals accepted from one induction reply.
+    pub max_proposals: usize,
+}
+
+/// Counts from one heuristic-induction batch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HeuristicBatch {
+    pub proposed: usize,
+    pub skipped: usize,
+    pub tokens: i64,
+    pub budget_hit: bool,
+}
+
+/// Retention horizons in ms (0 = disabled) plus the per-call batch bound.
+#[derive(Debug, Clone, Copy)]
+pub struct RetainPolicy {
+    pub raw_horizon_ms: i64,
+    pub embed_horizon_ms: i64,
+    pub batch: usize,
+}
+
+/// Counts from one retention sweep.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetainBatch {
+    pub raw_events_deleted: usize,
+    pub embeddings_deleted: usize,
+}
+
+/// Stable, readable key fragment for a heuristic principle: lowercase
+/// alphanumeric words joined by hyphens, capped to keep keys scannable.
+fn heuristic_slug(principle: &str) -> String {
+    let mut slug = String::new();
+    for word in principle
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .take(6)
+    {
+        if !slug.is_empty() {
+            slug.push('-');
+        }
+        slug.push_str(&word.to_ascii_lowercase());
+    }
+    if slug.is_empty() {
+        slug.push_str("unnamed");
+    }
+    slug.truncate(48);
+    slug
 }
 
 /// Counts from one decay batch.
@@ -4687,15 +5483,69 @@ mod tests {
             touched, 2,
             "two distinct raw_events consolidate into two memories"
         );
-        // jobs_run counts batch operations, not rows: one consolidate batch + one
-        // associate batch (both same-session memories link), no decay batch (fresh
-        // memories are not yet due) -> distinct from memories_touched.
+        // jobs_run counts batch operations, not rows: one consolidate batch, one
+        // distill batch (the idle 2-memory session is below DISTILL_MIN_MEMORIES,
+        // so it is close-swept), one associate batch (same-session memories link),
+        // no decay batch (fresh memories are not yet due).
         assert_eq!(
-            jobs_run, 2,
-            "jobs_run is the batch count (consolidate + associate), not the row count"
+            jobs_run, 3,
+            "jobs_run is the batch count (consolidate + distill sweep + associate)"
         );
         assert_eq!(status, "completed");
         assert!(finished.is_some(), "finished_at is stamped");
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn dream_once_runs_distill_phase_end_to_end() {
+        use crate::config::Caps;
+        use crate::dream::{DreamOptions, dream_once};
+        let path = temp_db_path("dream-distill");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 2_000_000_000_000i64;
+        // Three distinct events in one session, all idle (older than 30 min).
+        for index in 0..3 {
+            store
+                .capture_event(test_event_with_text(
+                    "s-narrative",
+                    now - 3_600_000 + index,
+                    &format!("distinct narrative event {index}"),
+                ))
+                .expect("capture succeeds");
+        }
+        let opts = DreamOptions {
+            trigger: "manual",
+            budget_usd: 100.0,
+            max_seconds: 60,
+        };
+        // Same pass: consolidate creates the member memories, distill (running
+        // after consolidate) summarizes the now-idle session.
+        let outcome = dream_once(
+            &mut store,
+            &SummarizingAdapter,
+            &Caps::small(),
+            &opts,
+            &|| now,
+        )
+        .expect("dream succeeds");
+
+        assert_eq!(outcome.distilled, 1, "idle session distilled in-pass");
+        let status: String = store
+            .conn
+            .query_row(
+                "SELECT status FROM sessions WHERE id = 's-narrative'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("session row");
+        assert_eq!(status, "consolidated");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM memories WHERE kind = 'session_summary'"
+            ),
+            1
+        );
         cleanup_db_files(&path);
     }
 
@@ -5233,6 +6083,797 @@ mod tests {
             provenance: serde_json::json!({}),
             ts_ms,
         }
+    }
+
+    fn test_distill_policy() -> DistillPolicy {
+        DistillPolicy {
+            sessions_per_pass: 3,
+            idle_ms: 30 * 60 * 1000,
+            min_memories: 3,
+            member_cap: 20,
+        }
+    }
+
+    fn test_heuristic_policy() -> HeuristicPolicy {
+        HeuristicPolicy {
+            input_cap: 20,
+            min_inputs: 5,
+            max_proposals: 3,
+        }
+    }
+
+    /// Metered LLM double whose heuristic induction returns fixed principles.
+    struct InducingAdapter;
+    impl crate::adapters::ProviderAdapter for InducingAdapter {
+        fn id(&self) -> &'static str {
+            "openai_compat"
+        }
+        fn model_id(&self) -> &str {
+            "stub-llm"
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, crate::adapters::AdapterError> {
+            Ok(texts.iter().map(|_| vec![0.0f32]).collect())
+        }
+        fn reachable(&self) -> bool {
+            true
+        }
+        fn induce_heuristics(
+            &self,
+            _texts: &[String],
+        ) -> Result<Option<String>, crate::adapters::AdapterError> {
+            Ok(Some(
+                "Prefer reversible choices under uncertainty\nAsk about failure modes first\n"
+                    .to_string(),
+            ))
+        }
+        fn usd_per_1k_prompt_tokens(&self) -> f64 {
+            1.0
+        }
+    }
+
+    fn seed_decision_memories(store: &Store, n: usize, created_at: i64) {
+        for index in 0..n {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO memories
+                        (id, kind, content, lifecycle_state, relevance_score, last_accessed_at,
+                         access_count, decay_at, created_at, source_trust, decay_score,
+                         decay_recomputed_at)
+                     VALUES (?1, 'decision', ?2, 'active', 0.5, ?3, 0, NULL, ?3, 0.7, 1.0, ?3)",
+                    params![
+                        format!("dec-{index}-{created_at}"),
+                        format!("chose option {index} because it is reversible"),
+                        created_at
+                    ],
+                )
+                .expect("seed decision");
+        }
+    }
+
+    #[test]
+    fn heuristics_propose_into_approvals_never_profile_facts() {
+        let path = temp_db_path("heuristics-propose");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_decision_memories(&store, 5, now - 1_000);
+
+        let mut spend = 0.0;
+        let batch = store
+            .extract_heuristics_pending(
+                &InducingAdapter,
+                100.0,
+                &mut spend,
+                &test_heuristic_policy(),
+                now,
+            )
+            .expect("induction succeeds");
+
+        assert_eq!(batch.proposed, 2);
+        assert!(batch.tokens > 0, "provider call metered");
+        let mut stmt = store
+            .conn
+            .prepare("SELECT target_ref FROM approvals WHERE state = 'pending' ORDER BY target_ref")
+            .expect("stmt");
+        let keys: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("keys");
+        drop(stmt);
+        assert_eq!(keys.len(), 2);
+        assert!(
+            keys.iter().all(|key| key.starts_with("heuristic.")),
+            "{keys:?}"
+        );
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM profile_facts"),
+            0,
+            "H6: nothing writes profile_facts without an approval decision"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'propose_heuristic'"
+            ),
+            2
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn heuristics_below_min_inputs_make_no_provider_call() {
+        struct PanickingAdapter;
+        impl crate::adapters::ProviderAdapter for PanickingAdapter {
+            fn id(&self) -> &'static str {
+                "openai_compat"
+            }
+            fn model_id(&self) -> &str {
+                "stub"
+            }
+            fn embed(
+                &self,
+                texts: &[String],
+            ) -> Result<Vec<Vec<f32>>, crate::adapters::AdapterError> {
+                Ok(texts.iter().map(|_| vec![0.0f32]).collect())
+            }
+            fn reachable(&self) -> bool {
+                true
+            }
+            fn induce_heuristics(
+                &self,
+                _texts: &[String],
+            ) -> Result<Option<String>, crate::adapters::AdapterError> {
+                panic!("must not be called below min_inputs");
+            }
+        }
+
+        let path = temp_db_path("heuristics-min");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_decision_memories(&store, 4, now - 1_000);
+
+        let mut spend = 0.0;
+        let batch = store
+            .extract_heuristics_pending(
+                &PanickingAdapter,
+                100.0,
+                &mut spend,
+                &test_heuristic_policy(),
+                now,
+            )
+            .expect("phase skips quietly");
+        assert_eq!(batch.proposed, 0);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM approvals"), 0);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn heuristics_do_not_reprocess_old_evidence_or_duplicate_keys() {
+        let path = temp_db_path("heuristics-dedup");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_decision_memories(&store, 5, now - 1_000);
+
+        let mut spend = 0.0;
+        let first = store
+            .extract_heuristics_pending(
+                &InducingAdapter,
+                100.0,
+                &mut spend,
+                &test_heuristic_policy(),
+                now,
+            )
+            .expect("first run");
+        assert_eq!(first.proposed, 2);
+
+        // Second run, same evidence: everything predates the last proposal, so
+        // no inputs qualify and no provider call is made.
+        let second = store
+            .extract_heuristics_pending(
+                &InducingAdapter,
+                100.0,
+                &mut spend,
+                &test_heuristic_policy(),
+                now + 1,
+            )
+            .expect("second run");
+        assert_eq!(second.proposed, 0);
+        assert_eq!(second.tokens, 0, "no new evidence, no spend");
+
+        // New evidence but identical induced principles: keys dedup as skips.
+        seed_decision_memories(&store, 5, now + 10);
+        let third = store
+            .extract_heuristics_pending(
+                &InducingAdapter,
+                100.0,
+                &mut spend,
+                &test_heuristic_policy(),
+                now + 20,
+            )
+            .expect("third run");
+        assert_eq!(third.proposed, 0);
+        assert_eq!(third.skipped, 2, "existing keys never re-propose");
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM approvals"), 2);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn heuristics_budget_cap_skips_without_spend() {
+        let path = temp_db_path("heuristics-budget");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_decision_memories(&store, 5, now - 1_000);
+
+        let mut spend = 0.0;
+        let batch = store
+            .extract_heuristics_pending(
+                &InducingAdapter,
+                0.0,
+                &mut spend,
+                &test_heuristic_policy(),
+                now,
+            )
+            .expect("phase skips");
+        assert!(batch.budget_hit);
+        assert_eq!(batch.proposed, 0);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM provider_usage"), 0);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn heuristics_inert_without_chat_adapter() {
+        let path = temp_db_path("heuristics-null");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_decision_memories(&store, 5, now - 1_000);
+
+        let mut spend = 0.0;
+        let batch = store
+            .extract_heuristics_pending(
+                &NullAdapter::new(),
+                0.0,
+                &mut spend,
+                &test_heuristic_policy(),
+                now,
+            )
+            .expect("phase inert");
+        assert_eq!(batch.proposed, 0);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM approvals"), 0);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn retention_deletes_only_old_consolidated_raw_events() {
+        let path = temp_db_path("retain-basic");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        let day = 86_400_000i64;
+        // Old + consolidated (eligible), old + unconsolidated (kept),
+        // fresh + consolidated (kept).
+        let old_id = store
+            .capture_event(test_event_with_text(
+                "s",
+                now - 200 * day,
+                "old consolidated",
+            ))
+            .expect("capture")
+            .raw_event_id;
+        let fresh_id = store
+            .capture_event(test_event_with_text("s", now - day, "fresh consolidated"))
+            .expect("capture")
+            .raw_event_id;
+        let mut spend = 0.0;
+        store
+            .consolidate_pending(&NullAdapter::new(), 0.0, &mut spend, "run", 1000, now)
+            .expect("consolidate");
+        let pending_id = store
+            .capture_event(test_event_with_text("s", now - 200 * day, "old pending"))
+            .expect("capture")
+            .raw_event_id;
+
+        let batch = store
+            .retain_expired(
+                &RetainPolicy {
+                    raw_horizon_ms: 180 * day,
+                    embed_horizon_ms: 0,
+                    batch: 500,
+                },
+                now,
+            )
+            .expect("sweep succeeds");
+
+        assert_eq!(batch.raw_events_deleted, 1);
+        let mut stmt = store
+            .conn
+            .prepare("SELECT id FROM raw_events ORDER BY id")
+            .expect("stmt");
+        let remaining: Vec<i64> = stmt
+            .query_map([], |r| r.get(0))
+            .expect("rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("ids");
+        drop(stmt);
+        assert_eq!(remaining, vec![fresh_id, pending_id]);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM raw_events_fts WHERE raw_event_id NOT IN (SELECT id FROM raw_events)"
+            ),
+            0,
+            "no orphaned FTS rows"
+        );
+        assert!(
+            count(&store, "SELECT COUNT(*) FROM memories") >= 2,
+            "memories survive retention"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'retention.sweep'"
+            ),
+            1
+        );
+        // old_id's embedding rows (if any) went with it.
+        let orphaned: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM embeddings WHERE owner_type='raw_event' AND owner_id = ?1",
+                params![old_id.to_string()],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(orphaned, 0);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn provider_spend_ledger_caps_across_passes() {
+        let path = temp_db_path("spend-ledger");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        // Prior pass spent 0.9 of a 1.0 daily budget inside the window; an
+        // older row outside the window must not count.
+        store
+            .conn
+            .execute(
+                "INSERT INTO provider_usage (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
+                 VALUES (?1, 'openai_compat', 'm', 'complete', 100, 0, 0.9, NULL),
+                        (?2, 'openai_compat', 'm', 'complete', 100, 0, 5.0, NULL)",
+                params![now - 1_000, now - 90_000_000],
+            )
+            .expect("usage seeded");
+        assert!(
+            (store.provider_spend_since(now - 86_400_000).expect("sum") - 0.9).abs() < 1e-9,
+            "only in-window spend counts"
+        );
+
+        // A dream pass with budget 1.0 sees 0.9 already spent: the metered
+        // summarize (cost > 0.1) is skipped and the run is budget_capped.
+        store
+            .capture_event(test_event_with_text(
+                "ledger-s",
+                now - 3_600_000,
+                &"long enough body to cost a few hundred tokens ".repeat(20),
+            ))
+            .expect("capture");
+        use crate::config::Caps;
+        use crate::dream::{DreamOptions, dream_once};
+        let opts = DreamOptions {
+            trigger: "manual",
+            budget_usd: 1.0,
+            max_seconds: 60,
+        };
+        let outcome = dream_once(
+            &mut store,
+            &SummarizingAdapter,
+            &Caps::small(),
+            &opts,
+            &|| now,
+        )
+        .expect("dream succeeds");
+        assert_eq!(
+            outcome.status, "budget_capped",
+            "prior-pass spend binds the rolling daily cap"
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn retention_disabled_is_a_no_op() {
+        let path = temp_db_path("retain-disabled");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        store
+            .capture_event(test_event_with_text("s", 1000, "ancient"))
+            .expect("capture");
+        let mut spend = 0.0;
+        store
+            .consolidate_pending(&NullAdapter::new(), 0.0, &mut spend, "run", 1000, now)
+            .expect("consolidate");
+
+        let batch = store
+            .retain_expired(
+                &RetainPolicy {
+                    raw_horizon_ms: 0,
+                    embed_horizon_ms: 0,
+                    batch: 500,
+                },
+                now,
+            )
+            .expect("no-op succeeds");
+        assert_eq!(batch, RetainBatch::default());
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM raw_events"), 1);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn retention_embedding_horizon_drops_vectors_but_keeps_events() {
+        let path = temp_db_path("retain-embed");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        let day = 86_400_000i64;
+        let id = store
+            .capture_event(test_event_with_text("s", now - 60 * day, "embedded event"))
+            .expect("capture")
+            .raw_event_id;
+        let mut spend = 0.0;
+        store
+            .consolidate_pending(&NullAdapter::new(), 0.0, &mut spend, "run", 1000, now)
+            .expect("consolidate");
+        store
+            .conn
+            .execute(
+                "INSERT INTO embeddings (id, owner_type, owner_id, model_id, dim, vector, created_at)
+                 VALUES ('emb-1', 'raw_event', ?1, 'm', 1, x'00000000', ?2)",
+                params![id.to_string(), now - 60 * day],
+            )
+            .expect("seed embedding");
+
+        let batch = store
+            .retain_expired(
+                &RetainPolicy {
+                    raw_horizon_ms: 0,
+                    embed_horizon_ms: 30 * day,
+                    batch: 500,
+                },
+                now,
+            )
+            .expect("sweep succeeds");
+
+        assert_eq!(batch.embeddings_deleted, 1);
+        assert_eq!(batch.raw_events_deleted, 0);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM raw_events"),
+            1,
+            "events stay; only their vectors aged out"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM embeddings WHERE owner_type='raw_event'"
+            ),
+            0
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn heuristic_slug_is_stable_and_bounded() {
+        assert_eq!(
+            heuristic_slug("Prefer reversible choices under uncertainty!"),
+            "prefer-reversible-choices-under-uncertainty"
+        );
+        assert_eq!(heuristic_slug("!!!"), "unnamed");
+        assert!(heuristic_slug(&"word ".repeat(40)).len() <= 48);
+    }
+
+    /// Capture `n` distinct events into `session` ending at `last_ts`, then
+    /// consolidate them so the session is distill-eligible (modulo idleness).
+    fn seed_consolidated_session(store: &mut Store, session: &str, n: usize, last_ts: i64) {
+        for index in 0..n {
+            store
+                .capture_event(test_event_with_text(
+                    session,
+                    last_ts - (n as i64 - 1 - index as i64),
+                    &format!("{session} event {index} unique body"),
+                ))
+                .expect("capture succeeds");
+        }
+        let mut spend = 0.0;
+        store
+            .consolidate_pending(
+                &NullAdapter::new(),
+                0.0,
+                &mut spend,
+                "run-seed",
+                1000,
+                last_ts,
+            )
+            .expect("consolidate succeeds");
+    }
+
+    #[test]
+    fn distill_creates_summary_links_members_and_consolidates_session() {
+        let path = temp_db_path("distill-happy");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_consolidated_session(&mut store, "s-rich", 3, now - 3_600_000);
+
+        let mut spend = 0.0;
+        let batch = store
+            .distill_sessions(
+                &SummarizingAdapter,
+                100.0,
+                &mut spend,
+                "run-1",
+                &test_distill_policy(),
+                now,
+            )
+            .expect("distill succeeds");
+
+        assert_eq!(batch.sessions_distilled, 1);
+        assert!(batch.tokens > 0, "metered adapter recorded tokens");
+        let (summary_id, content): (String, String) = store
+            .conn
+            .query_row(
+                "SELECT id, content FROM memories WHERE kind = 'session_summary'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("summary memory exists");
+        assert!(content.starts_with("summary:"), "LLM output stored");
+        let links: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_links
+                 WHERE link_type = 'temporal' AND (src_memory_id = ?1 OR dst_memory_id = ?1)",
+                params![summary_id],
+                |r| r.get(0),
+            )
+            .expect("links counted");
+        assert_eq!(links, 6, "symmetric temporal links to all 3 members");
+        let (status, session_summary): (String, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT status, summary FROM sessions WHERE id = 's-rich'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("session row");
+        assert_eq!(status, "consolidated");
+        assert!(
+            session_summary
+                .expect("summary set")
+                .starts_with("summary:")
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'dream.distill'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM provider_usage WHERE op = 'complete'"
+            ),
+            1
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn distill_skips_fresh_and_unconsolidated_sessions() {
+        let path = temp_db_path("distill-skips");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        // Fresh session: consolidated but not idle.
+        seed_consolidated_session(&mut store, "s-fresh", 3, now - 1_000);
+        // Idle but with unconsolidated events.
+        for index in 0..3 {
+            store
+                .capture_event(test_event_with_text(
+                    "s-pending",
+                    now - 3_600_000,
+                    &format!("pending {index}"),
+                ))
+                .expect("capture succeeds");
+        }
+
+        let mut spend = 0.0;
+        let batch = store
+            .distill_sessions(
+                &SummarizingAdapter,
+                100.0,
+                &mut spend,
+                "run-1",
+                &test_distill_policy(),
+                now,
+            )
+            .expect("distill succeeds");
+
+        assert_eq!(batch.sessions_distilled, 0);
+        assert_eq!(batch.sessions_closed, 0, "neither session swept");
+        for session in ["s-fresh", "s-pending"] {
+            let status: String = store
+                .conn
+                .query_row(
+                    "SELECT status FROM sessions WHERE id = ?1",
+                    params![session],
+                    |r| r.get(0),
+                )
+                .expect("session row");
+            assert_eq!(status, "open", "{session} stays open");
+        }
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn distill_close_sweeps_trivial_idle_sessions() {
+        let path = temp_db_path("distill-sweep");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_consolidated_session(&mut store, "s-trivial", 1, now - 3_600_000);
+
+        let mut spend = 0.0;
+        let batch = store
+            .distill_sessions(
+                &NullAdapter::new(),
+                0.0,
+                &mut spend,
+                "run-1",
+                &test_distill_policy(),
+                now,
+            )
+            .expect("distill succeeds");
+
+        assert_eq!(batch.sessions_closed, 1);
+        let (status, ended_at): (String, Option<i64>) = store
+            .conn
+            .query_row(
+                "SELECT status, ended_at FROM sessions WHERE id = 's-trivial'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("session row");
+        assert_eq!(status, "closed");
+        assert_eq!(ended_at, Some(now));
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn distill_budget_cap_leaves_session_open() {
+        let path = temp_db_path("distill-budget");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_consolidated_session(&mut store, "s-capped", 3, now - 3_600_000);
+
+        let mut spend = 0.0;
+        let batch = store
+            .distill_sessions(
+                &SummarizingAdapter,
+                0.0,
+                &mut spend,
+                "run-1",
+                &test_distill_policy(),
+                now,
+            )
+            .expect("distill succeeds");
+
+        assert!(batch.budget_hit);
+        assert_eq!(batch.sessions_distilled, 0);
+        let status: String = store
+            .conn
+            .query_row(
+                "SELECT status FROM sessions WHERE id = 's-capped'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("session row");
+        assert_eq!(status, "open", "retried next pass instead of degrading");
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM provider_usage"), 0);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn distill_without_chat_adapter_leaves_rich_sessions_open() {
+        let path = temp_db_path("distill-no-llm");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_consolidated_session(&mut store, "s-rich", 3, now - 3_600_000);
+
+        let mut spend = 0.0;
+        let batch = store
+            .distill_sessions(
+                &NullAdapter::new(),
+                0.0,
+                &mut spend,
+                "run-1",
+                &test_distill_policy(),
+                now,
+            )
+            .expect("distill succeeds");
+
+        assert_eq!(batch.sessions_distilled, 0);
+        let status: String = store
+            .conn
+            .query_row("SELECT status FROM sessions WHERE id = 's-rich'", [], |r| {
+                r.get(0)
+            })
+            .expect("session row");
+        assert_eq!(
+            status, "open",
+            "distillable later when an LLM is configured"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM memories WHERE kind = 'session_summary'"
+            ),
+            0
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn distill_redacts_provider_output() {
+        struct LeakyAdapter;
+        impl crate::adapters::ProviderAdapter for LeakyAdapter {
+            fn id(&self) -> &'static str {
+                "openai_compat"
+            }
+            fn model_id(&self) -> &str {
+                "leaky"
+            }
+            fn embed(
+                &self,
+                texts: &[String],
+            ) -> Result<Vec<Vec<f32>>, crate::adapters::AdapterError> {
+                Ok(texts.iter().map(|_| vec![0.0f32]).collect())
+            }
+            fn reachable(&self) -> bool {
+                true
+            }
+            fn summarize(
+                &self,
+                _texts: &[String],
+            ) -> Result<Option<String>, crate::adapters::AdapterError> {
+                Ok(Some(
+                    "did work with ghp_abcdefghijklmnopqrstuvwxyz123456 token".to_string(),
+                ))
+            }
+        }
+
+        let path = temp_db_path("distill-redact");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_consolidated_session(&mut store, "s-leak", 3, now - 3_600_000);
+
+        let mut spend = 0.0;
+        store
+            .distill_sessions(
+                &LeakyAdapter,
+                0.0,
+                &mut spend,
+                "run-1",
+                &test_distill_policy(),
+                now,
+            )
+            .expect("distill succeeds");
+
+        let content: String = store
+            .conn
+            .query_row(
+                "SELECT content FROM memories WHERE kind = 'session_summary'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("summary exists");
+        assert!(content.contains(REDACTED));
+        assert!(!content.contains("ghp_abcdefghijklmnopqrstuvwxyz123456"));
+        cleanup_db_files(&path);
     }
 
     fn temp_db_path(name: &str) -> PathBuf {
@@ -6030,6 +7671,84 @@ mod tests {
     }
 
     #[test]
+    fn decide_approval_redacts_fact_value_before_persist() {
+        let path = temp_db_path("p1-fact-redact");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+        // Insert the approval directly to simulate an upstream redaction miss.
+        let proposed_change = serde_json::json!({
+            "fact_key": "ci.token",
+            "fact_value": format!("uses {secret} for CI"),
+            "confidence": 0.9,
+        })
+        .to_string();
+        store
+            .conn
+            .execute(
+                "INSERT INTO approvals
+                    (id, target_type, target_ref, proposed_change, state, requested_at)
+                 VALUES ('appr-1', 'profile_fact', 'ci.token', ?1, 'pending', ?2)",
+                params![proposed_change, now],
+            )
+            .expect("approval inserted");
+
+        let decision = store
+            .decide_approval("appr-1", true, now + 1)
+            .expect("approval accepted");
+        assert!(decision.committed_fact);
+
+        let fact_value: String = store
+            .conn
+            .query_row("SELECT fact_value FROM profile_facts", [], |r| r.get(0))
+            .expect("fact persisted");
+        assert!(
+            fact_value.contains(REDACTED),
+            "secret replaced: {fact_value}"
+        );
+        assert!(!fact_value.contains(secret), "secret must not persist");
+        let audit_detail: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT detail FROM audit_log WHERE action = 'approve_profile_fact'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("audit row exists");
+        let detail = audit_detail.expect("redaction detail recorded");
+        assert!(detail.contains("fact_value_redactions"));
+        assert!(!detail.contains(secret));
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn redacts_sixteen_digit_pan() {
+        let result = redact_inline_string_with_count("card 4111111111111111 ok");
+        assert_eq!(result.value, format!("card {REDACTED} ok"));
+        assert_eq!(result.redactions, 1);
+    }
+
+    #[test]
+    fn does_not_redact_thirteen_digit_timestamp() {
+        let result = redact_inline_string_with_count("ts 1717171717171 ok");
+        assert_eq!(result.value, "ts 1717171717171 ok");
+        assert_eq!(result.redactions, 0);
+    }
+
+    #[test]
+    fn redacts_lowercase_akia_key() {
+        let result = redact_inline_string_with_count("key akiaabcdefghij1234567890 set");
+        assert_eq!(result.value, format!("key {REDACTED} set"));
+    }
+
+    #[test]
+    fn redacts_uppercase_github_prefix() {
+        let result =
+            redact_inline_string_with_count("token GHP_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 set");
+        assert_eq!(result.value, format!("token {REDACTED} set"));
+    }
+
+    #[test]
     fn dream_once_runs_extract_profile_phase() {
         use crate::dream::{DreamOptions, dream_once};
         let path = temp_db_path("m8-dream-extract");
@@ -6305,6 +8024,171 @@ mod tests {
             !result.hits.is_empty(),
             "semantic recall returns the dark-theme memory"
         );
+        cleanup_db_files(&path);
+    }
+
+    // ---- MCP: one-hop neighborhood lookup (memory_neighbors) ----
+
+    #[test]
+    fn memory_neighbors_returns_strongest_links_first() {
+        let path = temp_db_path("neighbors-order");
+        let store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_mem(
+            &store,
+            "a",
+            "observation",
+            "wal fix",
+            Some("s1"),
+            "active",
+            now,
+        );
+        seed_mem(
+            &store,
+            "b",
+            "observation",
+            "vacuum schedule",
+            Some("s1"),
+            "active",
+            now,
+        );
+        seed_mem(
+            &store,
+            "c",
+            "rule",
+            "use flyway",
+            Some("s1"),
+            "associated",
+            now,
+        );
+        seed_link(&store, "a", "b", "co_occurrence", 0.30, now);
+        seed_link(&store, "a", "c", "semantic", 0.80, now + 5);
+
+        let hood = store
+            .memory_neighbors("a", 10)
+            .expect("lookup succeeds")
+            .expect("memory exists");
+
+        assert_eq!(hood.memory_id, "a");
+        assert_eq!(hood.kind, "observation");
+        assert_eq!(hood.content, "wal fix");
+        assert_eq!(hood.neighbors.len(), 2);
+        assert_eq!(hood.neighbors[0].memory_id, "c", "strongest link first");
+        assert_eq!(hood.neighbors[0].link_type, "semantic");
+        assert!((hood.neighbors[0].link_strength - 0.80).abs() < 1e-9);
+        assert_eq!(hood.neighbors[0].last_reinforced_at, now + 5);
+        assert_eq!(hood.neighbors[0].lifecycle_state, "associated");
+        assert_eq!(hood.neighbors[1].memory_id, "b");
+        assert_eq!(hood.neighbors[1].link_type, "co_occurrence");
+        assert!((hood.neighbors[1].link_strength - 0.30).abs() < 1e-9);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn memory_neighbors_unknown_id_returns_none() {
+        let path = temp_db_path("neighbors-unknown");
+        let store = Store::open(&path).expect("store opens");
+
+        assert_eq!(store.memory_neighbors("nope", 10).expect("lookup"), None);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn memory_neighbors_filters_non_recallable_lifecycles() {
+        let path = temp_db_path("neighbors-lifecycle");
+        let store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_mem(
+            &store,
+            "a",
+            "observation",
+            "wal fix",
+            Some("s1"),
+            "active",
+            now,
+        );
+        seed_mem(
+            &store,
+            "b",
+            "observation",
+            "old note",
+            Some("s1"),
+            "archived",
+            now,
+        );
+        seed_mem(
+            &store,
+            "c",
+            "observation",
+            "live note",
+            Some("s1"),
+            "decaying",
+            now,
+        );
+        seed_link(&store, "a", "b", "co_occurrence", 0.90, now);
+        seed_link(&store, "a", "c", "co_occurrence", 0.30, now);
+
+        let hood = store
+            .memory_neighbors("a", 10)
+            .expect("lookup succeeds")
+            .expect("memory exists");
+        assert_eq!(hood.neighbors.len(), 1, "archived neighbor is filtered");
+        assert_eq!(hood.neighbors[0].memory_id, "c");
+
+        // A non-recallable source id behaves like an unknown id.
+        assert_eq!(store.memory_neighbors("b", 10).expect("lookup"), None);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn memory_neighbors_clamps_limit() {
+        let path = temp_db_path("neighbors-clamp");
+        let store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_mem(
+            &store,
+            "a",
+            "observation",
+            "wal fix",
+            Some("s1"),
+            "active",
+            now,
+        );
+        seed_mem(
+            &store,
+            "b",
+            "observation",
+            "first",
+            Some("s1"),
+            "active",
+            now,
+        );
+        seed_mem(
+            &store,
+            "c",
+            "observation",
+            "second",
+            Some("s1"),
+            "active",
+            now,
+        );
+        seed_link(&store, "a", "b", "co_occurrence", 0.80, now);
+        seed_link(&store, "a", "c", "co_occurrence", 0.40, now);
+
+        // limit 0 clamps up to 1 (never an empty/invalid LIMIT).
+        let hood = store
+            .memory_neighbors("a", 0)
+            .expect("lookup succeeds")
+            .expect("memory exists");
+        assert_eq!(hood.neighbors.len(), 1);
+        assert_eq!(hood.neighbors[0].memory_id, "b", "strongest survives clamp");
+
+        // An oversized limit clamps down to 50 (no error, all rows still fit).
+        let hood = store
+            .memory_neighbors("a", 5_000)
+            .expect("lookup succeeds")
+            .expect("memory exists");
+        assert_eq!(hood.neighbors.len(), 2);
         cleanup_db_files(&path);
     }
 }

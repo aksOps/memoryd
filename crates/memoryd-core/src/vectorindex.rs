@@ -37,12 +37,9 @@ impl VectorIndex for BruteForce {
             })
             .collect();
         // Descending similarity; ties broken by id DESC for determinism.
-        scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(b.id.cmp(&a.id))
-        });
+        // total_cmp keeps the order total even if a NaN score ever appears
+        // (matching the HNSW implementation's comparator).
+        scored.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| b.id.cmp(&a.id)));
         scored.truncate(k);
         scored
     }
@@ -415,6 +412,53 @@ mod tests {
     #[test]
     fn brute_force_empty_candidates_is_empty() {
         assert!(BruteForce.search(&[1.0], &[], 5).is_empty());
+    }
+
+    #[test]
+    fn brute_force_equal_scores_tie_break_by_id_desc() {
+        let query = vec![1.0, 0.0];
+        let candidates = vec![
+            Candidate {
+                id: 7,
+                vector: vec![1.0, 0.0],
+            },
+            Candidate {
+                id: 9,
+                vector: vec![1.0, 0.0],
+            },
+            Candidate {
+                id: 8,
+                vector: vec![1.0, 0.0],
+            },
+        ];
+        let ranked = BruteForce.search(&query, &candidates, 3);
+        let ids: Vec<i64> = ranked.iter().map(|s| s.id).collect();
+        assert_eq!(ids, [9, 8, 7], "identical scores order by id DESC");
+    }
+
+    #[test]
+    fn brute_force_sort_is_total_with_nan_scores() {
+        // NaN components produce NaN cosine scores; total_cmp must keep the
+        // sort total (no panic, deterministic placement) and rank real
+        // matches ahead of NaN (total_cmp orders NaN above +1.0, so NaN
+        // candidates sort first — the assertion pins that behavior).
+        let query = vec![1.0, 0.0];
+        let candidates = vec![
+            Candidate {
+                id: 1,
+                vector: vec![f32::NAN, 0.0],
+            },
+            Candidate {
+                id: 2,
+                vector: vec![1.0, 0.0],
+            },
+        ];
+        let ranked = BruteForce.search(&query, &candidates, 2);
+        assert_eq!(ranked.len(), 2, "sort completes with NaN present");
+        assert!(
+            ranked.iter().any(|s| s.id == 2),
+            "real match is not dropped"
+        );
     }
 
     /// Deterministic fixture vectors (no `rand`): each component is a stable FNV-1a
