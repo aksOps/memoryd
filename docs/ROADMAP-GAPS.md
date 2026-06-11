@@ -83,10 +83,15 @@ corpus hygiene, not query latency.
 
 ## D — Architecture follow-ups (from the actor/MCP work)
 
-- `[ ]` D1. Split inference out of `consolidate_pending` so the dream loop
-  can join the single-writer actor (the documented `[~]` carve-out: today
-  inference inside Store methods would serialize captures behind dream
-  passes).
+- `[x]` D1. Split inference out of the dream phases' write transactions:
+  consolidate, distill, extract-profile, and heuristic induction all run
+  provider calls in a compute phase BEFORE their (now millisecond-short)
+  IMMEDIATE write transactions; associate already followed the pattern.
+  The dream loop stays on its own connection — with no inference inside any
+  write tx, WAL + busy_timeout bound capture impact to milliseconds, which
+  resolves the carve-out's stated reason; routing dream writes through the
+  actor remains an optional optimization with no remaining correctness
+  motivation.
 - `[x]` D2. MCP `memory_remember` provenance: `remember_event` hardcodes
   `agent: "cli"`; stamp `mcp` (and thread the real agent name through) so
   provenance distinguishes capture surfaces.

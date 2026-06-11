@@ -590,44 +590,60 @@ impl Store {
             entry.ids.push(id);
         }
 
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut memories_created = 0usize;
+        // Compute phase — D1: all provider inference happens BEFORE the write
+        // transaction opens, so other writers (capture via the actor) are never
+        // blocked behind a network call. Usage rows are written afterwards with
+        // the same amounts.
+        let price = adapter.usd_per_1k_prompt_tokens();
+        let mut prepared: Vec<(String, Option<(i64, f64)>)> = Vec::with_capacity(order.len());
         let mut tokens = 0i64;
         let mut budget_hit = false;
         for key in &order {
             let cluster = &clusters[key];
-            let price = adapter.usd_per_1k_prompt_tokens();
             let tokens_est = prompt_token_estimate(&cluster.text);
-            let content = if price > 0.0 {
+            let (content, usage) = if price > 0.0 {
                 let est_cost = tokens_est as f64 / 1000.0 * price;
                 if *window_spend + est_cost <= budget_usd {
                     match adapter.summarize(std::slice::from_ref(&cluster.text))? {
                         Some(summary) => {
-                            tx.execute(
-                                "INSERT INTO provider_usage
-                                    (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
-                                 VALUES (?1, ?2, ?3, 'complete', ?4, 0, ?5, NULL)",
-                                params![now_ms, adapter.id(), adapter.model_id(), tokens_est, est_cost],
-                            )?;
                             *window_spend += est_cost;
                             tokens += tokens_est;
-                            summary
+                            (summary, Some((tokens_est, est_cost)))
                         }
-                        None => cluster.text.clone(),
+                        None => (cluster.text.clone(), None),
                     }
                 } else {
                     // Spend cap would be exceeded: degrade this and subsequent clusters.
                     budget_hit = true;
-                    cluster.text.clone()
+                    (cluster.text.clone(), None)
                 }
             } else {
                 // Free / null adapter: try summarize (None for null), no spend impact.
-                adapter
-                    .summarize(std::slice::from_ref(&cluster.text))?
-                    .unwrap_or_else(|| cluster.text.clone())
+                (
+                    adapter
+                        .summarize(std::slice::from_ref(&cluster.text))?
+                        .unwrap_or_else(|| cluster.text.clone()),
+                    None,
+                )
             };
+            prepared.push((content, usage));
+        }
+
+        // Write phase: one short IMMEDIATE transaction, no inference inside.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut memories_created = 0usize;
+        for (key, (content, usage)) in order.iter().zip(prepared) {
+            let cluster = &clusters[key];
+            if let Some((tokens_est, est_cost)) = usage {
+                tx.execute(
+                    "INSERT INTO provider_usage
+                        (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
+                     VALUES (?1, ?2, ?3, 'complete', ?4, 0, ?5, NULL)",
+                    params![now_ms, adapter.id(), adapter.model_id(), tokens_est, est_cost],
+                )?;
+            }
 
             let mem_kind = memory_kind_for(&cluster.kind);
             let trust = trust_for_source(&cluster.source, &cluster.kind);
@@ -722,6 +738,79 @@ impl Store {
         let mut batch = DistillBatch::default();
         let idle_cutoff = now_ms.saturating_sub(policy.idle_ms);
 
+        // Read phase (no transaction): select candidates and their members.
+        let limit_i = i64::try_from(policy.sessions_per_pass).unwrap_or(i64::MAX);
+        let candidates: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT s.id FROM sessions s
+                 WHERE s.status = 'open'
+                   AND (SELECT MAX(r.ts) FROM raw_events r WHERE r.session_id = s.id) <= ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM raw_events r2
+                       WHERE r2.session_id = s.id AND r2.consolidated_at IS NULL)
+                   AND (SELECT COUNT(*) FROM memories m
+                        WHERE m.source_session = s.id
+                          AND m.kind <> 'session_summary') >= ?2
+                 ORDER BY s.started_at ASC, s.id ASC LIMIT ?3",
+            )?;
+            let mapped = stmt
+                .query_map(params![idle_cutoff, policy.min_memories, limit_i], |row| {
+                    row.get::<_, String>(0)
+                })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        let member_cap_i = i64::try_from(policy.member_cap).unwrap_or(i64::MAX);
+        let mut sessions: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        for session_id in candidates {
+            let members: Vec<(String, String)> = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, content FROM memories
+                     WHERE source_session = ?1 AND kind <> 'session_summary'
+                       AND lifecycle_state IN ('active', 'associated', 'decaying', 'dormant')
+                     ORDER BY created_at DESC, id DESC LIMIT ?2",
+                )?;
+                let mapped = stmt.query_map(params![session_id, member_cap_i], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                mapped.collect::<Result<Vec<_>, _>>()?
+            };
+            if !members.is_empty() {
+                sessions.push((session_id, members));
+            }
+        }
+
+        // Compute phase — D1: provider inference outside any transaction.
+        let price = adapter.usd_per_1k_prompt_tokens();
+        type PreparedSession = (String, Vec<(String, String)>, String, Option<(i64, f64)>);
+        let mut prepared: Vec<PreparedSession> = Vec::new();
+        for (session_id, members) in sessions {
+            let texts: Vec<String> = members.iter().map(|(_, content)| content.clone()).collect();
+            let tokens_est: i64 = texts.iter().map(|text| prompt_token_estimate(text)).sum();
+            let mut usage = None;
+            if price > 0.0 {
+                let est_cost = tokens_est as f64 / 1000.0 * price;
+                if *window_spend + est_cost > budget_usd {
+                    // Spend cap binds: leave this and later sessions open for
+                    // the next pass instead of degrading to junk summaries.
+                    batch.budget_hit = true;
+                    break;
+                }
+                usage = Some((tokens_est, est_cost));
+            }
+            let Some(summary) = adapter.distill(&texts)? else {
+                // No chat capability: nothing in this phase can progress.
+                break;
+            };
+            if let Some((tokens_est, est_cost)) = usage {
+                *window_spend += est_cost;
+                batch.tokens += tokens_est;
+            }
+            // Defense in depth: provider output must not introduce a secret.
+            let summary = redact_inline_string_with_count(&summary).value;
+            prepared.push((session_id, members, summary, usage));
+        }
+
+        // Write phase: one short IMMEDIATE transaction, no inference inside.
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -744,73 +833,15 @@ impl Store {
             params![now_ms, idle_cutoff, policy.min_memories],
         )?;
 
-        let limit_i = i64::try_from(policy.sessions_per_pass).unwrap_or(i64::MAX);
-        let candidates: Vec<String> = {
-            let mut stmt = tx.prepare(
-                "SELECT s.id FROM sessions s
-                 WHERE s.status = 'open'
-                   AND (SELECT MAX(r.ts) FROM raw_events r WHERE r.session_id = s.id) <= ?1
-                   AND NOT EXISTS (
-                       SELECT 1 FROM raw_events r2
-                       WHERE r2.session_id = s.id AND r2.consolidated_at IS NULL)
-                   AND (SELECT COUNT(*) FROM memories m
-                        WHERE m.source_session = s.id
-                          AND m.kind <> 'session_summary') >= ?2
-                 ORDER BY s.started_at ASC, s.id ASC LIMIT ?3",
-            )?;
-            let mapped = stmt
-                .query_map(params![idle_cutoff, policy.min_memories, limit_i], |row| {
-                    row.get::<_, String>(0)
-                })?;
-            mapped.collect::<Result<Vec<_>, _>>()?
-        };
-
-        let member_cap_i = i64::try_from(policy.member_cap).unwrap_or(i64::MAX);
-        let price = adapter.usd_per_1k_prompt_tokens();
-        for session_id in candidates {
-            let members: Vec<(String, String)> = {
-                let mut stmt = tx.prepare(
-                    "SELECT id, content FROM memories
-                     WHERE source_session = ?1 AND kind <> 'session_summary'
-                       AND lifecycle_state IN ('active', 'associated', 'decaying', 'dormant')
-                     ORDER BY created_at DESC, id DESC LIMIT ?2",
-                )?;
-                let mapped = stmt.query_map(params![session_id, member_cap_i], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?;
-                mapped.collect::<Result<Vec<_>, _>>()?
-            };
-            if members.is_empty() {
-                continue;
-            }
-            let texts: Vec<String> = members.iter().map(|(_, content)| content.clone()).collect();
-            let tokens_est: i64 = texts.iter().map(|text| prompt_token_estimate(text)).sum();
-            if price > 0.0 {
-                let est_cost = tokens_est as f64 / 1000.0 * price;
-                if *window_spend + est_cost > budget_usd {
-                    // Spend cap binds: leave this and later sessions open for
-                    // the next pass instead of degrading to junk summaries.
-                    batch.budget_hit = true;
-                    break;
-                }
-            }
-            let Some(summary) = adapter.distill(&texts)? else {
-                // No chat capability: nothing in this phase can progress.
-                break;
-            };
-            if price > 0.0 {
-                let est_cost = tokens_est as f64 / 1000.0 * price;
+        for (session_id, members, summary, usage) in prepared {
+            if let Some((tokens_est, est_cost)) = usage {
                 tx.execute(
                     "INSERT INTO provider_usage
                         (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
                      VALUES (?1, ?2, ?3, 'complete', ?4, 0, ?5, NULL)",
                     params![now_ms, adapter.id(), adapter.model_id(), tokens_est, est_cost],
                 )?;
-                *window_spend += est_cost;
-                batch.tokens += tokens_est;
             }
-            // Defense in depth: provider output must not introduce a secret.
-            let summary = redact_inline_string_with_count(&summary).value;
 
             let trust = 0.70;
             let decay_at = half_life_ms("session_summary").map(|hl| now_ms + hl);
@@ -1333,12 +1364,15 @@ impl Store {
         }
 
         let mut batch = ExtractBatch::default();
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Compute phase — D1: dedup probes and the gated LLM refinement run
+        // before the write transaction, so no provider latency is held inside it.
+        type PreparedFact = (String, String, String, f64, Option<(i64, f64)>);
+        let mut prepared_facts: Vec<PreparedFact> = Vec::new();
         for (mem_id, kind, content, trust) in &cands {
             let fact_key = profile_fact_key(kind, content);
-            let already_proposed: bool = tx
+            let already_proposed: bool = self
+                .conn
                 .query_row(
                     "SELECT 1 FROM approvals
                      WHERE target_type = 'profile_fact' AND target_ref = ?1 LIMIT 1",
@@ -1347,7 +1381,8 @@ impl Store {
                 )
                 .optional()?
                 .is_some();
-            let already_active: bool = tx
+            let already_active: bool = self
+                .conn
                 .query_row(
                     "SELECT 1 FROM profile_facts WHERE fact_key = ?1 AND state = 'active' LIMIT 1",
                     params![fact_key],
@@ -1363,19 +1398,15 @@ impl Store {
             // Optional gated LLM refinement of the fact value (mirrors consolidation).
             let price = adapter.usd_per_1k_prompt_tokens();
             let tokens_est = prompt_token_estimate(content);
+            let mut usage = None;
             let fact_value = if price > 0.0 {
                 let est_cost = tokens_est as f64 / 1000.0 * price;
                 if *window_spend + est_cost <= budget_usd {
                     match adapter.summarize(std::slice::from_ref(content))? {
                         Some(summary) => {
-                            tx.execute(
-                                "INSERT INTO provider_usage
-                                    (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
-                                 VALUES (?1, ?2, ?3, 'complete', ?4, 0, ?5, NULL)",
-                                params![now_ms, adapter.id(), adapter.model_id(), tokens_est, est_cost],
-                            )?;
                             *window_spend += est_cost;
                             batch.tokens += tokens_est;
+                            usage = Some((tokens_est, est_cost));
                             summary
                         }
                         None => content.clone(),
@@ -1393,7 +1424,22 @@ impl Store {
             // provider summary (or any upstream miss) must not introduce a
             // secret into approvals/audit rows.
             let fact_value = redact_inline_string_with_count(&fact_value).value;
+            prepared_facts.push((mem_id.clone(), fact_key, fact_value, *trust, usage));
+        }
 
+        // Write phase: one short IMMEDIATE transaction, no inference inside.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (mem_id, fact_key, fact_value, trust, usage) in prepared_facts {
+            if let Some((tokens_est, est_cost)) = usage {
+                tx.execute(
+                    "INSERT INTO provider_usage
+                        (ts, adapter, model_id, op, prompt_tokens, completion_tokens, est_cost, job_id)
+                     VALUES (?1, ?2, ?3, 'complete', ?4, 0, ?5, NULL)",
+                    params![now_ms, adapter.id(), adapter.model_id(), tokens_est, est_cost],
+                )?;
+            }
             let proposed_change = serde_json::to_string(&serde_json::json!({
                 "fact_key": fact_key,
                 "fact_value": fact_value,
@@ -1439,11 +1485,10 @@ impl Store {
         now_ms: i64,
     ) -> Result<HeuristicBatch, StoreError> {
         let mut batch = HeuristicBatch::default();
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let since: i64 = tx
+        // Read phase (no transaction): frontier + evidence window.
+        let since: i64 = self
+            .conn
             .query_row(
                 "SELECT COALESCE(MAX(requested_at), 0) FROM approvals
                  WHERE target_type = 'profile_fact' AND target_ref LIKE 'heuristic.%'",
@@ -1455,7 +1500,7 @@ impl Store {
 
         let input_cap = i64::try_from(policy.input_cap).unwrap_or(i64::MAX);
         let inputs: Vec<String> = {
-            let mut stmt = tx.prepare(
+            let mut stmt = self.conn.prepare(
                 "SELECT content FROM memories
                  WHERE kind IN ('decision', 'session_summary')
                    AND created_at > ?1
@@ -1468,24 +1513,27 @@ impl Store {
         };
         if inputs.len() < policy.min_inputs {
             // Patterns need evidence; no provider call, no spend.
-            tx.commit()?;
             return Ok(batch);
         }
 
+        // Compute phase — D1: the provider call happens before any transaction.
         let price = adapter.usd_per_1k_prompt_tokens();
         let tokens_est: i64 = inputs.iter().map(|text| prompt_token_estimate(text)).sum();
         if price > 0.0 {
             let est_cost = tokens_est as f64 / 1000.0 * price;
             if *window_spend + est_cost > budget_usd {
                 batch.budget_hit = true;
-                tx.commit()?;
                 return Ok(batch);
             }
         }
         let Some(induced) = adapter.induce_heuristics(&inputs)? else {
-            tx.commit()?;
             return Ok(batch);
         };
+
+        // Write phase: one short IMMEDIATE transaction, no inference inside.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if price > 0.0 {
             let est_cost = tokens_est as f64 / 1000.0 * price;
             tx.execute(
