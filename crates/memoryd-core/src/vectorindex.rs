@@ -127,12 +127,7 @@ impl VectorIndex for Hnsw {
                 score: nb.sim,
             })
             .collect();
-        scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(b.id.cmp(&a.id))
-        });
+        scored.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| b.id.cmp(&a.id)));
         scored.truncate(k);
         scored
     }
@@ -457,6 +452,26 @@ mod tests {
         assert_eq!(ranked.len(), 2, "sort completes with NaN present");
         assert!(
             ranked.iter().any(|s| s.id == 2),
+            "real match is not dropped"
+        );
+    }
+
+    #[test]
+    fn hnsw_sort_is_total_with_nan_scores() {
+        // Mirror of brute_force_sort_is_total_with_nan_scores for the HNSW
+        // path (shortlist > M so the graph path's own sort runs): total_cmp
+        // keeps the sort total (no panic, deterministic) and a NaN candidate
+        // never drops the real top hit.
+        let mut candidates = fixture(100, 8);
+        candidates.push(Candidate {
+            id: 9999,
+            vector: vec![f32::NAN; 8],
+        });
+        let query = candidates[10].vector.clone();
+        let ranked = Hnsw::default().search(&query, &candidates, 10);
+        assert_eq!(ranked.len(), 10, "sort completes with NaN present");
+        assert!(
+            ranked.iter().any(|s| s.id == 10),
             "real match is not dropped"
         );
     }

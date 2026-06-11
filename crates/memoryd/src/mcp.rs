@@ -48,19 +48,24 @@ fn run_loop(
     writer: &mut impl Write,
 ) -> Result<(), crate::CliError> {
     let mut initialized = false;
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+    let mut reader = reader;
+    // Read byte-bounded: `BufRead::lines()` would allocate the whole line
+    // before any length check, so a pathological multi-GB line could OOM the
+    // process before we reject it. This caps buffered bytes per message.
+    while let Some((raw, over_limit)) = read_capped_line(&mut reader, MAX_MCP_LINE_BYTES)? {
+        let line = String::from_utf8_lossy(&raw);
+        let line = line.trim();
+        if line.is_empty() && !over_limit {
             continue;
         }
-        let response = if line.len() > MAX_MCP_LINE_BYTES {
+        let response = if over_limit {
             Some(error_response(
                 serde_json::Value::Null,
                 -32600,
                 "request line exceeds limit",
             ))
         } else {
-            match serde_json::from_str::<serde_json::Value>(&line) {
+            match serde_json::from_str::<serde_json::Value>(line) {
                 Ok(message) => dispatch(store, cfg, &mut initialized, &message),
                 Err(_) => Some(error_response(
                     serde_json::Value::Null,
@@ -77,6 +82,61 @@ fn run_loop(
         }
     }
     Ok(())
+}
+
+/// Read one newline-terminated message, buffering at most `max` bytes. Returns
+/// `(bytes_without_newline, over_limit)`; an over-limit line is drained to its
+/// newline (or EOF) and reported with an empty buffer so the caller can reject
+/// it without the process ever holding the oversized payload. `None` at EOF.
+fn read_capped_line(
+    reader: &mut impl BufRead,
+    max: usize,
+) -> std::io::Result<Option<(Vec<u8>, bool)>> {
+    let mut buf = Vec::new();
+    let mut over = false;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(slice) => slice,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        if available.is_empty() {
+            return Ok(if buf.is_empty() && !over {
+                None
+            } else {
+                Some((buf, over))
+            });
+        }
+        match available.iter().position(|&byte| byte == b'\n') {
+            Some(newline) => {
+                // Check the size even when the newline arrives in the same chunk
+                // as the content (Cursor / fully-buffered pipes), not just across
+                // chunk boundaries.
+                if !over && buf.len() + newline > max {
+                    over = true;
+                    buf = Vec::new();
+                }
+                if !over {
+                    buf.extend_from_slice(&available[..newline]);
+                }
+                reader.consume(newline + 1);
+                return Ok(Some((buf, over)));
+            }
+            None => {
+                let len = available.len();
+                if !over {
+                    if buf.len() + len > max {
+                        // Stop accumulating; we only need to know it was too big.
+                        over = true;
+                        buf = Vec::new();
+                    } else {
+                        buf.extend_from_slice(available);
+                    }
+                }
+                reader.consume(len);
+            }
+        }
+    }
 }
 
 /// Route one JSON-RPC message. Notifications (no `id`) never get replies;
@@ -1244,6 +1304,61 @@ mod tests {
         assert_eq!(
             second["result"]["tools"].as_array().expect("tools").len(),
             5
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn run_loop_accepts_crlf_terminated_lines() {
+        let (path, cfg, mut store) = open_fixture("mcp-crlf");
+        // CRLF-delimited clients: the trailing `\r` must be stripped before
+        // JSON parsing, never surfaced as a -32700 parse error.
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#,
+            "\r\n",
+        );
+        let mut output = Vec::new();
+
+        run_loop(&mut store, &cfg, std::io::Cursor::new(input), &mut output)
+            .expect("run_loop succeeds");
+
+        let text = String::from_utf8(output).expect("output is UTF-8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "one request => one response line");
+        let response: serde_json::Value = serde_json::from_str(lines[0]).expect("line parses");
+        assert!(
+            response.get("error").is_none(),
+            "CRLF line parses cleanly: {response}"
+        );
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn run_loop_rejects_oversized_line_without_buffering_it() {
+        let (path, cfg, mut store) = open_fixture("mcp-oversized");
+        // A line larger than MAX_MCP_LINE_BYTES followed by a valid request:
+        // the big line is rejected, the next line still processes (proving the
+        // reader resynchronized at the newline rather than choking).
+        let mut input = vec![b'x'; MAX_MCP_LINE_BYTES + 10];
+        input.push(b'\n');
+        input.extend_from_slice(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+        input.push(b'\n');
+        let mut output = Vec::new();
+
+        run_loop(&mut store, &cfg, std::io::Cursor::new(input), &mut output)
+            .expect("run_loop succeeds");
+
+        let text = String::from_utf8(output).expect("output is UTF-8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "one error line + one ping reply");
+        let first: serde_json::Value = serde_json::from_str(lines[0]).expect("line parses");
+        assert_eq!(first["error"]["code"], -32600);
+        let second: serde_json::Value = serde_json::from_str(lines[1]).expect("line parses");
+        assert_eq!(
+            second["id"], 1,
+            "request after the oversized line still served"
         );
         cleanup_db_files(&path);
     }
