@@ -2215,6 +2215,65 @@ mod tests {
     }
 
     #[test]
+    fn doctor_command_passes_on_fresh_store_with_fix() {
+        let path = temp_db_path("doctor-command");
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "doctor",
+                "--fix",
+                "--db",
+                path.to_str().expect("path is UTF-8"),
+            ]
+            .map(OsString::from),
+        )
+        .expect("cli parses");
+        let Command::Doctor(args) = cli.command.clone() else {
+            panic!("expected doctor command");
+        };
+
+        doctor(cli, args).expect("doctor passes on a fresh store");
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn doctor_command_handles_db_path_without_parent_dir() {
+        // A bare file name has no parent directory, so the `df` disk-free
+        // probe is skipped and doctor reports "disk_free_mb: unavailable".
+        let name = format!("memoryd-doctor-noparent-{}.db", std::process::id());
+        let path = PathBuf::from(&name);
+        let cli = Cli::parse(["memoryd", "doctor", "--db", name.as_str()].map(OsString::from))
+            .expect("cli parses");
+        let Command::Doctor(args) = cli.command.clone() else {
+            panic!("expected doctor command");
+        };
+
+        doctor(cli, args).expect("doctor passes without a disk-free probe");
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn stats_command_prints_table_counts() {
+        let path = temp_db_path("stats-command");
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "stats",
+                "--db",
+                path.to_str().expect("path is UTF-8"),
+            ]
+            .map(OsString::from),
+        )
+        .expect("cli parses");
+
+        stats(cli).expect("stats succeeds on a fresh store");
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
     fn parses_setup_with_out() {
         let cli = Cli::parse(["memoryd", "setup", "--out", "/tmp/m.env"].map(OsString::from))
             .expect("cli parses");
@@ -2288,6 +2347,33 @@ mod tests {
     }
 
     #[test]
+    fn backup_command_writes_copy_via_cli() {
+        let path = temp_db_path("backup-cli-source");
+        let target = temp_db_path("backup-cli-target");
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "backup",
+                "--to",
+                target.to_str().expect("path is UTF-8"),
+                "--db",
+                path.to_str().expect("path is UTF-8"),
+            ]
+            .map(OsString::from),
+        )
+        .expect("cli parses");
+        let Command::Backup(args) = cli.command.clone() else {
+            panic!("expected backup command");
+        };
+
+        backup(cli, args).expect("backup succeeds");
+
+        assert!(target.exists(), "backup target written");
+        cleanup_db_files(&path);
+        cleanup_db_files(&target);
+    }
+
+    #[test]
     fn parses_remember_with_kind_session_source_and_tags() {
         let cli = Cli::parse(
             [
@@ -2332,6 +2418,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn run_version_command_prints_version_and_succeeds() {
+        run(["memoryd", "--version"].map(OsString::from)).expect("version succeeds");
+    }
+
+    #[test]
+    fn print_help_writes_usage_without_panicking() {
+        print_help();
+    }
+
     /// Writer that always fails with EPIPE, like stdout after `| head` exits.
     struct BrokenPipeWriter;
 
@@ -2351,7 +2447,9 @@ mod tests {
         write_line(&mut buf, format_args!("memoryd {}", "0.1.0")).expect("vec write succeeds");
         assert_eq!(buf, b"memoryd 0.1.0\n");
 
-        let err = write_line(&mut BrokenPipeWriter, format_args!("memoryd doctor"))
+        let mut broken = BrokenPipeWriter;
+        broken.flush().expect("flush is a no-op");
+        let err = write_line(&mut broken, format_args!("memoryd doctor"))
             .expect_err("broken-pipe writer fails");
         assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
     }
@@ -3941,6 +4039,29 @@ mod tests {
             store.list_pending_approvals(10).expect("list").is_empty(),
             "the approval is no longer pending after the decision"
         );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn approve_list_prints_pending_approvals() {
+        let path = temp_db_path("m8-cli-list");
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "approve",
+                "--list",
+                "--db",
+                path.to_str().unwrap(),
+            ]
+            .map(OsString::from),
+        )
+        .expect("parses");
+        let Command::Approve(args) = cli.command.clone() else {
+            panic!("expected approve")
+        };
+
+        approve(cli, args).expect("listing pending approvals succeeds");
+
         cleanup_db_files(&path);
     }
 
