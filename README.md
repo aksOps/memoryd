@@ -19,6 +19,14 @@ cargo test --workspace --locked
 
 The pinned Rust toolchain is declared in `rust-toolchain.toml`.
 
+### Install via npm (pre-release)
+
+Pre-release builds are published to the **GitHub npm registry** as
+`@aksops/memoryd`: a thin shim whose postinstall downloads the sha256-verified
+prebuilt binary (linux/macOS, x64/arm64) from the matching GitHub release.
+See `npm/README.md` for the `.npmrc` setup and install steps. Stable versions
+will be published to the public npmjs registry once validated (M10).
+
 ## Current Commands
 
 ```bash
@@ -201,7 +209,7 @@ Still planned: broader worker/provider/profile audit coverage, npm binary distri
 
 ## Package Manager Rule
 
-There is no Node wrapper in S01. When Node/package workflows are added, use `pnpm` and commit `pnpm-lock.yaml`. `npm` is reserved for the eventual registry publication target, not local development workflows.
+The Node wrapper lives in `npm/` (zero runtime dependencies; `pnpm-lock.yaml` committed per the workspace rule). Use `pnpm` for local Node workflows; `npm` is reserved for registry publication (`npm publish` runs in the release workflow only).
 
 ## Retention
 

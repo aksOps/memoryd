@@ -62,6 +62,30 @@ items are queued.
   status checks on `main` so "gate must pass" is enforced at merge time, not
   just visible.
 
+## Part C — pre-release npm distribution (shipped 2026-06-11)
+
+- [x] **C1. npm wrapper package** (`npm/`): `@aksops/memoryd`, zero runtime
+  dependencies. `postinstall` downloads the prebuilt binary for the host
+  platform from the GitHub release matching the package version, verifies
+  the published sha256, and unpacks it; the `memoryd` bin shim forwards
+  argv/stdio/exit codes/signals so `serve` and `mcp` behave identically to
+  the bare binary. Tested locally end to end (download, tamper rejection,
+  exit-code passthrough).
+- [x] **C2. Release workflow** (`.github/workflows/release.yml`): on `v*`
+  tag or manual dispatch — creates a GitHub prerelease, builds
+  linux x64/arm64 + macOS x64/arm64 binaries (pinned toolchain, sha256
+  asset checksums, per-target smoke test), attaches assets, and publishes
+  the npm package to the GitHub npm registry with the workflow token.
+- [x] **C3. Portable model fetch**: `scripts/fetch-embed-model.sh` now runs
+  on macOS runners (bash 3.2 compatible, `shasum` fallback), same pinned
+  hashes.
+
+Publish runbook: bump `npm/package.json` version → merge to main → run the
+`release` workflow with tag `v<version>` (or push the tag). Consumers need
+`@aksops:registry=https://npm.pkg.github.com` plus a `read:packages` PAT in
+`~/.npmrc` (see `npm/README.md`). npmjs publication stays gated on manual
+validation (M10).
+
 ### Notes
 
 - Coverage headroom is 3.8 points. The thin spots are
