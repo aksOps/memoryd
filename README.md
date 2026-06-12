@@ -38,7 +38,20 @@ cargo run -p memoryd -- remember "Prod migrations use flyway" --kind rule --tags
 cargo run -p memoryd -- recall "flyway migrations" --k 5 --db /tmp/memoryd.db
 cargo run -p memoryd -- serve --db /tmp/memoryd.db --bind 127.0.0.1:7077
 cargo run -p memoryd -- mcp --db /tmp/memoryd.db
+cargo run -p memoryd -- tui --db /tmp/memoryd.db
 ```
+
+### Inspect the store
+
+`memoryd tui` opens a local, read-only terminal viewer over the store: tabbed
+browsing of memories (with lexical search and graph-neighbor detail), sessions,
+approved profile facts, import batches, and table stats. It never binds a
+socket or calls a provider — quit with `q`.
+
+Dependency minimalism remains the rule: every direct dependency must justify
+itself, and `memoryd-core` stays dependency-pure — it gains nothing from this
+feature. The one explicit owner-approved exception lives in the **binary crate
+only**: `ratatui`/`crossterm`, pinned exactly, powering the `tui` viewer.
 
 ## MCP
 

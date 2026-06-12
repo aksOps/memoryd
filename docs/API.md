@@ -150,6 +150,23 @@ OpenAI-shaped endpoint via `MEMORYD_OPENAI_BASE_URL` (api.openai.com, Ollama's
 `MEMORYD_OPENAI_EMBED_MODEL`, `MEMORYD_OPENAI_CHAT_MODEL`, and
 `MEMORYD_OPENAI_USD_PER_1K`; it requires a non-zero `MEMORYD_SPEND_CAP_USD`.
 
+### `tui`
+
+```bash
+memoryd tui [--db <path>]
+```
+
+Local-only, read-only interactive store viewer (requires stdout to be a
+terminal). Five tabs — Memories, Sessions, Profile, Imports, Stats — browse
+the store through the same read paths the CLI and MCP server use: paged
+memory/session lists, `/` lexical search (the CLI recall path under the
+`null` adapter — never embeds), Enter for a memory's graph neighborhood
+(`g` re-centers on a neighbor), distilled session narratives, approved
+profile facts, import-batch progress, and table counts plus db path/size.
+No network bind, no provider calls, no writes beyond the access bookkeeping
+recall already performs. Keys: `Tab`/`1-5` switch tabs, `j`/`k`/arrows move,
+`Enter` open, `Esc` back, `q`/`Ctrl-C` quit.
+
 ## REST
 
 Base URL: `http://127.0.0.1:7077` by default.

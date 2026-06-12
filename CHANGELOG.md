@@ -52,5 +52,10 @@ The project uses Semantic Versioning before the first stable release.
   dedup), pause/resume under a full embed queue, role-prefix and cap each unit
   at 4,000 characters, flow through the standard redaction pipeline, and open
   foreign agent databases strictly read-only.
+- Added `memoryd tui`: a local-only, read-only interactive store viewer
+  (ratatui/crossterm, the binary crate's first and only extra dependencies —
+  `memoryd-core` stays dependency-pure). Tabs for memories (lexical search,
+  graph-neighbor detail), sessions (distilled narratives), profile facts,
+  import batches, and table stats; no network bind, no provider calls.
 
 No public runtime vulnerabilities have been fixed in a release yet.

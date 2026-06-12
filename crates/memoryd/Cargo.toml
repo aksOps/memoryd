@@ -12,6 +12,11 @@ serde_json = { version = "1.0.150", default-features = false, features = ["std"]
 # handler is impossible in safe std; this is the canonical minimal choice and
 # its internal unsafe is outside the workspace forbid(unsafe_code) boundary.
 signal-hook = { version = "0.3", default-features = false }
+# Owner-approved exception to the zero-extra-deps stance, binary crate only:
+# the read-only `memoryd tui` viewer. memoryd-core stays dependency-pure.
+# Pinned exactly; crossterm matches the version ratatui's backend expects.
+ratatui = "=0.30.1"
+crossterm = "=0.29.0"
 
 [lints]
 workspace = true

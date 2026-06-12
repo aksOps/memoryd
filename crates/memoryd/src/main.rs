@@ -23,6 +23,7 @@ mod import_sources;
 mod integrate;
 mod logging;
 mod mcp;
+mod tui;
 
 const MAX_HTTP_LINE_BYTES: usize = 8 * 1024;
 const MAX_HTTP_HEADERS: usize = 64;
@@ -103,6 +104,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
         Command::Dream(args) => dream(cli, args),
         Command::Approve(args) => approve(cli, args),
         Command::Mcp => mcp::serve_stdio(cli),
+        Command::Tui => tui::run(cli),
         Command::Version => {
             outln!("memoryd {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -963,6 +965,7 @@ enum Command {
     Dream(DreamArgs),
     Approve(ApproveArgs),
     Mcp,
+    Tui,
     Version,
     Help,
 }
@@ -1100,6 +1103,7 @@ impl Cli {
                 "dream" => Command::Dream(DreamArgs::default()),
                 "approve" => Command::Approve(ApproveArgs::default()),
                 "mcp" => Command::Mcp,
+                "tui" => Command::Tui,
                 "--version" | "-V" | "version" => Command::Version,
                 "--help" | "-h" | "help" => Command::Help,
                 other => return Err(CliError::UnknownCommand(other.to_string())),
@@ -1493,6 +1497,7 @@ fn print_help() {
             memoryd dream [--now] [--budget-usd <n>] [--max-seconds <n>] [--db <path>]\n\
             memoryd approve [--list] [--id <id> --accept|--reject] [--db <path>]\n\
             memoryd mcp [--db <path>]   (MCP stdio server; no network bind)\n\
+            memoryd tui [--db <path>]   (interactive viewer)\n\
             memoryd serve [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>] [--adapter <null|local|openai_compat>]\n\
             memoryd version | --version | -V   (print the memoryd version)\n\n\
           Provider env: MEMORYD_ADAPTER, MEMORYD_SPEND_CAP_USD, MEMORYD_OPENAI_BASE_URL,\n\
@@ -1530,6 +1535,7 @@ enum CliError {
     Json(serde_json::Error),
     Io(std::io::Error),
     DoctorFailed,
+    TuiNotATerminal,
 }
 
 impl fmt::Display for CliError {
@@ -1581,6 +1587,12 @@ impl fmt::Display for CliError {
             Self::Json(err) => write!(f, "JSON error: {err}"),
             Self::Io(err) => write!(f, "I/O error: {err}"),
             Self::DoctorFailed => write!(f, "doctor checks failed"),
+            Self::TuiNotATerminal => {
+                write!(
+                    f,
+                    "tui requires an interactive terminal (stdout is not a tty)"
+                )
+            }
         }
     }
 }
@@ -2367,6 +2379,15 @@ mod tests {
         stats(cli).expect("stats succeeds on a fresh store");
 
         cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn parses_tui_command() {
+        let cli = Cli::parse(["memoryd", "tui", "--db", "/tmp/memoryd-tui.db"].map(OsString::from))
+            .expect("cli parses");
+
+        assert_eq!(cli.command, Command::Tui);
+        assert_eq!(cli.db_path, PathBuf::from("/tmp/memoryd-tui.db"));
     }
 
     #[test]
