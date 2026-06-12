@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod hook;
+mod import_sources;
 mod integrate;
 mod logging;
 mod mcp;
@@ -352,32 +353,127 @@ fn recall(cli: Cli, args: RecallArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Backfill historic data through the same capture path. Only the generic JSONL
-/// format ships in this slice; source-specific importers are deferred until it is
-/// stable. The embed queue is bounded by the governor's `queue_depth_max`, so a
-/// large import pauses and resumes rather than flooding the worker.
+/// Backfill historic data through the same capture path. `--source jsonl`
+/// imports one generic JSONL file; `claude`/`codex`/`opencode`/`hermes` parse
+/// that agent's native session history (auto-discovered under `$HOME`, or
+/// pointed at with `--path`); `agents` runs every detected agent. The embed
+/// queue is bounded by the governor's `queue_depth_max`, so a large import
+/// pauses and resumes rather than flooding the worker; re-runs are idempotent
+/// via content-hash dedup.
 fn import(cli: Cli, args: ImportArgs) -> Result<(), CliError> {
     let cfg = cli.config()?;
     cfg.validate()?;
 
-    if args.path.is_empty() {
-        return Err(CliError::MissingArgument("--path"));
+    match args.source.as_str() {
+        "jsonl" => {
+            if args.path.is_empty() {
+                return Err(CliError::MissingArgument("--path"));
+            }
+            let mut store = Store::open(&cfg.db_path)?;
+            let summary = store.import_jsonl(
+                &args.source,
+                &PathBuf::from(&args.path),
+                cfg.caps.queue_depth_max,
+            )?;
+            outln!("{}", import_response_json(&summary)?);
+            Ok(())
+        }
+        "claude" | "codex" | "opencode" | "hermes" => {
+            let mut store = Store::open(&cfg.db_path)?;
+            let home = integrate::home_dir();
+            let xdg = env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+            let override_path = (!args.path.is_empty()).then(|| PathBuf::from(&args.path));
+            let run = import_sources::run_agent_import(
+                &mut store,
+                &args.source,
+                override_path.as_deref(),
+                &home,
+                xdg.as_deref(),
+                cfg.caps.queue_depth_max,
+            )?;
+            outln!("{}", serde_json::to_string(&agent_import_value(&run))?);
+            Ok(())
+        }
+        "agents" => {
+            let mut store = Store::open(&cfg.db_path)?;
+            let home = integrate::home_dir();
+            let xdg = env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+            let mut agents = Vec::new();
+            for agent in integrate::KNOWN_AGENTS {
+                if !integrate::detect(agent, &home) {
+                    agents.push(serde_json::json!({ "agent": agent, "detected": false }));
+                    continue;
+                }
+                let run = import_sources::run_agent_import(
+                    &mut store,
+                    agent,
+                    None,
+                    &home,
+                    xdg.as_deref(),
+                    cfg.caps.queue_depth_max,
+                )?;
+                let mut entry = serde_json::Map::new();
+                entry.insert("agent".to_string(), serde_json::json!(agent));
+                entry.insert("detected".to_string(), serde_json::json!(true));
+                if let serde_json::Value::Object(fields) = agent_import_value(&run) {
+                    entry.extend(fields);
+                }
+                agents.push(serde_json::Value::Object(entry));
+            }
+            outln!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({ "agents": agents }))?
+            );
+            Ok(())
+        }
+        _ => {
+            // Don't echo the user-supplied value (it could contain a pasted secret).
+            Err(CliError::Store(StoreError::Import(
+                "unsupported import source; expected jsonl, claude, codex, opencode, hermes, \
+                 or agents"
+                    .to_string(),
+            )))
+        }
     }
-    if args.source != "jsonl" {
-        // Don't echo the user-supplied value (it could contain a pasted secret).
-        return Err(CliError::Store(StoreError::Import(
-            "unsupported import source; only \"jsonl\" is supported in this build".to_string(),
-        )));
-    }
+}
 
-    let mut store = Store::open(&cfg.db_path)?;
-    let summary = store.import_jsonl(
-        &args.source,
-        &PathBuf::from(&args.path),
-        cfg.caps.queue_depth_max,
-    )?;
-    outln!("{}", import_response_json(&summary)?);
-    Ok(())
+/// Single-agent import response: per-file batch rows (or skip notes) plus
+/// counters aggregated over every produced batch summary. The run is "paused"
+/// when any batch paused (embed queue full; re-run to resume), else "completed".
+fn agent_import_value(run: &import_sources::ImportRun) -> serde_json::Value {
+    let mut total = 0_usize;
+    let mut processed = 0_usize;
+    let mut skipped = 0_usize;
+    let mut paused = false;
+    let batches: Vec<serde_json::Value> = run
+        .files
+        .iter()
+        .map(|file| match &file.summary {
+            Some(summary) => {
+                total += summary.total;
+                processed += summary.processed;
+                skipped += summary.skipped;
+                paused |= summary.state == "paused";
+                serde_json::json!({
+                    "path": file.path,
+                    "batch_id": summary.batch_id,
+                    "total": summary.total,
+                    "processed": summary.processed,
+                    "skipped": summary.skipped,
+                    "state": summary.state,
+                })
+            }
+            None => serde_json::json!({ "path": file.path, "note": file.note }),
+        })
+        .collect();
+    serde_json::json!({
+        "source": run.source,
+        "total": total,
+        "processed": processed,
+        "skipped": skipped,
+        "state": if paused { "paused" } else { "completed" },
+        "batches": batches,
+    })
 }
 
 /// Run one dream pass now: consolidate pending raw_events into durable memories and
@@ -1393,7 +1489,7 @@ fn print_help() {
             memoryd stats  [--db <path>] [--bind <addr:port>] [--token <token>] [--token-file <path>]\n\
             memoryd remember <content> [--kind <kind>] [--session <id>] [--source <source>] [--tags <a,b>] [--db <path>]\n\
             memoryd recall <query> [--k <limit>] [--semantic] [--hops <0|1>] [--index <brute-force|hnsw>] [--db <path>]\n\
-            memoryd import --source jsonl --path <file> [--db <path>]\n\
+            memoryd import --source jsonl|claude|codex|opencode|hermes|agents [--path <file|dir|db>] [--db <path>]\n\
             memoryd dream [--now] [--budget-usd <n>] [--max-seconds <n>] [--db <path>]\n\
             memoryd approve [--list] [--id <id> --accept|--reject] [--db <path>]\n\
             memoryd mcp [--db <path>]   (MCP stdio server; no network bind)\n\
@@ -2713,6 +2809,46 @@ mod tests {
         };
         assert_eq!(args.source, "jsonl");
         assert_eq!(args.path, "/tmp/hist.jsonl");
+    }
+
+    #[test]
+    fn parses_import_with_agent_source_without_path() {
+        let cli = Cli::parse(["memoryd", "import", "--source", "claude"].map(OsString::from))
+            .expect("cli parses");
+        let Command::Import(args) = cli.command else {
+            panic!("expected import command");
+        };
+        assert_eq!(args.source, "claude");
+        assert!(args.path.is_empty(), "--path is optional for agent sources");
+    }
+
+    #[test]
+    fn import_rejects_unknown_source_lists_valid_ones() {
+        let cli = Cli::parse(["memoryd", "import", "--source", "telepathy"].map(OsString::from))
+            .expect("cli parses");
+        let Command::Import(args) = cli.command.clone() else {
+            panic!("expected import command");
+        };
+        let err = import(cli, args).expect_err("unknown source fails");
+        let message = err.to_string();
+        for valid in ["jsonl", "claude", "codex", "opencode", "hermes", "agents"] {
+            assert!(message.contains(valid), "missing {valid} in: {message}");
+        }
+        assert!(
+            !message.contains("telepathy"),
+            "user-supplied source must not be echoed: {message}"
+        );
+    }
+
+    #[test]
+    fn import_jsonl_still_requires_path() {
+        let cli = Cli::parse(["memoryd", "import", "--source", "jsonl"].map(OsString::from))
+            .expect("cli parses");
+        let Command::Import(args) = cli.command.clone() else {
+            panic!("expected import command");
+        };
+        let err = import(cli, args).expect_err("missing path fails");
+        assert!(matches!(err, CliError::MissingArgument("--path")));
     }
 
     #[test]

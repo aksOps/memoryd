@@ -58,7 +58,7 @@ pub(crate) struct IntegrateArgs {
 }
 
 /// The four agents this command knows how to integrate.
-const KNOWN_AGENTS: [&str; 4] = ["claude", "opencode", "codex", "hermes"];
+pub(crate) const KNOWN_AGENTS: [&str; 4] = ["claude", "opencode", "codex", "hermes"];
 
 pub(crate) fn run(args: &IntegrateArgs) -> Result<(), crate::CliError> {
     let home = home_dir();
@@ -142,7 +142,7 @@ fn plan(
 
 /// Best-effort presence probe: an agent counts as installed if its config dir
 /// (or a well-known config file) exists under HOME.
-fn detect(agent: &str, home: &Path) -> bool {
+pub(crate) fn detect(agent: &str, home: &Path) -> bool {
     let probes: &[&str] = match agent {
         "claude" => &[".claude", ".claude.json"],
         "opencode" => &[".config/opencode", ".opencode"],
@@ -725,7 +725,7 @@ fn indent(text: &str) -> String {
         .join("\n")
 }
 
-fn home_dir() -> PathBuf {
+pub(crate) fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))

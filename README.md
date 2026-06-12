@@ -119,6 +119,34 @@ corrupting an existing multi-server config. Every modified file is backed up to
 overwritten (it may carry your edits), and hook installs are path-independent
 idempotent: one memoryd dream hook per file even if the binary moved.
 
+### Bootstrapping from history
+
+`memoryd import` backfills the memory store from the session history your
+agents already wrote to disk, so a fresh install starts with months of context
+instead of an empty brain. Each source has a native parser: Claude Code
+(`~/.claude/projects/*/*.jsonl`), Codex (`~/.codex/sessions/**/*.jsonl`),
+OpenCode (`$XDG_DATA_HOME/opencode/opencode.db`), and Hermes
+(`~/.hermes/state.db`). Everything flows through the normal capture path —
+no privileged shortcut.
+
+```bash
+memoryd import --source agents                    # every detected agent
+memoryd import --source claude                    # one agent, auto-discovered
+memoryd import --source codex --path /backup/sessions   # file, dir, or db override
+memoryd import --source jsonl --path hist.jsonl   # generic one-object-per-line
+```
+
+Notes:
+
+- Re-runs are idempotent: already-imported content dedups by content hash
+  (`processed: 0`, everything `skipped`).
+- A full embed queue pauses rather than drops: on `"state": "paused"`, re-run
+  until the response says `"completed"`.
+- Units are role-prefixed (`[user]`, `[assistant]`, `[tool]`) and capped at
+  4,000 characters each; tool call arguments and thinking blocks are skipped.
+- The standard redaction pipeline applies before anything is persisted, and
+  foreign agent databases are opened strictly read-only.
+
 ## Providers
 
 The provider seam has three adapters: `null` (inert), `local` (default —

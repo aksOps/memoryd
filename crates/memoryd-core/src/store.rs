@@ -248,20 +248,32 @@ impl Store {
         let contents = fs::read_to_string(path)?;
         let units = parse_jsonl(&contents)?;
         let path_or_uri = path.display().to_string();
+        self.import_units(source, &path_or_uri, &units, max_active_jobs)
+    }
+
+    /// Stage already-parsed import units into `raw_events`, idempotently and
+    /// resumably — the shared back half of every importer (generic JSONL and the
+    /// source-specific parsers in [`crate::importers`]).
+    ///
+    /// `path_or_uri` keys the `import_batches` row, so re-running the same
+    /// source resumes its batch; dedup over `content_hash` keeps re-staging
+    /// safe. When the embed queue is full the run *pauses* (batch left
+    /// resumable) rather than dropping work.
+    pub fn import_units(
+        &mut self,
+        source: &str,
+        path_or_uri: &str,
+        units: &[ImportUnit],
+        max_active_jobs: usize,
+    ) -> Result<ImportSummary, StoreError> {
         let now = unix_ms_now();
 
-        let batch_id = self.begin_import_batch(source, &path_or_uri, units.len(), now)?;
+        let batch_id = self.begin_import_batch(source, path_or_uri, units.len(), now)?;
 
         let mut paused = false;
-        for unit in &units {
-            let outcome = self.stage_import_unit(
-                &batch_id,
-                source,
-                &path_or_uri,
-                unit,
-                now,
-                max_active_jobs,
-            )?;
+        for unit in units {
+            let outcome =
+                self.stage_import_unit(&batch_id, source, path_or_uri, unit, now, max_active_jobs)?;
             if matches!(outcome, StageOutcome::Paused) {
                 paused = true;
                 break;
@@ -275,7 +287,7 @@ impl Store {
             params![state, finished_at, batch_id],
         )?;
 
-        self.import_summary(&batch_id, source, &path_or_uri)
+        self.import_summary(&batch_id, source, path_or_uri)
     }
 
     /// Find-or-create the `import_batches` row for `(source, path_or_uri)` and reset it
@@ -487,6 +499,86 @@ impl Store {
             skipped: usize::try_from(skipped).unwrap_or(0),
             state,
         })
+    }
+
+    /// One page of stored memories, newest first (by `created_at`, then insert
+    /// order). Read-only browse helper for the TUI; `limit` is clamped to
+    /// `1..=200` so a careless caller cannot drag the whole table into memory.
+    pub fn list_memories_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<MemoryListItem>, StoreError> {
+        let limit = i64::try_from(limit.clamp(1, 200)).unwrap_or(200);
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, lifecycle_state, content, created_at, last_accessed_at
+             FROM memories
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt.query_map(params![limit, offset], |row| {
+            Ok(MemoryListItem {
+                memory_id: row.get(0)?,
+                kind: row.get(1)?,
+                lifecycle_state: row.get(2)?,
+                content: row.get(3)?,
+                created_at: row.get(4)?,
+                last_accessed_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// One page of sessions, newest first (by `started_at`). Read-only browse
+    /// helper for the TUI; `limit` is clamped to `1..=200`.
+    pub fn list_sessions_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionListItem>, StoreError> {
+        let limit = i64::try_from(limit.clamp(1, 200)).unwrap_or(200);
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, agent, event_count, started_at
+             FROM sessions
+             ORDER BY started_at DESC, rowid DESC
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt.query_map(params![limit, offset], |row| {
+            Ok(SessionListItem {
+                session_id: row.get(0)?,
+                agent: row.get(1)?,
+                event_count: row.get(2)?,
+                started_at: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// All import batches, newest first (by `started_at`). Read-only status
+    /// helper for the TUI — batch counts stay personal-archive small, so no
+    /// paging is needed here.
+    pub fn list_import_batches(&self) -> Result<Vec<ImportBatchItem>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source, path_or_uri, total, processed, skipped, state
+             FROM import_batches
+             ORDER BY started_at DESC, rowid DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ImportBatchItem {
+                source: row.get(0)?,
+                path_or_uri: row.get(1)?,
+                total: row.get(2)?,
+                processed: row.get(3)?,
+                skipped: row.get(4)?,
+                state: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     /// Open a new `dream_runs` row in the `running` state; returns its id.
@@ -2810,6 +2902,39 @@ pub struct TableStats {
     pub rows: i64,
 }
 
+/// One row of [`Store::list_memories_page`] — a memory as the TUI browses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryListItem {
+    pub memory_id: String,
+    pub kind: String,
+    pub lifecycle_state: String,
+    /// Full stored content (display-side truncation is the caller's concern).
+    pub content: String,
+    pub created_at: i64,
+    /// Last recall touch in unix ms; `None` for never-recalled memories.
+    pub last_accessed_at: Option<i64>,
+}
+
+/// One row of [`Store::list_sessions_page`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionListItem {
+    pub session_id: String,
+    pub agent: String,
+    pub event_count: i64,
+    pub started_at: i64,
+}
+
+/// One row of [`Store::list_import_batches`] — progress of a (re-)import run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportBatchItem {
+    pub source: String,
+    pub path_or_uri: String,
+    pub total: i64,
+    pub processed: i64,
+    pub skipped: i64,
+    pub state: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RedactedString {
     value: String,
@@ -3702,7 +3827,7 @@ CREATE VIRTUAL TABLE raw_events_fts USING fts5(
 
 /// Cap on the whole-file read in [`Store::import_jsonl`] - bounds memory on a small VM.
 /// 64 MiB of JSONL is hundreds of thousands of records, well beyond personal scale.
-const MAX_IMPORT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_IMPORT_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Outcome of staging one import unit: a new row, a dedup skip, or a queue-full pause.
 enum StageOutcome {
@@ -5857,6 +5982,218 @@ mod tests {
         assert_eq!(count_imported(&store), 3, "no duplicates after resume");
 
         let _ = fs::remove_file(&src);
+        cleanup_db_files(&db);
+    }
+
+    fn test_unit(text: &str, session: &str, ts_ms: Option<i64>) -> ImportUnit {
+        ImportUnit {
+            text: text.to_string(),
+            session_id: session.to_string(),
+            agent: "claude".to_string(),
+            source: "claude-session".to_string(),
+            ts_ms,
+        }
+    }
+
+    #[test]
+    fn import_units_is_idempotent_per_path() {
+        let db = temp_db_path("import-units-idem");
+        let mut store = Store::open(&db).expect("store opens");
+        let units = vec![
+            test_unit("[user] alpha", "s1", Some(1)),
+            test_unit("[assistant] beta", "s1", Some(2)),
+        ];
+
+        let first = store
+            .import_units("claude-session", "/fake/session.jsonl", &units, usize::MAX)
+            .expect("first import");
+        assert_eq!(first.processed, 2);
+        assert_eq!(first.skipped, 0);
+        assert_eq!(first.state, "completed");
+
+        let second = store
+            .import_units("claude-session", "/fake/session.jsonl", &units, usize::MAX)
+            .expect("second import");
+        assert_eq!(
+            second.batch_id, first.batch_id,
+            "the same path_or_uri reuses the batch row"
+        );
+        assert_eq!(second.processed, 0, "re-import stages nothing new");
+        assert_eq!(second.skipped, 2);
+        assert_eq!(second.state, "completed");
+        assert_eq!(count_imported(&store), 2, "no duplicate rows");
+
+        cleanup_db_files(&db);
+    }
+
+    #[test]
+    fn import_units_preserves_unit_timestamps_in_raw_events_and_sessions() {
+        let db = temp_db_path("import-units-ts");
+        let mut store = Store::open(&db).expect("store opens");
+        let units = vec![
+            test_unit("[user] later message", "ts-sess", Some(1_705_321_900_000)),
+            test_unit("[user] earlier message", "ts-sess", Some(1_705_321_845_000)),
+            test_unit("[user] no timestamp", "ts-sess", None),
+        ];
+
+        store
+            .import_units("claude-session", "/fake/ts.jsonl", &units, usize::MAX)
+            .expect("import");
+
+        let stamps: Vec<i64> = {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT ts FROM raw_events WHERE kind = 'import' ORDER BY id")
+                .expect("prepare");
+            stmt.query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("rows")
+        };
+        assert_eq!(stamps[0], 1_705_321_900_000, "unit ts lands in raw_events");
+        assert_eq!(stamps[1], 1_705_321_845_000);
+        assert!(
+            stamps[2] >= 1_705_321_900_000,
+            "missing ts falls back to the batch default (now)"
+        );
+
+        let started_at: i64 = store
+            .conn
+            .query_row(
+                "SELECT started_at FROM sessions WHERE id = 'ts-sess'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("session row");
+        assert_eq!(
+            started_at, 1_705_321_845_000,
+            "the session starts at its earliest event timestamp"
+        );
+
+        cleanup_db_files(&db);
+    }
+
+    #[test]
+    fn import_units_pauses_when_queue_full() {
+        let db = temp_db_path("import-units-pause");
+        let mut store = Store::open(&db).expect("store opens");
+        let units = vec![
+            test_unit("[user] one", "s1", Some(1)),
+            test_unit("[user] two", "s1", Some(2)),
+            test_unit("[user] three", "s1", Some(3)),
+        ];
+
+        let first = store
+            .import_units("claude-session", "/fake/pause.jsonl", &units, 2)
+            .expect("capped import");
+        assert_eq!(first.state, "paused");
+        assert_eq!(first.processed, 2, "the queue cap bounds staging");
+        assert_eq!(count_imported(&store), 2);
+
+        // Drain the queue; the same units resume the batch to completion.
+        store
+            .conn
+            .execute("UPDATE jobs SET state = 'done' WHERE state = 'pending'", [])
+            .expect("drain queue");
+        let second = store
+            .import_units("claude-session", "/fake/pause.jsonl", &units, 2)
+            .expect("resumed import");
+        assert_eq!(second.state, "completed");
+        assert_eq!(second.processed, 1);
+        assert_eq!(second.skipped, 2);
+        assert_eq!(count_imported(&store), 3);
+
+        cleanup_db_files(&db);
+    }
+
+    #[test]
+    fn list_memories_page_returns_newest_first() {
+        let path = temp_db_path("list-memories");
+        let store = Store::open(&path).expect("store opens");
+        // seed_memory uses last_accessed for created_at too.
+        seed_memory(&store, "mem-old", "decision", 1_000, 9_000, "active");
+        seed_memory(&store, "mem-mid", "fact", 2_000, 9_000, "decaying");
+        seed_memory(&store, "mem-new", "insight", 3_000, 9_000, "active");
+
+        let page = store.list_memories_page(0, 2).expect("first page");
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].memory_id, "mem-new");
+        assert_eq!(page[0].kind, "insight");
+        assert_eq!(page[0].lifecycle_state, "active");
+        assert_eq!(page[0].content, "content mem-new");
+        assert_eq!(page[0].created_at, 3_000);
+        assert_eq!(page[0].last_accessed_at, Some(3_000));
+        assert_eq!(page[1].memory_id, "mem-mid");
+
+        let rest = store.list_memories_page(2, 2).expect("second page");
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].memory_id, "mem-old");
+
+        // limit clamps into 1..=200 instead of erroring or returning everything.
+        let clamped = store.list_memories_page(0, 0).expect("clamped low");
+        assert_eq!(clamped.len(), 1);
+        let all = store.list_memories_page(0, 5_000).expect("clamped high");
+        assert_eq!(all.len(), 3);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn list_sessions_and_import_batches_pages() {
+        let db = temp_db_path("list-sessions-batches");
+        let mut store = Store::open(&db).expect("store opens");
+        store
+            .import_units(
+                "claude-session",
+                "/fake/a.jsonl",
+                &[
+                    test_unit("[user] older one", "sess-old", Some(1_000)),
+                    test_unit("[user] older two", "sess-old", Some(1_500)),
+                ],
+                usize::MAX,
+            )
+            .expect("first batch");
+        store
+            .import_units(
+                "codex-session",
+                "/fake/b.jsonl",
+                &[test_unit("[user] newer", "sess-new", Some(2_000))],
+                usize::MAX,
+            )
+            .expect("second batch");
+
+        let sessions = store.list_sessions_page(0, 10).expect("sessions");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session_id, "sess-new", "newest first");
+        assert_eq!(sessions[0].agent, "claude");
+        assert_eq!(sessions[0].event_count, 1);
+        assert_eq!(sessions[0].started_at, 2_000);
+        assert_eq!(sessions[1].session_id, "sess-old");
+        assert_eq!(sessions[1].event_count, 2);
+        assert_eq!(sessions[1].started_at, 1_000);
+
+        let second_page = store.list_sessions_page(1, 10).expect("offset page");
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page[0].session_id, "sess-old");
+
+        let batches = store.list_import_batches().expect("batches");
+        assert_eq!(batches.len(), 2);
+        let codex = batches
+            .iter()
+            .find(|b| b.source == "codex-session")
+            .expect("codex batch listed");
+        assert_eq!(codex.path_or_uri, "/fake/b.jsonl");
+        assert_eq!(codex.total, 1);
+        assert_eq!(codex.processed, 1);
+        assert_eq!(codex.skipped, 0);
+        assert_eq!(codex.state, "completed");
+        let claude = batches
+            .iter()
+            .find(|b| b.source == "claude-session")
+            .expect("claude batch listed");
+        assert_eq!(claude.total, 2);
+        assert_eq!(claude.state, "completed");
+
         cleanup_db_files(&db);
     }
 

@@ -4,6 +4,9 @@ Memory quality in determines persona quality out: the dream pipeline can only
 consolidate, link, and induce patterns from what capture gives it. Five
 habits make the difference (roadmap E1).
 
+Starting fresh? `memoryd import --source agents` bootstraps the store from the
+session history your coding agents already wrote to disk (see `docs/API.md`).
+
 ## Use kinds deliberately
 
 `--kind` (CLI) / `kind` (HTTP/MCP) drives decay half-lives, profile
