@@ -1,0 +1,43 @@
+{
+  "name": "@aksops/memoryd",
+  "version": "0.1.0-pre.1",
+  "description": "Local-first memory daemon for AI coding agents — npm distribution of the memoryd binary",
+  "license": "(MIT OR Apache-2.0)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aksOps/memoryd.git"
+  },
+  "homepage": "https://github.com/aksOps/memoryd#readme",
+  "bugs": {
+    "url": "https://github.com/aksOps/memoryd/issues"
+  },
+  "keywords": [
+    "memory",
+    "ai-agents",
+    "mcp",
+    "sqlite",
+    "daemon"
+  ],
+  "bin": {
+    "memoryd": "bin/memoryd.js"
+  },
+  "files": [
+    "bin/memoryd.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "linux",
+    "darwin"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "public"
+  }
+}

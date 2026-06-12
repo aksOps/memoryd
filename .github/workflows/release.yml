@@ -1,0 +1,163 @@
+name: release
+
+# Builds prebuilt memoryd binaries and publishes them ENTIRELY through the
+# npm registry (GitHub npm registry today, npmjs later): one platform
+# package per target carrying the binary, plus the @aksops/memoryd main
+# package that selects the right one via optionalDependencies. No install
+# scripts and no install-time downloads, so installs work behind registry
+# proxies (Nexus/Artifactory) with no github.com access. A GitHub release
+# with tar.gz assets is also created as a convenience for non-npm consumers.
+# Triggered by a v* tag push or manually with an explicit tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0-pre.1); created at the current commit if it does not exist"
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+
+      - name: Resolve tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          TAG="${INPUT_TAG:-$GITHUB_REF_NAME}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "resolved tag: $TAG"
+
+      - name: Verify package version matches tag
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          PKG_VERSION="$(node -p "require('./npm/package.json').version")"
+          if [ "v$PKG_VERSION" != "$TAG" ]; then
+            echo "::error::npm/package.json version v$PKG_VERSION does not match tag $TAG"
+            exit 1
+          fi
+
+      - name: Create prerelease if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG already exists"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --prerelease --target "$GITHUB_SHA" \
+              --title "memoryd $TAG (pre-release)" \
+              --notes "Automated pre-release build. Install via npm: @aksops/memoryd (binaries ship inside platform npm packages; the attached tar.gz assets are a convenience for non-npm consumers)."
+          fi
+
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            npm_os: linux
+            npm_cpu: x64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            npm_os: linux
+            npm_cpu: arm64
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            npm_os: darwin
+            npm_cpu: arm64
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            npm_os: darwin
+            npm_cpu: x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Fetch embed model (sha256-pinned; build.rs re-verifies)
+        run: bash scripts/fetch-embed-model.sh
+
+      - name: Build release binary
+        run: cargo build --release --locked -p memoryd
+
+      - name: Smoke-test binary
+        run: |
+          target/release/memoryd --version
+          target/release/memoryd doctor --db /tmp/release-smoke.db
+          rm -f /tmp/release-smoke.db*
+
+      - name: Publish platform npm package
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+          NPM_OS: ${{ matrix.npm_os }}
+          NPM_CPU: ${{ matrix.npm_cpu }}
+        run: |
+          node npm/scripts/make-platform-package.js \
+            "platform-pkg" "$NPM_OS" "$NPM_CPU" target/release/memoryd
+          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
+          cd platform-pkg
+          npm publish
+
+      - name: Upload release asset (convenience for non-npm consumers)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.create-release.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          ASSET="memoryd-${TARGET}.tar.gz"
+          tar -C target/release -czf "$ASSET" memoryd
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ASSET" > "$ASSET.sha256"
+          else
+            shasum -a 256 "$ASSET" > "$ASSET.sha256"
+          fi
+          cat "$ASSET.sha256"
+          gh release upload "$TAG" "$ASSET" "$ASSET.sha256" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+  publish-npm:
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+
+      - name: Inject platform optionalDependencies and publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+        run: |
+          # The platform packages only exist on the registry as of this run,
+          # so they are injected here rather than committed (a committed
+          # reference to unpublished packages would break repo-local
+          # `pnpm install`).
+          node -e '
+            const fs = require("fs");
+            const p = JSON.parse(fs.readFileSync("npm/package.json", "utf8"));
+            p.optionalDependencies = Object.fromEntries(
+              ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"]
+                .map(t => [`@aksops/memoryd-${t}`, p.version])
+            );
+            fs.writeFileSync("npm/package.json", JSON.stringify(p, null, 2) + "\n");
+          '
+          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
+          cd npm
+          npm publish
