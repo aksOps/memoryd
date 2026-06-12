@@ -131,7 +131,12 @@ jobs:
         run: |
           node npm/scripts/make-platform-package.js \
             "platform-pkg" "$NPM_OS" "$NPM_CPU" "target/$TARGET/release/memoryd"
-          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
+          # Scope mapping is required for npm view (publishConfig only
+          # affects npm publish), otherwise the idempotency check queries
+          # the default npmjs registry and always misses.
+          printf '%s\n%s\n' \
+            "@aksops:registry=https://npm.pkg.github.com" \
+            "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
           cd platform-pkg
           NAME="$(node -p "require('./package.json').name")"
           VERSION="$(node -p "require('./package.json').version")"
@@ -182,7 +187,12 @@ jobs:
             );
             fs.writeFileSync("npm/package.json", JSON.stringify(p, null, 2) + "\n");
           '
-          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
+          # Scope mapping is required for npm view (publishConfig only
+          # affects npm publish), otherwise the idempotency check queries
+          # the default npmjs registry and always misses.
+          printf '%s\n%s\n' \
+            "@aksops:registry=https://npm.pkg.github.com" \
+            "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
           cd npm
           NAME="$(node -p "require('./package.json').name")"
           VERSION="$(node -p "require('./package.json').version")"
