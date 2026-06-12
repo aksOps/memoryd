@@ -1,9 +1,13 @@
 name: release
 
-# Builds prebuilt memoryd binaries for the supported platforms, attaches
-# them (plus sha256 files) to a GitHub prerelease, and publishes the npm
-# wrapper package to the GitHub npm registry. Triggered by a v* tag push or
-# manually with an explicit tag.
+# Builds prebuilt memoryd binaries and publishes them ENTIRELY through the
+# npm registry (GitHub npm registry today, npmjs later): one platform
+# package per target carrying the binary, plus the @aksops/memoryd main
+# package that selects the right one via optionalDependencies. No install
+# scripts and no install-time downloads, so installs work behind registry
+# proxies (Nexus/Artifactory) with no github.com access. A GitHub release
+# with tar.gz assets is also created as a convenience for non-npm consumers.
+# Triggered by a v* tag push or manually with an explicit tag.
 on:
   push:
     tags: ["v*"]
@@ -35,6 +39,16 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "resolved tag: $TAG"
 
+      - name: Verify package version matches tag
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          PKG_VERSION="$(node -p "require('./npm/package.json').version")"
+          if [ "v$PKG_VERSION" != "$TAG" ]; then
+            echo "::error::npm/package.json version v$PKG_VERSION does not match tag $TAG"
+            exit 1
+          fi
+
       - name: Create prerelease if missing
         env:
           GH_TOKEN: ${{ github.token }}
@@ -46,7 +60,7 @@ jobs:
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
               --prerelease --target "$GITHUB_SHA" \
               --title "memoryd $TAG (pre-release)" \
-              --notes "Automated pre-release build. Binaries are attached per target; npm wrapper published to the GitHub npm registry as @aksops/memoryd."
+              --notes "Automated pre-release build. Install via npm: @aksops/memoryd (binaries ship inside platform npm packages; the attached tar.gz assets are a convenience for non-npm consumers)."
           fi
 
   build:
@@ -57,12 +71,20 @@ jobs:
         include:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            npm_os: linux
+            npm_cpu: x64
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            npm_os: linux
+            npm_cpu: arm64
           - runner: macos-14
             target: aarch64-apple-darwin
+            npm_os: darwin
+            npm_cpu: arm64
           - runner: macos-13
             target: x86_64-apple-darwin
+            npm_os: darwin
+            npm_cpu: x64
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
@@ -83,7 +105,19 @@ jobs:
           target/release/memoryd doctor --db /tmp/release-smoke.db
           rm -f /tmp/release-smoke.db*
 
-      - name: Package and upload asset
+      - name: Publish platform npm package
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+          NPM_OS: ${{ matrix.npm_os }}
+          NPM_CPU: ${{ matrix.npm_cpu }}
+        run: |
+          node npm/scripts/make-platform-package.js \
+            "platform-pkg" "$NPM_OS" "$NPM_CPU" target/release/memoryd
+          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
+          cd platform-pkg
+          npm publish
+
+      - name: Upload release asset (convenience for non-npm consumers)
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.create-release.outputs.tag }}
@@ -107,21 +141,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
 
-      - name: Verify package version matches tag
+      - name: Inject platform optionalDependencies and publish main package
         env:
-          TAG: ${{ needs.create-release.outputs.tag }}
-        run: |
-          PKG_VERSION="$(node -p "require('./npm/package.json').version")"
-          if [ "v$PKG_VERSION" != "$TAG" ]; then
-            echo "::error::npm/package.json version v$PKG_VERSION does not match tag $TAG"
-            exit 1
-          fi
-
-      - name: Publish to GitHub npm registry
-        env:
-          MEMORYD_SKIP_DOWNLOAD: "1"
           NODE_AUTH_TOKEN: ${{ github.token }}
         run: |
+          # The platform packages only exist on the registry as of this run,
+          # so they are injected here rather than committed (a committed
+          # reference to unpublished packages would break repo-local
+          # `pnpm install`).
+          node -e '
+            const fs = require("fs");
+            const p = JSON.parse(fs.readFileSync("npm/package.json", "utf8"));
+            p.optionalDependencies = Object.fromEntries(
+              ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"]
+                .map(t => [`@aksops/memoryd-${t}`, p.version])
+            );
+            fs.writeFileSync("npm/package.json", JSON.stringify(p, null, 2) + "\n");
+          '
           echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
           cd npm
           npm publish

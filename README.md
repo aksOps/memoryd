@@ -22,10 +22,12 @@ The pinned Rust toolchain is declared in `rust-toolchain.toml`.
 ### Install via npm (pre-release)
 
 Pre-release builds are published to the **GitHub npm registry** as
-`@aksops/memoryd`: a thin shim whose postinstall downloads the sha256-verified
-prebuilt binary (linux/macOS, x64/arm64) from the matching GitHub release.
-See `npm/README.md` for the `.npmrc` setup and install steps. Stable versions
-will be published to the public npmjs registry once validated (M10).
+`@aksops/memoryd`. Binaries ship **inside platform-specific npm packages**
+(`@aksops/memoryd-<os>-<cpu>`, linux/macOS × x64/arm64) selected via
+`optionalDependencies` — no install scripts, no install-time downloads, so
+installs work behind corporate registry proxies (Nexus/Artifactory) without
+github.com access. See `npm/README.md` for `.npmrc`/Nexus setup. Stable
+versions will be published to the public npmjs registry once validated (M10).
 
 ## Current Commands
 

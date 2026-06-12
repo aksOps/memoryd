@@ -11,3 +11,4 @@ bom.json
 bom.xml
 .claude/
 lcov.info
+npm/node_modules

@@ -23,12 +23,8 @@
   },
   "files": [
     "bin/memoryd.js",
-    "scripts/install.js",
     "README.md"
   ],
-  "scripts": {
-    "postinstall": "node scripts/install.js"
-  },
   "engines": {
     "node": ">=18"
   },
