@@ -1142,4 +1142,472 @@ mod tests {
         assert_eq!(truncate_chars("ééééé", 3), "éé…");
         assert_eq!(truncate_chars("anything", 0), "…");
     }
+
+    fn capture(store: &mut Store, session: &str, ts_ms: i64, text: &str) {
+        store
+            .capture_event(NewRawEvent {
+                session_id: session.to_string(),
+                agent: "claude".to_string(),
+                source: "test".to_string(),
+                kind: "observation".to_string(),
+                payload: serde_json::json!({ "text": text }),
+                provenance: serde_json::json!({}),
+                ts_ms,
+            })
+            .expect("capture succeeds");
+    }
+
+    /// Consolidate captured events into durable memories the same way the
+    /// `dream` command does (default config adapter, manual trigger).
+    fn dream(store: &mut Store, db_path: &std::path::Path) {
+        let cfg = memoryd_core::config::Config::with_db_path(db_path.to_path_buf());
+        let adapter = memoryd_core::adapters::AdapterKind::from_default_adapter(
+            &cfg.providers.default_adapter,
+        );
+        let opts = memoryd_core::dream::DreamOptions {
+            trigger: "manual",
+            budget_usd: cfg.caps.paid_spend_cap_usd,
+            max_seconds: cfg.caps.dream_wallclock_secs,
+        };
+        memoryd_core::dream::dream_once(store, &adapter, &cfg.caps, &opts, &|| {
+            crate::unix_ms_now()
+        })
+        .expect("dream succeeds");
+    }
+
+    #[test]
+    fn enter_opens_memory_detail_and_g_recenters_on_neighbors() {
+        let path = temp_db_path("detail-flow");
+        let mut store = Store::open(&path).expect("store opens");
+        capture(&mut store, "s1", 1_000, "wal busy timeout fix");
+        capture(&mut store, "s1", 1_001, "vacuum schedule weekly");
+        dream(&mut store, &path);
+
+        let mut app = App::new(path.clone(), 0);
+        app.reload(&store);
+        assert!(app.memories.len() >= 2, "dream consolidated the captures");
+
+        // Enter opens the selected memory's one-hop neighborhood.
+        handle_key(&mut app, key(KeyCode::Enter), &store);
+        assert_eq!(app.detail.len(), 1);
+        assert_eq!(app.detail[0].hood.memory_id, app.memories[0].memory_id);
+        assert!(
+            !app.detail[0].hood.neighbors.is_empty(),
+            "same-session siblings are linked"
+        );
+
+        // Enter inside a detail view is a no-op (the stack is already open).
+        handle_key(&mut app, key(KeyCode::Enter), &store);
+        assert_eq!(app.detail.len(), 1);
+
+        // j/k move the neighbor selection, clamped to the list.
+        handle_key(&mut app, key(KeyCode::Char('j')), &store);
+        assert!(app.detail[0].selected < app.detail[0].hood.neighbors.len());
+        handle_key(&mut app, key(KeyCode::Char('k')), &store);
+        assert_eq!(app.detail[0].selected, 0);
+
+        // g recenters on the selected neighbor, pushing a second level.
+        handle_key(&mut app, key(KeyCode::Char('g')), &store);
+        assert_eq!(app.detail.len(), 2);
+        assert_eq!(
+            app.detail[1].hood.memory_id,
+            app.detail[0].hood.neighbors[0].memory_id
+        );
+
+        // Esc walks the visited path back one level at a time.
+        handle_key(&mut app, key(KeyCode::Esc), &store);
+        assert_eq!(app.detail.len(), 1);
+        handle_key(&mut app, key(KeyCode::Esc), &store);
+        assert!(app.detail.is_empty());
+
+        // g at the top level (no detail open) is a no-op.
+        handle_key(&mut app, key(KeyCode::Char('g')), &store);
+        assert!(app.detail.is_empty());
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn search_returns_durable_memory_hits_and_opens_detail() {
+        let path = temp_db_path("search-memory");
+        let mut store = Store::open(&path).expect("store opens");
+        capture(&mut store, "s1", 1_000, "vacuum schedule weekly");
+        capture(&mut store, "s1", 1_001, "wal busy timeout fix");
+        dream(&mut store, &path);
+
+        let mut app = App::new(path.clone(), 0);
+        app.reload(&store);
+
+        handle_key(&mut app, key(KeyCode::Char('/')), &store);
+        for c in "vacuum".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)), &store);
+        }
+        // The search-input footer renders while typing.
+        let typing = render(&app);
+        assert!(
+            typing.contains("type query  Enter search  Esc cancel"),
+            "search footer: {typing}"
+        );
+
+        handle_key(&mut app, key(KeyCode::Enter), &store);
+        let hit_id = {
+            let results = app.search.results.as_ref().expect("results populated");
+            assert!(!results.is_empty(), "lexical hit over durable memories");
+            results[0]
+                .memory_id
+                .clone()
+                .expect("durable memory hit carries an id")
+        };
+
+        // Durable hits render with the "memory" origin tag.
+        let rendered = render(&app);
+        assert!(rendered.contains("memory ["), "origin tag: {rendered}");
+
+        // j keeps the selection within the result list.
+        handle_key(&mut app, key(KeyCode::Char('j')), &store);
+        let len = app.search.results.as_ref().expect("results").len();
+        assert!(app.search.selected < len);
+        app.search.selected = 0;
+
+        // Enter opens the hit's graph detail; Esc backs out to the results,
+        // then clears them.
+        handle_key(&mut app, key(KeyCode::Enter), &store);
+        assert_eq!(app.detail.len(), 1);
+        assert_eq!(app.detail[0].hood.memory_id, hit_id);
+        handle_key(&mut app, key(KeyCode::Esc), &store);
+        assert!(app.detail.is_empty());
+        assert!(app.search.results.is_some());
+        handle_key(&mut app, key(KeyCode::Esc), &store);
+        assert!(app.search.results.is_none());
+
+        // Submitting an empty query clears results instead of searching.
+        handle_key(&mut app, key(KeyCode::Char('/')), &store);
+        handle_key(&mut app, key(KeyCode::Enter), &store);
+        assert!(app.search.results.is_none());
+
+        // A token-free query is a recall error, surfaced in the footer status.
+        handle_key(&mut app, key(KeyCode::Char('/')), &store);
+        for c in "!!!".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)), &store);
+        }
+        handle_key(&mut app, key(KeyCode::Enter), &store);
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.starts_with("search:")),
+            "status: {:?}",
+            app.status
+        );
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn open_selected_surfaces_missing_memory_and_raw_event_hits() {
+        let path = temp_db_path("open-missing");
+        let store = Store::open(&path).expect("store opens");
+        let mut app = fixture_app();
+
+        // The fixture rows are not in the store: Enter surfaces a status line.
+        handle_key(&mut app, key(KeyCode::Enter), &store);
+        assert!(app.detail.is_empty());
+        assert!(
+            app.status
+                .as_deref()
+                .expect("status set")
+                .contains("not in a recallable state")
+        );
+
+        // A raw-event search hit has no durable memory to open.
+        app.search.results = Some(vec![SearchHit {
+            memory_id: None,
+            kind: "note".to_string(),
+            content: "raw event content".to_string(),
+            score: 1.0,
+        }]);
+        handle_key(&mut app, key(KeyCode::Enter), &store);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("raw-event hit: no durable memory to open")
+        );
+
+        // Raw-event hits render with the "event" origin tag.
+        let rendered = render(&app);
+        assert!(rendered.contains("event  ["), "origin tag: {rendered}");
+
+        // Selection past the end of the results is a no-op.
+        app.search.selected = 5;
+        handle_key(&mut app, key(KeyCode::Enter), &store);
+        assert!(app.detail.is_empty());
+
+        // Enter on an empty memories list is a no-op too.
+        app.search.results = None;
+        app.search.selected = 0;
+        app.memories.clear();
+        handle_key(&mut app, key(KeyCode::Enter), &store);
+        assert!(app.detail.is_empty() && app.status.is_none());
+
+        // Enter on an empty sessions list, Profile, and Stats does nothing.
+        app.tab = Tab::Sessions;
+        handle_key(&mut app, key(KeyCode::Enter), &store);
+        assert!(app.session_detail.is_none());
+        app.tab = Tab::Profile;
+        handle_key(&mut app, key(KeyCode::Enter), &store);
+        app.tab = Tab::Stats;
+        handle_key(&mut app, key(KeyCode::Enter), &store);
+        assert!(app.detail.is_empty() && app.session_detail.is_none());
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn sessions_tab_opens_detail_and_esc_closes() {
+        let path = temp_db_path("sessions-flow");
+        let mut store = Store::open(&path).expect("store opens");
+        capture(&mut store, "sess-a", 1_000, "alpha work");
+        capture(&mut store, "sess-b", 2_000, "beta work");
+
+        let mut app = App::new(path.clone(), 0);
+        app.reload(&store);
+        assert_eq!(app.sessions.len(), 2);
+        app.tab = Tab::Sessions;
+
+        let list = render(&app);
+        assert!(list.contains("2 Sessions"), "tab bar: {list}");
+        assert!(list.contains("Sessions (2 loaded)"), "title: {list}");
+
+        // j selects the second session; Enter opens its detail.
+        handle_key(&mut app, key(KeyCode::Char('j')), &store);
+        assert_eq!(app.sessions_selected, 1);
+        let expected = app.sessions[1].session_id.clone();
+        handle_key(&mut app, key(KeyCode::Enter), &store);
+        {
+            let detail = app.session_detail.as_ref().expect("session detail");
+            assert_eq!(detail.item.session_id, expected);
+            assert!(detail.summary.is_none(), "nothing distilled yet");
+        }
+
+        // j/k are inert while the detail is open.
+        handle_key(&mut app, key(KeyCode::Char('j')), &store);
+        assert_eq!(app.sessions_selected, 1);
+
+        // The undistilled detail renders the placeholder narrative.
+        let rendered = render(&app);
+        assert!(
+            rendered.contains(&format!("session: {expected}")),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("no distilled narrative yet"),
+            "placeholder: {rendered}"
+        );
+
+        // Esc closes the detail back to the list.
+        handle_key(&mut app, key(KeyCode::Esc), &store);
+        assert!(app.session_detail.is_none());
+
+        // A distilled narrative renders verbatim.
+        app.session_detail = Some(SessionDetail {
+            item: app.sessions[0].clone(),
+            summary: Some("Fixed the WAL bug.".to_string()),
+        });
+        let distilled = render(&app);
+        assert!(distilled.contains("Fixed the WAL bug."), "{distilled}");
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn renders_profile_and_imports_tabs_with_selection() {
+        let path = temp_db_path("profile-imports");
+        let store = Store::open(&path).expect("store opens");
+        let mut app = fixture_app();
+
+        app.tab = Tab::Profile;
+        app.profile = vec![
+            ProfileFact {
+                fact_key: "editor".to_string(),
+                fact_value: "helix".to_string(),
+                confidence: 0.9,
+            },
+            ProfileFact {
+                fact_key: "shell".to_string(),
+                fact_value: "fish".to_string(),
+                confidence: 0.75,
+            },
+        ];
+        let profile = render(&app);
+        assert!(profile.contains("3 Profile"), "tab bar: {profile}");
+        assert!(profile.contains("Profile facts (2)"), "title: {profile}");
+        assert!(
+            profile.contains("editor: helix  [active 0.90]"),
+            "fact row: {profile}"
+        );
+        handle_key(&mut app, key(KeyCode::Char('j')), &store);
+        assert_eq!(app.profile_selected, 1);
+        handle_key(&mut app, key(KeyCode::Char('k')), &store);
+        assert_eq!(app.profile_selected, 0);
+
+        app.tab = Tab::Imports;
+        app.imports = vec![ImportBatchItem {
+            source: "claude-session".to_string(),
+            path_or_uri: "/tmp/x.jsonl".to_string(),
+            total: 4,
+            processed: 3,
+            skipped: 1,
+            state: "completed".to_string(),
+        }];
+        let imports = render(&app);
+        assert!(imports.contains("4 Imports"), "tab bar: {imports}");
+        assert!(imports.contains("Import batches (1)"), "title: {imports}");
+        assert!(
+            imports.contains("3/4 processed, 1 skipped"),
+            "batch row: {imports}"
+        );
+        handle_key(&mut app, key(KeyCode::Char('j')), &store);
+        assert_eq!(app.imports_selected, 0, "single row clamps in place");
+
+        // Stats has no selection: j/k are inert.
+        app.tab = Tab::Stats;
+        handle_key(&mut app, key(KeyCode::Char('j')), &store);
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn footer_shows_status_message() {
+        let mut app = fixture_app();
+        app.status = Some("search: boom".to_string());
+        let text = render(&app);
+        assert!(text.contains("|  search: boom"), "footer: {text}");
+    }
+
+    #[test]
+    fn scrolling_past_loaded_end_fetches_next_page_and_clamps() {
+        let path = temp_db_path("paging");
+        let store = Store::open(&path).expect("store opens");
+        let mut app = fixture_app();
+
+        // The fixture rows look like a partial page; scrolling past the end
+        // asks the (empty) store for more and learns it is the end.
+        assert!(!app.memories_end);
+        app.memories_selected = 1;
+        handle_key(&mut app, key(KeyCode::Char('j')), &store);
+        assert!(app.memories_end);
+        assert_eq!(app.memories_selected, 1, "selection clamps at the end");
+        handle_key(&mut app, key(KeyCode::Down), &store);
+        assert_eq!(app.memories_selected, 1);
+        handle_key(&mut app, key(KeyCode::Up), &store);
+        assert_eq!(app.memories_selected, 0);
+
+        // Sessions paging follows the same pattern.
+        app.tab = Tab::Sessions;
+        assert!(!app.sessions_end);
+        handle_key(&mut app, key(KeyCode::Char('j')), &store);
+        assert!(app.sessions_end);
+        assert_eq!(app.sessions_selected, 0, "empty list clamps to zero");
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn handle_key_ignores_release_events_and_unmapped_keys() {
+        let path = temp_db_path("edge-keys");
+        let store = Store::open(&path).expect("store opens");
+        let mut app = fixture_app();
+
+        // Key releases never mutate state or quit.
+        let mut release = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        assert_eq!(handle_key(&mut app, release, &store), Action::None);
+
+        // '/' only starts a search on the Memories tab.
+        app.tab = Tab::Sessions;
+        handle_key(&mut app, key(KeyCode::Char('/')), &store);
+        assert!(!app.search.active);
+        app.tab = Tab::Memories;
+
+        // Unmapped keys at the top level are ignored.
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Home), &store),
+            Action::None
+        );
+
+        // In search mode: Backspace edits, unmapped keys are ignored, Esc
+        // leaves input mode with the draft intact.
+        handle_key(&mut app, key(KeyCode::Char('/')), &store);
+        assert!(app.search.active);
+        handle_key(&mut app, key(KeyCode::Char('a')), &store);
+        handle_key(&mut app, key(KeyCode::Char('b')), &store);
+        handle_key(&mut app, key(KeyCode::Backspace), &store);
+        assert_eq!(app.search.input, "a");
+        handle_key(&mut app, key(KeyCode::Home), &store);
+        assert_eq!(app.search.input, "a");
+        handle_key(&mut app, key(KeyCode::Esc), &store);
+        assert!(!app.search.active);
+        assert_eq!(app.search.input, "a");
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn recenter_needs_a_neighbor_that_is_in_the_store() {
+        let path = temp_db_path("recenter-edge");
+        let store = Store::open(&path).expect("store opens");
+        let mut app = fixture_app();
+        app.detail.push(DetailView {
+            hood: MemoryNeighborhood {
+                memory_id: "mem-1".to_string(),
+                kind: "decision".to_string(),
+                content: "use sqlite WAL for the store".to_string(),
+                neighbors: Vec::new(),
+            },
+            lifecycle_state: None,
+            created_at: None,
+            last_accessed_at: None,
+            selected: 0,
+        });
+
+        // No neighbors: g and j/k are inert inside the detail.
+        handle_key(&mut app, key(KeyCode::Char('g')), &store);
+        assert_eq!(app.detail.len(), 1);
+        handle_key(&mut app, key(KeyCode::Char('j')), &store);
+        assert_eq!(app.detail[0].selected, 0);
+
+        // A neighbor that is not in the store surfaces a status, not a push.
+        app.detail[0].hood.neighbors.push(MemoryNeighbor {
+            memory_id: "mem-ghost".to_string(),
+            kind: "observation".to_string(),
+            content: "gone".to_string(),
+            link_type: "co_occurrence".to_string(),
+            link_strength: 0.5,
+            last_reinforced_at: 0,
+            lifecycle_state: "active".to_string(),
+        });
+        handle_key(&mut app, key(KeyCode::Char('g')), &store);
+        assert_eq!(app.detail.len(), 1);
+        assert!(
+            app.status
+                .as_deref()
+                .expect("status set")
+                .contains("not in a recallable state")
+        );
+
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn step_clamps_and_human_size_picks_units() {
+        assert_eq!(step(0, 0, true), 0);
+        assert_eq!(step(0, 5, false), 0);
+        assert_eq!(step(3, 0, true), 1);
+        assert_eq!(step(3, 2, true), 2);
+        assert_eq!(step(3, 0, false), 0);
+        assert_eq!(step(3, 2, false), 1);
+
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(2 * 1024), "2.0 KiB");
+        assert_eq!(human_size(3 * 1024 * 1024 / 2), "1.5 MiB");
+        assert_eq!(human_size(2 * 1024 * 1024 * 1024), "2.0 GiB");
+    }
 }

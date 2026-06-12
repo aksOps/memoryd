@@ -363,6 +363,19 @@ fn recall(cli: Cli, args: RecallArgs) -> Result<(), CliError> {
 /// pauses and resumes rather than flooding the worker; re-runs are idempotent
 /// via content-hash dedup.
 fn import(cli: Cli, args: ImportArgs) -> Result<(), CliError> {
+    let home = integrate::home_dir();
+    let xdg = env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+    import_from_env(cli, args, &home, xdg.as_deref())
+}
+
+/// [`import`] with the environment (home directory, XDG data dir) already
+/// resolved, so tests can run agent imports against a synthetic home tree.
+fn import_from_env(
+    cli: Cli,
+    args: ImportArgs,
+    home: &Path,
+    xdg_data_home: Option<&Path>,
+) -> Result<(), CliError> {
     let cfg = cli.config()?;
     cfg.validate()?;
 
@@ -382,15 +395,13 @@ fn import(cli: Cli, args: ImportArgs) -> Result<(), CliError> {
         }
         "claude" | "codex" | "opencode" | "hermes" => {
             let mut store = Store::open(&cfg.db_path)?;
-            let home = integrate::home_dir();
-            let xdg = env::var_os("XDG_DATA_HOME").map(PathBuf::from);
             let override_path = (!args.path.is_empty()).then(|| PathBuf::from(&args.path));
             let run = import_sources::run_agent_import(
                 &mut store,
                 &args.source,
                 override_path.as_deref(),
-                &home,
-                xdg.as_deref(),
+                home,
+                xdg_data_home,
                 cfg.caps.queue_depth_max,
             )?;
             outln!("{}", serde_json::to_string(&agent_import_value(&run))?);
@@ -398,11 +409,9 @@ fn import(cli: Cli, args: ImportArgs) -> Result<(), CliError> {
         }
         "agents" => {
             let mut store = Store::open(&cfg.db_path)?;
-            let home = integrate::home_dir();
-            let xdg = env::var_os("XDG_DATA_HOME").map(PathBuf::from);
             let mut agents = Vec::new();
             for agent in integrate::KNOWN_AGENTS {
-                if !integrate::detect(agent, &home) {
+                if !integrate::detect(agent, home) {
                     agents.push(serde_json::json!({ "agent": agent, "detected": false }));
                     continue;
                 }
@@ -410,8 +419,8 @@ fn import(cli: Cli, args: ImportArgs) -> Result<(), CliError> {
                     &mut store,
                     agent,
                     None,
-                    &home,
-                    xdg.as_deref(),
+                    home,
+                    xdg_data_home,
                     cfg.caps.queue_depth_max,
                 )?;
                 let mut entry = serde_json::Map::new();
@@ -2912,6 +2921,259 @@ mod tests {
 
         let _ = fs::remove_file(&src);
         cleanup_db_files(&db);
+    }
+
+    #[test]
+    fn import_jsonl_missing_file_is_an_error() {
+        let db = temp_db_path("import-missing-jsonl");
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "import",
+                "--source",
+                "jsonl",
+                "--path",
+                "/nonexistent/never-there.jsonl",
+                "--db",
+                db.to_str().expect("path is UTF-8"),
+            ]
+            .map(OsString::from),
+        )
+        .expect("cli parses");
+        let Command::Import(args) = cli.command.clone() else {
+            panic!("expected import command");
+        };
+
+        let err = import(cli, args).expect_err("missing jsonl file fails");
+        assert!(matches!(err, CliError::Store(_)), "got: {err}");
+
+        cleanup_db_files(&db);
+    }
+
+    /// A one-line Claude session transcript whose user message carries `word`.
+    fn claude_transcript(word: &str) -> String {
+        format!(
+            "{{\"type\":\"user\",\"sessionId\":\"s-{word}\",\"message\":{{\"content\":\"prefer {word} for migrations\"}}}}\n"
+        )
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "memoryd-main-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir creates");
+        dir
+    }
+
+    #[test]
+    fn import_command_stages_agent_source_via_path_override() {
+        let db = temp_db_path("import-agent-cmd");
+        let tree = temp_dir("import-agent-tree");
+        fs::create_dir_all(tree.join("proj")).expect("project dir");
+        fs::write(tree.join("proj/s1.jsonl"), claude_transcript("flyway")).expect("fixture");
+
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "import",
+                "--source",
+                "claude",
+                "--path",
+                tree.to_str().expect("path is UTF-8"),
+                "--db",
+                db.to_str().expect("path is UTF-8"),
+            ]
+            .map(OsString::from),
+        )
+        .expect("cli parses");
+        let Command::Import(args) = cli.command.clone() else {
+            panic!("expected import command");
+        };
+
+        import(cli, args).expect("agent import succeeds");
+
+        let store = Store::open(&db).expect("store opens");
+        let stats = store.table_stats().expect("table stats");
+        assert_eq!(table_rows(&stats, "raw_events"), 1);
+        assert_eq!(table_rows(&stats, "import_batches"), 1);
+
+        let _ = fs::remove_dir_all(&tree);
+        cleanup_db_files(&db);
+    }
+
+    #[test]
+    fn import_agents_source_reports_detection_per_agent() {
+        let db = temp_db_path("import-agents-cmd");
+        let home = temp_dir("import-agents-home");
+        fs::create_dir_all(home.join(".claude/projects/proj")).expect("claude tree");
+        fs::write(
+            home.join(".claude/projects/proj/s1.jsonl"),
+            claude_transcript("sqitch"),
+        )
+        .expect("fixture");
+
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "import",
+                "--source",
+                "agents",
+                "--db",
+                db.to_str().expect("path is UTF-8"),
+            ]
+            .map(OsString::from),
+        )
+        .expect("cli parses");
+        let Command::Import(args) = cli.command.clone() else {
+            panic!("expected import command");
+        };
+
+        // Only Claude is "installed" in the synthetic home: its history imports,
+        // the other known agents report detected=false without running.
+        import_from_env(cli, args, &home, None).expect("agents import succeeds");
+
+        let store = Store::open(&db).expect("store opens");
+        let stats = store.table_stats().expect("table stats");
+        assert_eq!(table_rows(&stats, "raw_events"), 1);
+        assert_eq!(table_rows(&stats, "import_batches"), 1);
+
+        let _ = fs::remove_dir_all(&home);
+        cleanup_db_files(&db);
+    }
+
+    #[test]
+    fn import_agent_database_read_errors_propagate() {
+        let db = temp_db_path("import-agent-err");
+        let home = temp_dir("import-agent-err-home");
+        fs::write(home.join("opencode.db"), "not a sqlite database").expect("fixture");
+
+        // Single agent: an override pointing at a bogus database is a hard error.
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "import",
+                "--source",
+                "opencode",
+                "--path",
+                home.join("opencode.db").to_str().expect("path is UTF-8"),
+                "--db",
+                db.to_str().expect("path is UTF-8"),
+            ]
+            .map(OsString::from),
+        )
+        .expect("cli parses");
+        let Command::Import(args) = cli.command.clone() else {
+            panic!("expected import command");
+        };
+        let err = import_from_env(cli, args, &home, None).expect_err("bogus database fails");
+        assert!(matches!(err, CliError::Store(_)), "got: {err}");
+
+        // Agents fan-out: a detected agent with an unreadable database fails the run.
+        fs::create_dir_all(home.join(".hermes")).expect("hermes dir");
+        fs::write(home.join(".hermes/state.db"), "not a sqlite database").expect("fixture");
+        let cli = Cli::parse(
+            [
+                "memoryd",
+                "import",
+                "--source",
+                "agents",
+                "--db",
+                db.to_str().expect("path is UTF-8"),
+            ]
+            .map(OsString::from),
+        )
+        .expect("cli parses");
+        let Command::Import(args) = cli.command.clone() else {
+            panic!("expected import command");
+        };
+        let err = import_from_env(cli, args, &home, None).expect_err("agents run fails");
+        assert!(matches!(err, CliError::Store(_)), "got: {err}");
+
+        let _ = fs::remove_dir_all(&home);
+        cleanup_db_files(&db);
+    }
+
+    #[test]
+    fn agent_import_value_aggregates_summaries_and_notes() {
+        use memoryd_core::import::ImportSummary;
+
+        let summary = |path: &str, processed: usize, state: &str| ImportSummary {
+            batch_id: format!("batch-{state}"),
+            source: "claude-session".to_string(),
+            path: path.to_string(),
+            total: 3,
+            processed,
+            skipped: 3 - processed,
+            state: state.to_string(),
+        };
+        let run = import_sources::ImportRun {
+            source: "claude-session".to_string(),
+            files: vec![
+                import_sources::ImportFileOutcome {
+                    path: "/tmp/a.jsonl".to_string(),
+                    summary: Some(summary("/tmp/a.jsonl", 2, "completed")),
+                    note: None,
+                },
+                import_sources::ImportFileOutcome {
+                    path: "/tmp/big.jsonl".to_string(),
+                    summary: None,
+                    note: Some("skipped: file exceeds 64 MiB cap".to_string()),
+                },
+                import_sources::ImportFileOutcome {
+                    path: "/tmp/b.jsonl".to_string(),
+                    summary: Some(summary("/tmp/b.jsonl", 1, "paused")),
+                    note: None,
+                },
+            ],
+        };
+
+        let value = agent_import_value(&run);
+        assert_eq!(value["source"], "claude-session");
+        assert_eq!(value["total"], 6, "noted files add nothing to the counters");
+        assert_eq!(value["processed"], 3);
+        assert_eq!(value["skipped"], 3);
+        assert_eq!(value["state"], "paused", "any paused batch pauses the run");
+        let batches = value["batches"].as_array().expect("batches array");
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0]["batch_id"], "batch-completed");
+        assert_eq!(batches[1]["note"], "skipped: file exceeds 64 MiB cap");
+        assert_eq!(batches[2]["state"], "paused");
+
+        // All-completed runs (and empty ones) report "completed".
+        let empty = agent_import_value(&import_sources::ImportRun {
+            source: "codex-session".to_string(),
+            files: Vec::new(),
+        });
+        assert_eq!(empty["state"], "completed");
+        assert_eq!(empty["total"], 0);
+    }
+
+    #[test]
+    fn tui_command_refuses_when_stdout_is_not_a_terminal() {
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() {
+            return; // interactive `cargo test` run: the non-tty guard cannot trip
+        }
+        let path = temp_db_path("tui-no-tty");
+
+        let err = run([
+            "memoryd",
+            "tui",
+            "--db",
+            path.to_str().expect("path is UTF-8"),
+        ]
+        .map(OsString::from))
+        .expect_err("tui refuses to start without a terminal");
+
+        assert!(matches!(err, CliError::TuiNotATerminal), "got: {err}");
+        assert!(
+            err.to_string().contains("interactive terminal"),
+            "message: {err}"
+        );
+        cleanup_db_files(&path);
     }
 
     #[test]

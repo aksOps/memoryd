@@ -602,4 +602,278 @@ mod tests {
         assert!(matches!(err, CliError::UnknownAgent(name) if name == "emacs"));
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    /// A two-record Codex rollout whose user message carries `word`.
+    fn codex_rollout_body(word: &str) -> String {
+        format!(
+            "{{\"timestamp\":\"2024-02-01T08:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"c-{word}\"}}}}\n\
+             {{\"timestamp\":\"2024-02-01T08:00:01Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"ship {word} today\"}}]}}}}\n"
+        )
+    }
+
+    #[test]
+    fn run_agent_import_stages_codex_discovery_and_overrides() {
+        let home = tmp_home("codex-e2e");
+        write(
+            &home.join(".codex/sessions/2024/02/01/rollout-a.jsonl"),
+            &codex_rollout_body("turbofish"),
+        );
+        let mut store = test_store(&home);
+
+        // Discovery against home stages the rollout's single user unit.
+        let run = run_agent_import(&mut store, "codex", None, &home, None, 100)
+            .expect("codex import succeeds");
+        assert_eq!(run.source, "codex-session");
+        assert_eq!(run.files.len(), 1);
+        let summary = run.files[0].summary.as_ref().expect("summary");
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.processed, 1);
+        assert_eq!(summary.state, "completed");
+
+        // File override imports exactly that file; a directory override walks
+        // recursively (same bounded walk as discovery).
+        let exported = home.join("exported");
+        write(
+            &exported.join("deep/nest/rollout-b.jsonl"),
+            &codex_rollout_body("rayon"),
+        );
+        let single = run_agent_import(
+            &mut store,
+            "codex",
+            Some(&exported.join("deep/nest/rollout-b.jsonl")),
+            &home,
+            None,
+            100,
+        )
+        .expect("file override imports");
+        assert_eq!(single.files.len(), 1);
+        assert_eq!(single.files[0].summary.as_ref().expect("summary").total, 1);
+
+        let tree = run_agent_import(&mut store, "codex", Some(&exported), &home, None, 100)
+            .expect("dir override imports");
+        assert_eq!(tree.files.len(), 1);
+        assert!(tree.files[0].path.ends_with("rollout-b.jsonl"));
+        let resumed = tree.files[0].summary.as_ref().expect("summary");
+        assert_eq!(resumed.processed, 0, "re-import dedups to skipped");
+        assert_eq!(resumed.skipped, 1);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn run_agent_import_notes_unreadable_and_content_free_files() {
+        let home = tmp_home("claude-notes");
+        write(&home.join(".claude/projects/proj/aa-empty.jsonl"), "{}\n");
+        let bad = home.join(".claude/projects/proj/bb-bad.jsonl");
+        std::fs::write(&bad, [0xff, 0xfe, 0xfd]).expect("write invalid UTF-8 fixture");
+        let mut store = test_store(&home);
+
+        let run = run_agent_import(&mut store, "claude", None, &home, None, 100)
+            .expect("notes, not errors");
+        assert_eq!(run.files.len(), 2);
+        assert!(run.files[0].summary.is_none());
+        assert_eq!(
+            run.files[0].note.as_deref(),
+            Some("skipped: no importable content")
+        );
+        let unreadable = run.files[1].note.as_deref().expect("note present");
+        assert!(
+            unreadable.starts_with("skipped: unreadable ("),
+            "note: {unreadable}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn run_agent_import_stops_at_first_paused_batch() {
+        let home = tmp_home("claude-paused");
+        write(
+            &home.join(".claude/projects/proj/a1.jsonl"),
+            &claude_session_body("alpha"),
+        );
+        write(
+            &home.join(".claude/projects/proj/a2.jsonl"),
+            &claude_session_body("beta"),
+        );
+        let mut store = test_store(&home);
+
+        // max_active_jobs = 0: the embed queue counts as full before the first
+        // unit, so the first batch pauses and the second file is never staged.
+        let run = run_agent_import(&mut store, "claude", None, &home, None, 0)
+            .expect("paused run still succeeds");
+        assert_eq!(run.files.len(), 1, "stops after the first paused batch");
+        let summary = run.files[0].summary.as_ref().expect("summary");
+        assert_eq!(summary.state, "paused");
+        assert_eq!(summary.processed, 0);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn run_agent_import_claude_override_missing_dir_is_empty_run() {
+        let home = tmp_home("claude-missing-override");
+        let mut store = test_store(&home);
+        let run = run_agent_import(
+            &mut store,
+            "claude",
+            Some(&home.join("nope")),
+            &home,
+            None,
+            100,
+        )
+        .expect("missing override dir is an empty run");
+        assert_eq!(run.source, "claude-session");
+        assert!(run.files.is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn discovery_walks_cap_at_max_import_files() {
+        let home = tmp_home("walk-cap");
+        let flood = home.join("flood");
+        std::fs::create_dir_all(&flood).unwrap();
+        for i in 0..=MAX_IMPORT_FILES {
+            std::fs::write(flood.join(format!("f{i:05}.jsonl")), "{}").unwrap();
+        }
+
+        let mut flat = Vec::new();
+        push_jsonl_in_dir(&flood, &mut flat);
+        assert_eq!(flat.len(), MAX_IMPORT_FILES);
+
+        let mut recursive = Vec::new();
+        collect_jsonl_recursive(&flood, MAX_WALK_DEPTH, &mut recursive);
+        assert_eq!(recursive.len(), MAX_IMPORT_FILES);
+
+        // Missing directories discover nothing instead of erroring.
+        assert!(codex_session_files(&home.join("nope")).is_empty());
+        let mut none = Vec::new();
+        push_jsonl_in_dir(&home.join("nope"), &mut none);
+        assert!(none.is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolve_db_handles_every_override_form() {
+        let home = tmp_home("resolve-db");
+        let file = home.join("custom.db");
+        write(&file, "stub");
+
+        // Explicit file override: used as-is, regardless of its name.
+        assert_eq!(
+            resolve_db(Some(&file), "state.db", || unreachable!()),
+            Ok(file.clone())
+        );
+
+        // Directory override: probed for the conventional database name.
+        let with_db = home.join("with-db");
+        write(&with_db.join("state.db"), "stub");
+        assert_eq!(
+            resolve_db(Some(&with_db), "state.db", || unreachable!()),
+            Ok(with_db.join("state.db"))
+        );
+        assert_eq!(
+            resolve_db(Some(&home.join("empty")), "state.db", || unreachable!()),
+            Err(home.join("empty/state.db"))
+        );
+
+        // No override: discovery decides.
+        assert_eq!(
+            resolve_db(None, "state.db", || Err(PathBuf::from("/probe"))),
+            Err(PathBuf::from("/probe"))
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn import_db_stages_units_notes_empty_and_propagates_read_errors() {
+        use memoryd_core::import::ImportError;
+
+        fn read_two(_: &Path) -> Result<Vec<ImportUnit>, ImportError> {
+            Ok(["[user] hello", "[assistant] hi"]
+                .iter()
+                .map(|text| ImportUnit {
+                    text: (*text).to_string(),
+                    session_id: "h1".to_string(),
+                    agent: "hermes".to_string(),
+                    source: "hermes-session".to_string(),
+                    ts_ms: Some(1_700_000_000_000),
+                })
+                .collect())
+        }
+        fn read_empty(_: &Path) -> Result<Vec<ImportUnit>, ImportError> {
+            Ok(Vec::new())
+        }
+        fn read_fails(_: &Path) -> Result<Vec<ImportUnit>, ImportError> {
+            Err(ImportError::Db("database is locked".to_string()))
+        }
+
+        let home = tmp_home("import-db");
+        let db = home.join("state.db");
+        write(&db, "stub");
+        let mut store = test_store(&home);
+
+        let run = import_db(&mut store, "hermes-session", Ok(db.clone()), read_two, 100)
+            .expect("units stage");
+        assert_eq!(run.files.len(), 1);
+        let summary = run.files[0].summary.as_ref().expect("summary");
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.processed, 2);
+        assert_eq!(summary.state, "completed");
+
+        let empty = import_db(
+            &mut store,
+            "hermes-session",
+            Ok(db.clone()),
+            read_empty,
+            100,
+        )
+        .expect("empty db is a note");
+        assert!(empty.files[0].summary.is_none());
+        assert_eq!(
+            empty.files[0].note.as_deref(),
+            Some("skipped: no importable content")
+        );
+
+        let err = import_db(
+            &mut store,
+            "hermes-session",
+            Ok(db.clone()),
+            read_fails,
+            100,
+        )
+        .expect_err("a read failure on an existing db is a hard error");
+        assert!(matches!(err, CliError::Store(_)));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn run_agent_import_opencode_notes_absence_and_rejects_bogus_db() {
+        let home = tmp_home("opencode-run");
+        let mut store = test_store(&home);
+
+        // No override, no conventional database: a "not found" note.
+        let run = run_agent_import(
+            &mut store,
+            "opencode",
+            None,
+            &home,
+            Some(&home.join("xdg")),
+            100,
+        )
+        .expect("absent db is a note, not an error");
+        assert_eq!(run.source, "opencode-session");
+        assert_eq!(run.files.len(), 1);
+        let note = run.files[0].note.as_deref().expect("note present");
+        assert!(
+            note.starts_with("not found: ") && note.contains("opencode/opencode.db"),
+            "note: {note}"
+        );
+
+        // An override pointing at a non-SQLite file is a hard error: the
+        // database exists but cannot be read, which the user must act on.
+        let bogus = home.join("opencode.db");
+        write(&bogus, "not a sqlite database");
+        let err = run_agent_import(&mut store, "opencode", Some(&bogus), &home, None, 100)
+            .expect_err("unreadable db is a hard error");
+        assert!(matches!(err, CliError::Store(_)));
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
