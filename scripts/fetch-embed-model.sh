@@ -29,7 +29,11 @@ fetch_one() {
         return 0
     fi
     echo "fetching $name ..."
-    python3 - "$url" "$dst.tmp" <<'PY'
+    # Hugging Face rate-limits bursty CI traffic (HTTP 429); retry with
+    # backoff before giving up.
+    attempt=1
+    while true; do
+        if python3 - "$url" "$dst.tmp" <<'PY'
 import sys, urllib.request
 url, dst = sys.argv[1], sys.argv[2]
 req = urllib.request.Request(url, headers={"User-Agent": "memoryd-build"})
@@ -40,6 +44,18 @@ with urllib.request.urlopen(req, timeout=300) as r, open(dst, "wb") as f:
             break
         f.write(chunk)
 PY
+        then
+            break
+        fi
+        if [ "$attempt" -ge 4 ]; then
+            echo "FATAL: download failed for $name after $attempt attempts" >&2
+            rm -f "$dst.tmp"
+            exit 1
+        fi
+        echo "download failed for $name (attempt $attempt); retrying in $((attempt * 20))s ..."
+        sleep $((attempt * 20))
+        attempt=$((attempt + 1))
+    done
     if ! sha256_ok "$sha" "$dst.tmp"; then
         echo "FATAL: sha256 mismatch for $name" >&2
         rm -f "$dst.tmp"
