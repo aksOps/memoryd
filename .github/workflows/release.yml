@@ -73,49 +73,78 @@ jobs:
             target: x86_64-unknown-linux-gnu
             npm_os: linux
             npm_cpu: x64
+            smoke: true
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             npm_os: linux
             npm_cpu: arm64
+            smoke: true
           - runner: macos-14
             target: aarch64-apple-darwin
             npm_os: darwin
             npm_cpu: arm64
-          - runner: macos-13
+            smoke: true
+          # GitHub retired the Intel macos-13 runners; cross-compile the
+          # x64 binary on the arm64 runner instead (same Xcode SDK). The
+          # smoke test is skipped because Rosetta is not guaranteed on
+          # hosted arm64 runners.
+          - runner: macos-14
             target: x86_64-apple-darwin
             npm_os: darwin
             npm_cpu: x64
+            smoke: false
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup target add "$TARGET" --toolchain 1.95.0
 
       - name: Fetch embed model (sha256-pinned; build.rs re-verifies)
         run: bash scripts/fetch-embed-model.sh
 
       - name: Build release binary
-        run: cargo build --release --locked -p memoryd
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked -p memoryd --target "$TARGET"
 
       - name: Smoke-test binary
+        if: ${{ matrix.smoke }}
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          target/release/memoryd --version
-          target/release/memoryd doctor --db /tmp/release-smoke.db
+          "target/$TARGET/release/memoryd" --version
+          "target/$TARGET/release/memoryd" doctor --db /tmp/release-smoke.db
           rm -f /tmp/release-smoke.db*
 
-      - name: Publish platform npm package
+      - name: Publish platform npm package (idempotent)
         env:
           NODE_AUTH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
           NPM_OS: ${{ matrix.npm_os }}
           NPM_CPU: ${{ matrix.npm_cpu }}
         run: |
           node npm/scripts/make-platform-package.js \
-            "platform-pkg" "$NPM_OS" "$NPM_CPU" target/release/memoryd
-          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
+            "platform-pkg" "$NPM_OS" "$NPM_CPU" "target/$TARGET/release/memoryd"
+          # Scope mapping is required for npm view (publishConfig only
+          # affects npm publish), otherwise the idempotency check queries
+          # the default npmjs registry and always misses.
+          printf '%s\n%s\n' \
+            "@aksops:registry=https://npm.pkg.github.com" \
+            "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
           cd platform-pkg
-          npm publish
+          NAME="$(node -p "require('./package.json').name")"
+          VERSION="$(node -p "require('./package.json').version")"
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "$NAME@$VERSION already published; skipping"
+          else
+            npm publish
+          fi
 
       - name: Upload release asset (convenience for non-npm consumers)
         env:
@@ -124,7 +153,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           ASSET="memoryd-${TARGET}.tar.gz"
-          tar -C target/release -czf "$ASSET" memoryd
+          tar -C "target/$TARGET/release" -czf "$ASSET" memoryd
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$ASSET" > "$ASSET.sha256"
           else
@@ -158,6 +187,17 @@ jobs:
             );
             fs.writeFileSync("npm/package.json", JSON.stringify(p, null, 2) + "\n");
           '
-          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
+          # Scope mapping is required for npm view (publishConfig only
+          # affects npm publish), otherwise the idempotency check queries
+          # the default npmjs registry and always misses.
+          printf '%s\n%s\n' \
+            "@aksops:registry=https://npm.pkg.github.com" \
+            "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
           cd npm
-          npm publish
+          NAME="$(node -p "require('./package.json').name")"
+          VERSION="$(node -p "require('./package.json').version")"
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "$NAME@$VERSION already published; skipping"
+          else
+            npm publish
+          fi
