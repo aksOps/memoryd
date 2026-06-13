@@ -6,7 +6,10 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+# 0.0.0 is a permanent placeholder: the real version lives only in git tags and
+# is injected into release builds via MEMORYD_RELEASE_VERSION (see the release
+# workflow and crate::VERSION). main never carries a real version bump.
+version = "0.0.0"
 edition = "2024"
 rust-version = "1.95.0"
 license = "MIT OR Apache-2.0"

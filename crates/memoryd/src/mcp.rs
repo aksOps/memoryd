@@ -180,7 +180,7 @@ fn initialize_result() -> serde_json::Value {
     serde_json::json!({
         "protocolVersion": MCP_PROTOCOL_VERSION,
         "capabilities": { "tools": {}, "resources": {} },
-        "serverInfo": { "name": "memoryd", "version": env!("CARGO_PKG_VERSION") },
+        "serverInfo": { "name": "memoryd", "version": crate::VERSION },
         "instructions": "Local memory store and owner persona. Call memory_profile at \
                          session start and adopt its facts, preferences, and decision \
                          heuristics as the owner's standing positions. Use memory_recall \

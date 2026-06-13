@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-memoryd-core = { path = "../memoryd-core", version = "0.1.0" }
+memoryd-core = { path = "../memoryd-core", version = "0.0.0" }
 serde_json = { version = "1.0.150", default-features = false, features = ["std"] }
 # Graceful shutdown only (SIGTERM/SIGINT -> AtomicBool). Installing a signal
 # handler is impossible in safe std; this is the canonical minimal choice and
