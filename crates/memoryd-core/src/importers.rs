@@ -337,6 +337,30 @@ struct OpencodeMessage {
 }
 
 impl OpencodeMessage {
+    /// Build a message header from the per-message columns shared by every part
+    /// row. Returns `None` (dropping the whole message) when the session or
+    /// role is missing/unsupported — only `user`/`assistant` turns import,
+    /// matching the lenient skip contract.
+    fn from_data(
+        session_id: Option<&str>,
+        message_data: Option<&str>,
+        ts_ms: Option<i64>,
+    ) -> Option<Self> {
+        let session = session_id?.to_string();
+        let data: serde_json::Value = serde_json::from_str(message_data?).ok()?;
+        let role = match data.get("role").and_then(serde_json::Value::as_str) {
+            Some(role @ ("user" | "assistant")) => role.to_string(),
+            _ => return None, // unknown roles: skip the whole message
+        };
+        Some(Self {
+            role,
+            session,
+            ts_ms,
+            texts: Vec::new(),
+            tools: Vec::new(),
+        })
+    }
+
     fn flush_into(self, units: &mut Vec<ImportUnit>) {
         const AGENT: &str = "opencode";
         const SOURCE: &str = "opencode-session";
@@ -378,35 +402,224 @@ fn opencode_tool_text(content: &str) -> Option<String> {
     }
 }
 
-/// Import an OpenCode SQLite database (`messages` joined with `parts`).
-///
-/// The schema is introspected defensively first; a layout this importer does
-/// not recognize returns [`ImportError::UnsupportedSchema`] rather than
-/// guessing. Per-row extraction failures skip the row.
-pub fn read_opencode_db(path: &Path) -> Result<Vec<ImportUnit>, ImportError> {
-    const AGENT: &str = "opencode";
-    let conn = open_readonly(path)?;
-    for table in ["sessions", "messages", "parts"] {
-        if !table_exists(&conn, table)? {
-            return Err(unsupported(AGENT, format!("missing table \"{table}\"")));
+/// A single part row normalized for [`accumulate_opencode`]: the per-message
+/// identity columns plus this part's already-extracted `payload` (the prose of
+/// a text part, or the output of a tool part). `kind` is the lowercased part
+/// type; `payload` is `None` when the part carries nothing importable.
+struct OpencodePart {
+    message_id: String,
+    session_id: Option<String>,
+    message_data: Option<String>,
+    ts_ms: Option<i64>,
+    kind: String,
+    payload: Option<String>,
+}
+
+/// Fold an ordered stream of part rows into import units: consecutive parts of
+/// the same message accumulate (text parts concatenate into one role unit, tool
+/// parts each become a `[tool]` unit) and flush when the message id changes.
+/// Shared by both OpenCode schema readers; per-row gaps are silently skipped.
+fn accumulate_opencode(parts: impl Iterator<Item = OpencodePart>) -> Vec<ImportUnit> {
+    let mut units = Vec::new();
+    let mut current_id: Option<String> = None;
+    let mut pending: Option<OpencodeMessage> = None;
+    for part in parts {
+        if current_id.as_deref() != Some(part.message_id.as_str()) {
+            if let Some(done) = pending.take() {
+                done.flush_into(&mut units);
+            }
+            current_id = Some(part.message_id);
+            pending = OpencodeMessage::from_data(
+                part.session_id.as_deref(),
+                part.message_data.as_deref(),
+                part.ts_ms,
+            );
+        }
+        let Some(message) = pending.as_mut() else {
+            continue; // message skipped (unknown role / bad header)
+        };
+        let Some(payload) = part.payload else {
+            continue; // part carries no importable text
+        };
+        if part.kind.contains("text") {
+            message.texts.push(payload);
+        } else if part.kind.contains("tool") {
+            message.tools.push(payload);
         }
     }
-    let message_columns = table_columns(&conn, "messages")?;
-    require_columns(
-        AGENT,
-        "messages",
-        &message_columns,
-        &["id", "session_id", "data"],
-    )?;
-    let time_column = ["time_created", "created_at", "created", "time"]
+    if let Some(done) = pending.take() {
+        done.flush_into(&mut units);
+    }
+    units
+}
+
+/// The first recognized message time column, shared by both OpenCode readers.
+fn opencode_time_column(
+    agent: &'static str,
+    message_columns: &[String],
+) -> Result<&'static str, ImportError> {
+    ["time_created", "created_at", "created", "time"]
         .into_iter()
         .find(|candidate| {
             message_columns
                 .iter()
                 .any(|col| col.eq_ignore_ascii_case(candidate))
         })
-        .ok_or_else(|| unsupported(AGENT, "table \"messages\" has no recognized time column"))?;
-    let part_columns = table_columns(&conn, "parts")?;
+        .ok_or_else(|| unsupported(agent, "message table has no recognized time column"))
+}
+
+/// Import an OpenCode SQLite database.
+///
+/// Two on-disk layouts are recognized. Current OpenCode uses singular
+/// `session`/`message`/`part` tables whose `part.data` JSON carries the part
+/// type and text; older databases used plural `sessions`/`messages`/`parts`
+/// with `type`/`content` columns on `parts`. The schema is introspected
+/// defensively and an unrecognized layout returns
+/// [`ImportError::UnsupportedSchema`] rather than guessing. Per-row extraction
+/// failures skip the row.
+pub fn read_opencode_db(path: &Path) -> Result<Vec<ImportUnit>, ImportError> {
+    let conn = open_readonly(path)?;
+    if table_exists(&conn, "message")? && table_exists(&conn, "part")? {
+        read_opencode_current(&conn)
+    } else {
+        read_opencode_legacy(&conn)
+    }
+}
+
+/// Run `sql`, map each row's column values through `to_part`, and fold the
+/// results into import units. Centralizes the statement-prep and row-iteration
+/// boilerplate the two OpenCode schema readers would otherwise duplicate.
+fn query_opencode_parts(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    to_part: impl Fn(&[rusqlite::types::Value]) -> Option<OpencodePart>,
+) -> Result<Vec<ImportUnit>, ImportError> {
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|err| ImportError::Db(err.to_string()))?;
+    let columns = stmt.column_count();
+    let rows = stmt
+        .query_map([], |row| {
+            (0..columns)
+                .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(|err| ImportError::Db(err.to_string()))?;
+    let parts = rows.filter_map(|row| to_part(&row.ok()?));
+    Ok(accumulate_opencode(parts))
+}
+
+/// Assemble one [`OpencodePart`] from the per-message column values shared by
+/// both schemas, given this part's already-extracted `kind` and `payload`.
+fn opencode_part(
+    message_id: String,
+    session_id: &rusqlite::types::Value,
+    message_data: &rusqlite::types::Value,
+    time: &rusqlite::types::Value,
+    kind: String,
+    payload: Option<String>,
+) -> OpencodePart {
+    OpencodePart {
+        message_id,
+        session_id: value_to_string(session_id),
+        message_data: value_to_string(message_data),
+        ts_ms: value_to_unix_ms(time),
+        kind,
+        payload,
+    }
+}
+
+/// Current OpenCode schema: `message ⋈ part`, where each part's type and
+/// payload live in the `part.data` JSON (`$.type`, `$.text`, and a tool part's
+/// `$.state.output`).
+fn read_opencode_current(conn: &rusqlite::Connection) -> Result<Vec<ImportUnit>, ImportError> {
+    const AGENT: &str = "opencode";
+    let message_columns = table_columns(conn, "message")?;
+    require_columns(
+        AGENT,
+        "message",
+        &message_columns,
+        &["id", "session_id", "data"],
+    )?;
+    let time_column = opencode_time_column(AGENT, &message_columns)?;
+    require_columns(
+        AGENT,
+        "part",
+        &table_columns(conn, "part")?,
+        &["message_id", "data"],
+    )?;
+
+    // `time_column` comes from the fixed candidate list, never from input.
+    let sql = format!(
+        "SELECT m.id, m.session_id, m.data, m.{time_column}, p.data
+         FROM message m JOIN part p ON p.message_id = m.id
+         ORDER BY m.id, p.id"
+    );
+    query_opencode_parts(conn, &sql, |row| {
+        let [id, session, data, time, part_data] = row else {
+            return None;
+        };
+        let message_id = value_to_string(id)?;
+        let (kind, payload) = match value_to_string(part_data)
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        {
+            Some(part) => {
+                let kind = part
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                let payload = opencode_part_payload(&kind, &part);
+                (kind, payload)
+            }
+            None => (String::new(), None),
+        };
+        Some(opencode_part(
+            message_id, session, data, time, kind, payload,
+        ))
+    })
+}
+
+/// Extract the importable text from a current-schema `part.data` JSON object:
+/// the prose of a non-synthetic `text` part, or the completed output of a
+/// `tool` part (`$.state.output`). Reasoning, step, patch and compaction parts
+/// carry no conversational text and contribute nothing.
+fn opencode_part_payload(kind: &str, part: &serde_json::Value) -> Option<String> {
+    if kind.contains("text") {
+        if part.get("synthetic").and_then(serde_json::Value::as_bool) == Some(true) {
+            return None; // system-injected text, not user-authored
+        }
+        part.get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    } else if kind.contains("tool") {
+        part.get("state")
+            .and_then(|state| state.get("output"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    } else {
+        None
+    }
+}
+
+/// Legacy OpenCode schema: plural `sessions`/`messages`/`parts` tables with
+/// `type`/`content` columns on `parts`.
+fn read_opencode_legacy(conn: &rusqlite::Connection) -> Result<Vec<ImportUnit>, ImportError> {
+    const AGENT: &str = "opencode";
+    for table in ["sessions", "messages", "parts"] {
+        if !table_exists(conn, table)? {
+            return Err(unsupported(AGENT, format!("missing table \"{table}\"")));
+        }
+    }
+    let message_columns = table_columns(conn, "messages")?;
+    require_columns(
+        AGENT,
+        "messages",
+        &message_columns,
+        &["id", "session_id", "data"],
+    )?;
+    let time_column = opencode_time_column(AGENT, &message_columns)?;
+    let part_columns = table_columns(conn, "parts")?;
     require_columns(
         AGENT,
         "parts",
@@ -414,81 +627,32 @@ pub fn read_opencode_db(path: &Path) -> Result<Vec<ImportUnit>, ImportError> {
         &["message_id", "content", "type"],
     )?;
 
-    // `time_column` comes from the fixed candidate list above, never from input.
+    // `time_column` comes from the fixed candidate list, never from input.
     let sql = format!(
         "SELECT m.id, m.session_id, m.data, m.{time_column}, p.type, p.content
          FROM messages m JOIN parts p ON p.message_id = m.id
          ORDER BY m.rowid, p.rowid"
     );
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|err| ImportError::Db(err.to_string()))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, rusqlite::types::Value>(0)?,
-                row.get::<_, rusqlite::types::Value>(1)?,
-                row.get::<_, rusqlite::types::Value>(2)?,
-                row.get::<_, rusqlite::types::Value>(3)?,
-                row.get::<_, rusqlite::types::Value>(4)?,
-                row.get::<_, rusqlite::types::Value>(5)?,
-            ))
-        })
-        .map_err(|err| ImportError::Db(err.to_string()))?;
-
-    let mut units = Vec::new();
-    let mut current_id: Option<String> = None;
-    let mut pending: Option<OpencodeMessage> = None;
-    for row in rows {
-        let Ok((message_id, session_id, data, time, part_type, content)) = row else {
-            continue; // per-row read failure: skip, never fail the import
+    query_opencode_parts(conn, &sql, |row| {
+        let [id, session, data, time, part_type, content] = row else {
+            return None;
         };
-        let Some(message_id) = value_to_string(&message_id) else {
-            continue;
+        let message_id = value_to_string(id)?;
+        let kind = value_to_string(part_type)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let content = value_to_string(content);
+        let payload = if kind.contains("text") {
+            content
+        } else if kind.contains("tool") {
+            content.as_deref().and_then(opencode_tool_text)
+        } else {
+            None
         };
-        if current_id.as_deref() != Some(message_id.as_str()) {
-            if let Some(done) = pending.take() {
-                done.flush_into(&mut units);
-            }
-            current_id = Some(message_id);
-            pending = (|| {
-                let session = value_to_string(&session_id)?;
-                let data: serde_json::Value =
-                    serde_json::from_str(&value_to_string(&data)?).ok()?;
-                let role = match data.get("role").and_then(serde_json::Value::as_str) {
-                    Some(role @ ("user" | "assistant")) => role.to_string(),
-                    _ => return None, // unknown roles: skip the whole message
-                };
-                Some(OpencodeMessage {
-                    role,
-                    session,
-                    ts_ms: value_to_unix_ms(&time),
-                    texts: Vec::new(),
-                    tools: Vec::new(),
-                })
-            })();
-        }
-        let Some(message) = pending.as_mut() else {
-            continue;
-        };
-        let (Some(part_type), Some(content)) =
-            (value_to_string(&part_type), value_to_string(&content))
-        else {
-            continue;
-        };
-        let part_type = part_type.to_ascii_lowercase();
-        if part_type.contains("text") {
-            message.texts.push(content);
-        } else if part_type.contains("tool")
-            && let Some(text) = opencode_tool_text(&content)
-        {
-            message.tools.push(text);
-        }
-    }
-    if let Some(done) = pending.take() {
-        done.flush_into(&mut units);
-    }
-    Ok(units)
+        Some(opencode_part(
+            message_id, session, data, time, kind, payload,
+        ))
+    })
 }
 
 /// Import a Hermes SQLite database: a flat `messages` table with
@@ -824,6 +988,120 @@ mod tests {
                     if detail.contains("messages")
             ),
             "got: {err}"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    fn build_opencode_db_current(path: &Path) {
+        let conn = rusqlite::Connection::open(path).expect("create db");
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT);
+             CREATE TABLE message (
+                 id TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL,
+                 time_created INTEGER NOT NULL,
+                 data TEXT NOT NULL
+             );
+             CREATE TABLE part (
+                 id TEXT PRIMARY KEY,
+                 message_id TEXT NOT NULL,
+                 session_id TEXT NOT NULL,
+                 time_created INTEGER NOT NULL,
+                 data TEXT NOT NULL
+             );",
+        )
+        .expect("schema");
+        conn.execute(
+            "INSERT INTO session (id, title) VALUES ('ses_1', 'demo')",
+            [],
+        )
+        .expect("session row");
+        // role lives inside message.data JSON, not a column (current schema).
+        for (id, ts, data) in [
+            ("msg_1", 1_705_321_845_000_i64, r#"{"role":"user"}"#),
+            ("msg_2", 1_705_321_846_000_i64, r#"{"role":"assistant"}"#),
+        ] {
+            conn.execute(
+                "INSERT INTO message (id, session_id, time_created, data)
+                 VALUES (?1, 'ses_1', ?2, ?3)",
+                rusqlite::params![id, ts, data],
+            )
+            .expect("message row");
+        }
+        // part type/text/tool-output all live inside part.data JSON.
+        for (id, message, data) in [
+            ("prt_1", "msg_1", r#"{"type":"text","text":"first half"}"#),
+            ("prt_2", "msg_1", r#"{"type":"text","text":"second half"}"#),
+            (
+                "prt_3",
+                "msg_1",
+                r#"{"type":"text","synthetic":true,"text":"injected system context"}"#,
+            ),
+            (
+                "prt_4",
+                "msg_2",
+                r#"{"type":"reasoning","text":"thinking to myself"}"#,
+            ),
+            (
+                "prt_5",
+                "msg_2",
+                r#"{"type":"text","text":"assistant reply"}"#,
+            ),
+            (
+                "prt_6",
+                "msg_2",
+                r#"{"type":"tool","tool":"bash","state":{"status":"completed","output":"tool said hi"}}"#,
+            ),
+            (
+                "prt_7",
+                "msg_2",
+                r#"{"type":"tool","tool":"bash","state":{"status":"error","error":"boom"}}"#,
+            ),
+            (
+                "prt_8",
+                "msg_2",
+                r#"{"type":"step-finish","reason":"stop"}"#,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO part (id, message_id, session_id, time_created, data)
+                 VALUES (?1, ?2, 'ses_1', 0, ?3)",
+                rusqlite::params![id, message, data],
+            )
+            .expect("part row");
+        }
+    }
+
+    #[test]
+    fn read_opencode_current_schema_extracts_text_and_tool_parts() {
+        let path = temp_db_path("opencode-current");
+        build_opencode_db_current(&path);
+
+        // The dispatcher must detect the singular session/message/part schema.
+        let units = read_opencode_db(&path).expect("read succeeds");
+        assert_eq!(units.len(), 3, "units: {units:?}");
+        assert_eq!(units[0].text, "[user] first half\nsecond half");
+        assert_eq!(units[0].session_id, "ses_1");
+        assert_eq!(units[0].agent, "opencode");
+        assert_eq!(units[0].source, "opencode-session");
+        // time_created is already unix ms and passes through unscaled.
+        assert_eq!(units[0].ts_ms, Some(1_705_321_845_000));
+        assert_eq!(units[1].text, "[assistant] assistant reply");
+        assert_eq!(units[2].text, "[tool] tool said hi");
+        assert!(
+            units
+                .iter()
+                .all(|u| !u.text.contains("injected system context")),
+            "synthetic text parts are skipped"
+        );
+        assert!(
+            units.iter().all(|u| !u.text.contains("thinking to myself")),
+            "reasoning parts are not imported as conversation"
+        );
+        assert!(
+            units.iter().all(|u| !u.text.contains("boom")),
+            "errored tool parts (no output) are skipped"
         );
 
         let _ = fs::remove_file(&path);
