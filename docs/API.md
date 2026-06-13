@@ -76,6 +76,64 @@ Output JSON:
 }
 ```
 
+### `import`
+
+```bash
+memoryd import --source jsonl|claude|codex|opencode|hermes|agents [--path <file|dir|db>] [--db <path>]
+```
+
+Backfills historic data through the same capture path as `remember` (redaction
+included; no privileged path). Sources:
+
+- `jsonl` — one generic JSON object per line with a required `text` field;
+  `--path <file>` is required.
+- `claude` / `codex` — native session transcripts, auto-discovered under
+  `~/.claude/projects/*/*.jsonl` and `~/.codex/sessions/**/*.jsonl`; `--path`
+  optionally points at one file or an exported directory instead.
+- `opencode` / `hermes` — the agent's SQLite database
+  (`$XDG_DATA_HOME/opencode/opencode.db`, `~/.hermes/state.db`), opened
+  strictly read-only; `--path` optionally points at a copied database file or
+  its directory.
+- `agents` — every agent that `memoryd integrate` would detect, in one run.
+
+Re-runs are idempotent (content-hash dedup); a full embed queue pauses the run
+(`"state": "paused"`) and a re-run resumes it. Files over 64 MiB and files with
+no importable content are skipped with a per-file `note`. Each unit is
+role-prefixed (`[user]`/`[assistant]`/`[tool]`) and capped at 4,000 characters.
+
+`--source jsonl` keeps the original single-batch response:
+
+```json
+{"batch_id":"…","source":"jsonl","path":"hist.jsonl","total":2,"processed":2,"skipped":0,"state":"completed"}
+```
+
+Single-agent sources aggregate one batch per discovered file:
+
+```json
+{
+  "source": "claude-session",
+  "total": 12,
+  "processed": 12,
+  "skipped": 0,
+  "state": "completed",
+  "batches": [
+    {"path": "…/s1.jsonl", "batch_id": "…", "total": 8, "processed": 8, "skipped": 0, "state": "completed"},
+    {"path": "…/s2.jsonl", "note": "skipped: no importable content"}
+  ]
+}
+```
+
+`--source agents` wraps one such object per detected agent:
+
+```json
+{
+  "agents": [
+    {"agent": "claude", "detected": true, "source": "claude-session", "total": 12, "processed": 12, "skipped": 0, "state": "completed", "batches": ["…"]},
+    {"agent": "codex", "detected": false}
+  ]
+}
+```
+
 ### `serve`
 
 ```bash
@@ -91,6 +149,23 @@ OpenAI-shaped endpoint via `MEMORYD_OPENAI_BASE_URL` (api.openai.com, Ollama's
 `/v1`, vLLM, LM Studio) with `MEMORYD_OPENAI_API_KEY[_FILE]`,
 `MEMORYD_OPENAI_EMBED_MODEL`, `MEMORYD_OPENAI_CHAT_MODEL`, and
 `MEMORYD_OPENAI_USD_PER_1K`; it requires a non-zero `MEMORYD_SPEND_CAP_USD`.
+
+### `tui`
+
+```bash
+memoryd tui [--db <path>]
+```
+
+Local-only, read-only interactive store viewer (requires stdout to be a
+terminal). Five tabs — Memories, Sessions, Profile, Imports, Stats — browse
+the store through the same read paths the CLI and MCP server use: paged
+memory/session lists, `/` lexical search (the CLI recall path under the
+`null` adapter — never embeds), Enter for a memory's graph neighborhood
+(`g` re-centers on a neighbor), distilled session narratives, approved
+profile facts, import-batch progress, and table counts plus db path/size.
+No network bind, no provider calls, no writes beyond the access bookkeeping
+recall already performs. Keys: `Tab`/`1-5` switch tabs, `j`/`k`/arrows move,
+`Enter` open, `Esc` back, `q`/`Ctrl-C` quit.
 
 ## REST
 

@@ -38,7 +38,20 @@ cargo run -p memoryd -- remember "Prod migrations use flyway" --kind rule --tags
 cargo run -p memoryd -- recall "flyway migrations" --k 5 --db /tmp/memoryd.db
 cargo run -p memoryd -- serve --db /tmp/memoryd.db --bind 127.0.0.1:7077
 cargo run -p memoryd -- mcp --db /tmp/memoryd.db
+cargo run -p memoryd -- tui --db /tmp/memoryd.db
 ```
+
+### Inspect the store
+
+`memoryd tui` opens a local, read-only terminal viewer over the store: tabbed
+browsing of memories (with lexical search and graph-neighbor detail), sessions,
+approved profile facts, import batches, and table stats. It never binds a
+socket or calls a provider — quit with `q`.
+
+Dependency minimalism remains the rule: every direct dependency must justify
+itself, and `memoryd-core` stays dependency-pure — it gains nothing from this
+feature. The one explicit owner-approved exception lives in the **binary crate
+only**: `ratatui`/`crossterm`, pinned exactly, powering the `tui` viewer.
 
 ## MCP
 
@@ -118,6 +131,34 @@ corrupting an existing multi-server config. Every modified file is backed up to
 `<file>.memoryd.bak` first. An existing `plugins/memoryd.js` is never
 overwritten (it may carry your edits), and hook installs are path-independent
 idempotent: one memoryd dream hook per file even if the binary moved.
+
+### Bootstrapping from history
+
+`memoryd import` backfills the memory store from the session history your
+agents already wrote to disk, so a fresh install starts with months of context
+instead of an empty brain. Each source has a native parser: Claude Code
+(`~/.claude/projects/*/*.jsonl`), Codex (`~/.codex/sessions/**/*.jsonl`),
+OpenCode (`$XDG_DATA_HOME/opencode/opencode.db`), and Hermes
+(`~/.hermes/state.db`). Everything flows through the normal capture path —
+no privileged shortcut.
+
+```bash
+memoryd import --source agents                    # every detected agent
+memoryd import --source claude                    # one agent, auto-discovered
+memoryd import --source codex --path /backup/sessions   # file, dir, or db override
+memoryd import --source jsonl --path hist.jsonl   # generic one-object-per-line
+```
+
+Notes:
+
+- Re-runs are idempotent: already-imported content dedups by content hash
+  (`processed: 0`, everything `skipped`).
+- A full embed queue pauses rather than drops: on `"state": "paused"`, re-run
+  until the response says `"completed"`.
+- Units are role-prefixed (`[user]`, `[assistant]`, `[tool]`) and capped at
+  4,000 characters each; tool call arguments and thinking blocks are skipped.
+- The standard redaction pipeline applies before anything is persisted, and
+  foreign agent databases are opened strictly read-only.
 
 ## Providers
 

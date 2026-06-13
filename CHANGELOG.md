@@ -45,5 +45,17 @@ The project uses Semantic Versioning before the first stable release.
   `memoryd setup`.
 - Moved all provider inference outside dream write transactions.
 - Added `docs/CAPTURE-GUIDE.md` and `docs/OPERATIONS.md`.
+- Added source-specific history importers: `memoryd import --source
+  claude|codex|opencode|hermes` parses each agent's native session history
+  (auto-discovered under `$HOME`, overridable with `--path`), and `--source
+  agents` runs every detected agent. Imports are idempotent (content-hash
+  dedup), pause/resume under a full embed queue, role-prefix and cap each unit
+  at 4,000 characters, flow through the standard redaction pipeline, and open
+  foreign agent databases strictly read-only.
+- Added `memoryd tui`: a local-only, read-only interactive store viewer
+  (ratatui/crossterm, the binary crate's first and only extra dependencies —
+  `memoryd-core` stays dependency-pure). Tabs for memories (lexical search,
+  graph-neighbor detail), sessions (distilled narratives), profile facts,
+  import batches, and table stats; no network bind, no provider calls.
 
 No public runtime vulnerabilities have been fixed in a release yet.
