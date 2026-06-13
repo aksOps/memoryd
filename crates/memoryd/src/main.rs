@@ -4448,15 +4448,27 @@ mod tests {
                 })
                 .expect("capture");
         }
-        // dream: consolidate -> ... -> extract proposes a pending approval.
-        let cli = Cli::parse(
-            ["memoryd", "dream", "--now", "--db", path.to_str().unwrap()].map(OsString::from),
-        )
-        .expect("parses");
-        let Command::Dream(dargs) = cli.command.clone() else {
-            panic!("expected dream")
-        };
-        dream(cli, dargs).expect("dream");
+        // Propose a pending approval with auto-approve disabled, so the manual
+        // `approve` CLI below has something to commit. (The dream CLI auto-
+        // approves by default now; that path is covered in memoryd-core.)
+        {
+            let mut store = Store::open(&path).expect("store opens");
+            let mut caps = memoryd_core::config::Caps::small();
+            caps.auto_approve_profile_facts = false;
+            let opts = memoryd_core::dream::DreamOptions {
+                trigger: "manual",
+                budget_usd: 0.0,
+                max_seconds: 60,
+            };
+            memoryd_core::dream::dream_once(
+                &mut store,
+                &memoryd_core::adapters::AdapterKind::from_default_adapter("null"),
+                &caps,
+                &opts,
+                &|| 2_000_000_000_000i64,
+            )
+            .expect("dream");
+        }
 
         let id = {
             let store = Store::open(&path).expect("store opens");

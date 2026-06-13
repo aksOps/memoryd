@@ -478,8 +478,16 @@ mod tests {
             "local"
         );
 
-        // Without an override, embeds follow the default adapter.
+        // Without an override, embeds default to local even when the chat
+        // provider is remote — the split is the default, not opt-in.
         providers.embed_adapter = None;
+        assert_eq!(
+            AdapterKind::embed_from_provider_config(&providers).id(),
+            "local"
+        );
+
+        // Opting back into remote embeddings is explicit.
+        providers.embed_adapter = Some("openai_compat".to_string());
         assert_eq!(
             AdapterKind::embed_from_provider_config(&providers).id(),
             "openai_compat"

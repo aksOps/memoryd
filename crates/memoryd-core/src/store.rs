@@ -7970,7 +7970,7 @@ mod tests {
     }
 
     #[test]
-    fn dream_auto_approves_profile_facts_only_when_enabled() {
+    fn dream_auto_approves_profile_facts_unless_gate_restored() {
         use crate::dream::{DreamOptions, dream_once};
         let now = 1_000_000_000_000i64;
         let opts = DreamOptions {
@@ -7979,7 +7979,7 @@ mod tests {
             max_seconds: 60,
         };
 
-        // Default caps: the human gate holds — the proposal stays pending.
+        // Manual gate restored (auto_approve=false): the proposal stays pending.
         let gated_path = temp_db_path("dream-gate-on");
         let mut gated = Store::open(&gated_path).expect("store opens");
         seed_mem(
@@ -7991,15 +7991,14 @@ mod tests {
             "active",
             now,
         );
-        let gated_out = dream_once(
-            &mut gated,
-            &NullAdapter::new(),
-            &crate::config::Caps::small(),
-            &opts,
-            &|| now,
-        )
-        .expect("dream runs");
-        assert_eq!(gated_out.auto_approved, 0, "default keeps the manual gate");
+        let mut gated_caps = crate::config::Caps::small();
+        gated_caps.auto_approve_profile_facts = false;
+        let gated_out = dream_once(&mut gated, &NullAdapter::new(), &gated_caps, &opts, &|| now)
+            .expect("dream runs");
+        assert_eq!(
+            gated_out.auto_approved, 0,
+            "auto_approve=false keeps the manual gate"
+        );
         let gated_facts: i64 = gated
             .conn
             .query_row("SELECT COUNT(*) FROM profile_facts", [], |r| r.get(0))
@@ -8007,7 +8006,7 @@ mod tests {
         assert_eq!(gated_facts, 0);
         cleanup_db_files(&gated_path);
 
-        // Opt-in caps: the proposed fact is auto-committed within the pass.
+        // Default caps (auto-approve on): the proposed fact is committed in-pass.
         let auto_path = temp_db_path("dream-auto-on");
         let mut auto = Store::open(&auto_path).expect("store opens");
         seed_mem(
@@ -8019,13 +8018,17 @@ mod tests {
             "active",
             now,
         );
-        let mut caps = crate::config::Caps::small();
-        caps.auto_approve_profile_facts = true;
-        let auto_out =
-            dream_once(&mut auto, &NullAdapter::new(), &caps, &opts, &|| now).expect("dream runs");
+        let auto_out = dream_once(
+            &mut auto,
+            &NullAdapter::new(),
+            &crate::config::Caps::small(),
+            &opts,
+            &|| now,
+        )
+        .expect("dream runs");
         assert_eq!(
             auto_out.auto_approved, 1,
-            "opt-in commits the proposed fact"
+            "default commits the proposed fact"
         );
         let auto_facts: i64 = auto
             .conn
@@ -8366,14 +8369,12 @@ mod tests {
             budget_usd: 0.0,
             max_seconds: 60,
         };
-        let outcome = dream_once(
-            &mut store,
-            &NullAdapter::new(),
-            &crate::config::Caps::small(),
-            &opts,
-            &|| now,
-        )
-        .expect("dream runs");
+        // Restore the manual gate so this test exercises propose-only (the
+        // auto-approve path has its own dedicated test).
+        let mut caps = crate::config::Caps::small();
+        caps.auto_approve_profile_facts = false;
+        let outcome =
+            dream_once(&mut store, &NullAdapter::new(), &caps, &opts, &|| now).expect("dream runs");
         assert_eq!(outcome.consolidated, 1);
         assert_eq!(outcome.proposed, 1, "extract phase proposed the preference");
         assert_eq!(

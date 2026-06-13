@@ -235,11 +235,11 @@ pub struct Caps {
     /// Which `VectorIndex` implementation recall uses: "brute-force" (default, oracle)
     /// or "hnsw" (ARCHITECTURE-PLAN §21.12).
     pub vector_index_kind: String,
-    /// Auto-accept dream-proposed profile facts without manual `approve`. Off by
-    /// default: profile facts are durable owner knowledge, so the human gate (H6)
-    /// stays the default. Owner opt-in via `MEMORYD_AUTO_APPROVE` for a fully
-    /// hands-off profile. Scoped to `profile_fact` approvals only — deletions
-    /// (`memory_cleanup`/`memory_purge`) are never auto-approved.
+    /// Auto-accept dream-proposed profile facts without manual `approve`. On by
+    /// default for a hands-off profile; set `MEMORYD_AUTO_APPROVE=false` to
+    /// restore the manual human-review gate (H6). Scoped to `profile_fact`
+    /// approvals only — deletions (`memory_cleanup`/`memory_purge`) are never
+    /// auto-approved regardless of this setting.
     pub auto_approve_profile_facts: bool,
 }
 
@@ -257,7 +257,7 @@ impl Caps {
             retain_raw_days: 0,
             retain_raw_embeddings_days: 0,
             vector_index_kind: "brute-force".to_string(),
-            auto_approve_profile_facts: false,
+            auto_approve_profile_facts: true,
         }
     }
 }
@@ -267,23 +267,33 @@ pub struct ProviderConfig {
     pub default_adapter: String,
     /// Optional override for embedding operations only (recall query embeds,
     /// the serve embed worker, and the dream associate phase). When `None`,
-    /// embeds use `default_adapter`. Set to `local` to keep embeddings on the
-    /// in-process bge-small vectors while `default_adapter` drives the LLM/chat
-    /// phases via a remote provider — the embed/chat split that lets a paid
-    /// chat model fill the profile without re-embedding the corpus or routing
-    /// recall through a remote endpoint.
+    /// embeds default to `local` (or `null` when `default_adapter` is `null`)
+    /// — see [`ProviderConfig::effective_embed_adapter`]. This keeps embeddings
+    /// on the in-process bge-small vectors while `default_adapter` drives the
+    /// LLM/chat phases via a remote provider — the embed/chat split that lets a
+    /// paid chat model fill the profile without re-embedding the corpus or
+    /// routing recall through a remote endpoint. Set explicitly (e.g.
+    /// `openai_compat`) only to opt back into remote embeddings.
     pub embed_adapter: Option<String>,
     pub paid_spend_cap_usd: f64,
     pub openai_compat: OpenAiCompatConfig,
 }
 
 impl ProviderConfig {
-    /// The adapter name governing embedding operations: the `embed_adapter`
-    /// override if set, else `default_adapter`.
+    /// The adapter name governing embedding operations. The `embed_adapter`
+    /// override wins if set; otherwise embeddings default to the in-process
+    /// `local` model so configuring a remote chat provider never re-routes
+    /// recall or persisted vectors to the cloud. The one exception is the
+    /// `null` adapter (CI/deterministic, no model load), which stays `null`.
     pub fn effective_embed_adapter(&self) -> &str {
-        self.embed_adapter
-            .as_deref()
-            .unwrap_or(&self.default_adapter)
+        if let Some(embed) = self.embed_adapter.as_deref() {
+            return embed;
+        }
+        if self.default_adapter == "null" {
+            "null"
+        } else {
+            "local"
+        }
     }
 }
 
@@ -570,13 +580,22 @@ mod tests {
     #[test]
     fn embed_adapter_override_resolves_and_validates() {
         let mut cfg = Config::with_db_path(PathBuf::from("memoryd.db"));
-        // Unset: embeds follow the default adapter.
+        // Default (local provider): embeds are local.
         assert_eq!(cfg.providers.effective_embed_adapter(), "local");
 
-        // The user's split: remote chat provider, local embeddings.
+        // Remote chat provider, no override: embeds still default to local —
+        // the split is the default so the cloud never gets the embeddings.
         cfg.providers.default_adapter = "openai_compat".to_string();
         cfg.providers.paid_spend_cap_usd = 1.0;
         cfg.providers.openai_compat.base_url = "http://127.0.0.1:11434/v1".to_string();
+        assert_eq!(cfg.providers.effective_embed_adapter(), "local");
+
+        // The null adapter (CI/deterministic) keeps null embeddings, no override.
+        let mut null_cfg = Config::with_db_path(PathBuf::from("memoryd.db"));
+        null_cfg.providers.default_adapter = "null".to_string();
+        assert_eq!(null_cfg.providers.effective_embed_adapter(), "null");
+
+        // Explicit override is still honored and validated.
         cfg.providers.embed_adapter = Some("local".to_string());
         assert_eq!(cfg.providers.effective_embed_adapter(), "local");
         assert!(
@@ -602,15 +621,18 @@ mod tests {
     }
 
     #[test]
-    fn auto_approve_defaults_off_and_reads_env() {
+    fn auto_approve_defaults_on_and_env_can_disable() {
         let mut cfg = Config::with_db_path(PathBuf::from("memoryd.db"));
         assert!(
-            !cfg.caps.auto_approve_profile_facts,
-            "manual approval is the default"
+            cfg.caps.auto_approve_profile_facts,
+            "hands-off profile is the default"
         );
-        cfg.apply_env_from(&|name| (name == "MEMORYD_AUTO_APPROVE").then(|| "true".to_string()))
+        cfg.apply_env_from(&|name| (name == "MEMORYD_AUTO_APPROVE").then(|| "false".to_string()))
             .expect("env applies");
-        assert!(cfg.caps.auto_approve_profile_facts);
+        assert!(
+            !cfg.caps.auto_approve_profile_facts,
+            "env restores the manual gate"
+        );
     }
 
     #[test]
