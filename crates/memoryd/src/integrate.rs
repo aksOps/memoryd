@@ -329,31 +329,144 @@ fn plan_opencode(
         Scope::User => home.join(".config/opencode/plugins/memoryd.js"),
         Scope::Project => cwd.join(".opencode/plugins/memoryd.js"),
     };
-    actions.push(opencode_plugin(&plugin_path, bin, &args.db)?);
+    actions.push(opencode_plugin(&plugin_path, bin, &args.db, args.mode)?);
     Ok(actions)
 }
 
-/// Write the session-idle dream plugin if absent; never overwrite an existing
-/// (possibly user-customized) plugin file.
+/// Write/refresh the OpenCode plugin. A file matching a known unmodified
+/// memoryd template is regenerated (so an older dream-only install upgrades to
+/// capture); any other existing file — hand-edited or user-authored — is left
+/// untouched, so we never clobber someone's edits.
 fn opencode_plugin(
     path: &Path,
     bin: &Path,
     db: &Option<PathBuf>,
+    mode: Mode,
 ) -> Result<Action, crate::CliError> {
-    if path.exists() {
-        let existing = std::fs::read_to_string(path).map_err(crate::CliError::Io)?;
-        return Ok(Action::Write {
-            path: path.to_path_buf(),
-            new_contents: existing,
-            what: "session-idle dream plugin",
-            already: true,
-        });
-    }
     let db_arg = match db {
         Some(db) => format!(" --db \"{}\"", shell_escape_db(&db.display().to_string())),
         None => String::new(),
     };
-    let contents = format!(
+    let target = render_opencode_plugin(bin, &db_arg, mode);
+    if path.exists() {
+        let existing = std::fs::read_to_string(path).map_err(crate::CliError::Io)?;
+        if existing == target {
+            return Ok(Action::Write {
+                path: path.to_path_buf(),
+                new_contents: existing,
+                what: "memoryd opencode plugin",
+                already: true,
+            });
+        }
+        // An unmodified plugin from an earlier memoryd version is ours to
+        // regenerate in place (dream-only -> capture). Anything else matches no
+        // known template and is preserved.
+        if existing == legacy_opencode_dream_plugin(bin, &db_arg) {
+            return Ok(Action::Write {
+                path: path.to_path_buf(),
+                new_contents: target,
+                what: "memoryd opencode plugin",
+                already: false,
+            });
+        }
+        return Ok(Action::Write {
+            path: path.to_path_buf(),
+            new_contents: existing,
+            what: "opencode plugin (left as-is; not memoryd-managed)",
+            already: true,
+        });
+    }
+    Ok(Action::Write {
+        path: path.to_path_buf(),
+        new_contents: target,
+        what: "memoryd opencode plugin",
+        already: false,
+    })
+}
+
+/// OpenCode capture handlers: prompts via `chat.message`, completed tool calls
+/// via `tool.execute.after`. Static text — they call the `capture` helper
+/// (which carries the binary path), so no interpolation is needed here. Emitted
+/// only in Hooks/All mode, mirroring the Claude capture-suite gate. Synthetic /
+/// ignored text parts are skipped, matching the importer; failed tool calls are
+/// not captured (`tool.execute.after` only fires on success), which keeps live
+/// capture symmetric with the importer's completed-output-only ingest.
+const OPENCODE_CAPTURE_HANDLERS: &str = r#"    "chat.message": async (input, output) => {
+      const sessionId = input?.sessionID ?? ""
+      const text = (output?.parts ?? [])
+        .filter((p) => p.type === "text" && !p.synthetic && !p.ignored)
+        .map((p) => p.text)
+        .join("\n")
+      if (!text.trim()) return
+      await capture("prompt", {
+        session_id: sessionId,
+        hook_event_name: "UserPromptSubmit",
+        prompt: text,
+      })
+    },
+    "tool.execute.after": async (input, output) => {
+      await capture("tool", {
+        session_id: input?.sessionID ?? "",
+        hook_event_name: "PostToolUse",
+        tool_name: input?.tool ?? "tool",
+        tool_input: input?.args ?? {},
+        tool_output: output?.output ?? null,
+      })
+    },
+"#;
+
+/// Render the current OpenCode plugin. Always wires `session.idle -> dream`; in
+/// Hooks/All mode also live-captures prompts and tool calls by shelling out to
+/// `memoryd hook`, piping the event JSON on **stdin** (`< ${new Response(...)}`)
+/// so arbitrary prompt/tool text never reaches argv. Every memoryd call is
+/// `.quiet().nothrow()` and try/caught so it can neither echo into the TUI nor
+/// throw into OpenCode's event loop.
+fn render_opencode_plugin(bin: &Path, db_arg: &str, mode: Mode) -> String {
+    let (capture_helper, handlers) = if mode != Mode::Mcp {
+        (
+            format!(
+                r#"  const capture = async (verb, payload) => {{
+    try {{
+      await $`"{bin}" hook ${{verb}} --agent opencode{db_arg} < ${{new Response(JSON.stringify(payload))}}`.quiet().nothrow()
+    }} catch (_) {{}}
+  }}
+"#,
+                bin = bin.display(),
+            ),
+            OPENCODE_CAPTURE_HANDLERS,
+        )
+    } else {
+        (String::new(), "")
+    };
+    format!(
+        r#"// Installed by `memoryd integrate`. Captures this machine's OpenCode
+// prompts and tool calls into memoryd (direct-to-SQLite, no daemon), and runs
+// a dream pass (distill, associate, decay) when a session goes idle. Every
+// memoryd call is wrapped so a failure can never break your OpenCode session.
+// Auto-managed: re-running `memoryd integrate` regenerates this file when it is
+// unmodified; your edits are preserved (copy to another name to customize).
+export const MemorydPlugin = async ({{ $ }}) => {{
+{capture_helper}  return {{
+    event: async ({{ event }}) => {{
+      if (event.type === "session.idle") {{
+        try {{
+          await $`"{bin}" dream{db_arg}`.quiet().nothrow()
+        }} catch (_) {{}}
+      }}
+    }},
+{handlers}  }}
+}}
+"#,
+        bin = bin.display(),
+    )
+}
+
+/// The exact dream-only plugin produced by memoryd before live capture shipped.
+/// Frozen verbatim so an unmodified install of it can be recognized by
+/// byte-equality and upgraded in place (see [`opencode_plugin`]). Do not edit;
+/// changing it would orphan the installed base it is meant to match.
+fn legacy_opencode_dream_plugin(bin: &Path, db_arg: &str) -> String {
+    format!(
         "// Installed by `memoryd integrate`. Consolidates this machine's memoryd\n\
          // captures (dream pass: distill, associate, decay) whenever a session goes\n\
          // idle. The pass is incremental and bounded, so repeat fires are cheap.\n\
@@ -370,13 +483,7 @@ fn opencode_plugin(
          \x20 }}\n\
          }}\n",
         bin = bin.display(),
-    );
-    Ok(Action::Write {
-        path: path.to_path_buf(),
-        new_contents: contents,
-        what: "session-idle dream plugin",
-        already: false,
-    })
+    )
 }
 
 /// Escape a path for embedding inside a double-quoted string in the generated
@@ -870,9 +977,12 @@ mod tests {
         assert!(path.ends_with(".config/opencode/plugins/memoryd.js"));
         assert!(new_contents.contains("export const MemorydPlugin"));
         assert!(new_contents.contains(r#"event.type === "session.idle""#));
-        assert!(new_contents.contains(r#"await $`"/opt/memoryd" dream`"#));
+        // The dream call is quiet (no TUI echo) and nothrow (never breaks the host).
+        assert!(new_contents.contains(r#"await $`"/opt/memoryd" dream`.quiet().nothrow()"#));
+        // Default (Mcp) mode is dream-only: no capture handlers.
+        assert!(!new_contents.contains(r#""chat.message""#));
 
-        // An existing plugin file (possibly user-edited) is never overwritten.
+        // A hand-edited / foreign plugin file is never overwritten.
         write(path, "// customized by user\n");
         let actions2 = plan_opencode(&home, &home, &bin, &a).unwrap();
         let Action::Write {
@@ -885,6 +995,134 @@ mod tests {
         };
         assert!(already);
         assert!(c2.contains("customized by user"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn opencode_captures_in_hooks_and_all_not_mcp() {
+        let bin = PathBuf::from("/opt/memoryd");
+
+        // Hooks mode: no MCP write, so the plugin is action[0] and captures.
+        let home = tmp_home("opencode-cap-hooks");
+        let mut a = args(Scope::User);
+        a.mode = Mode::Hooks;
+        let actions = plan_opencode(&home, &home, &bin, &a).unwrap();
+        assert_eq!(
+            actions.len(),
+            1,
+            "hooks mode writes only the plugin (no mcp)"
+        );
+        let Action::Write { new_contents, .. } = &actions[0] else {
+            panic!("expected plugin write");
+        };
+        assert!(new_contents.contains(r#""chat.message""#));
+        assert!(new_contents.contains(r#""tool.execute.after""#));
+        assert!(new_contents.contains("hook ${verb} --agent opencode"));
+        assert!(new_contents.contains("< ${new Response(JSON.stringify(payload))}"));
+        assert!(new_contents.contains(r#"event.type === "session.idle""#)); // dream still on
+        let _ = std::fs::remove_dir_all(&home);
+
+        // All mode: mcp + plugin; the plugin (index 1) also captures.
+        let home = tmp_home("opencode-cap-all");
+        let mut a = args(Scope::User);
+        a.mode = Mode::All;
+        let actions = plan_opencode(&home, &home, &bin, &a).unwrap();
+        let Action::Write { new_contents, .. } = &actions[1] else {
+            panic!("expected plugin write");
+        };
+        assert!(new_contents.contains(r#""chat.message""#));
+        assert!(new_contents.contains(r#""tool.execute.after""#));
+        let _ = std::fs::remove_dir_all(&home);
+
+        // Mcp (default) mode: dream-only, no capture handlers.
+        let home = tmp_home("opencode-cap-mcp");
+        let a = args(Scope::User);
+        let actions = plan_opencode(&home, &home, &bin, &a).unwrap();
+        let Action::Write { new_contents, .. } = &actions[1] else {
+            panic!("expected plugin write");
+        };
+        assert!(!new_contents.contains(r#""chat.message""#));
+        assert!(!new_contents.contains("tool.execute.after"));
+        assert!(new_contents.contains(r#"event.type === "session.idle""#));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn opencode_capture_payload_uses_hook_contract_fields() {
+        let home = tmp_home("opencode-cap-fields");
+        let bin = PathBuf::from("/opt/memoryd");
+        let mut a = args(Scope::User);
+        a.mode = Mode::Hooks;
+        let actions = plan_opencode(&home, &home, &bin, &a).unwrap();
+        let Action::Write { new_contents, .. } = &actions[0] else {
+            panic!("expected plugin write");
+        };
+        // Field names consumed by hook.rs (capture_prompt / capture_tool).
+        for needle in [
+            "session_id:",
+            "hook_event_name:",
+            "prompt: text",
+            "tool_name: input?.tool",
+            "tool_input: input?.args",
+            "tool_output: output?.output",
+        ] {
+            assert!(
+                new_contents.contains(needle),
+                "missing {needle}: {new_contents}"
+            );
+        }
+        // Calls are quiet (no TUI echo) + nothrow (never break the host turn).
+        assert!(new_contents.contains(".quiet().nothrow()"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn opencode_plugin_upgrades_unmodified_legacy_but_preserves_edits() {
+        let bin = PathBuf::from("/opt/memoryd");
+
+        // An unmodified legacy dream-only plugin is regenerated into capture.
+        let home = tmp_home("opencode-upgrade");
+        let mut a = args(Scope::User);
+        a.mode = Mode::Hooks;
+        let plugin = home.join(".config/opencode/plugins/memoryd.js");
+        write(&plugin, &legacy_opencode_dream_plugin(&bin, ""));
+        let actions = plan_opencode(&home, &home, &bin, &a).unwrap();
+        let Action::Write {
+            new_contents,
+            already,
+            ..
+        } = &actions[0]
+        else {
+            panic!("expected plugin write");
+        };
+        assert!(!already, "unmodified legacy plugin upgrades (not a no-op)");
+        assert!(
+            new_contents.contains(r#""chat.message""#),
+            "upgraded to capture"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+
+        // A legacy plugin the user has edited is left untouched.
+        let home = tmp_home("opencode-upgrade-edited");
+        let plugin = home.join(".config/opencode/plugins/memoryd.js");
+        let mut edited = legacy_opencode_dream_plugin(&bin, "");
+        edited.push_str("// my custom tweak\n");
+        write(&plugin, &edited);
+        let actions = plan_opencode(&home, &home, &bin, &a).unwrap();
+        let Action::Write {
+            new_contents,
+            already,
+            ..
+        } = &actions[0]
+        else {
+            panic!("expected plugin write");
+        };
+        assert!(already, "edited plugin is preserved");
+        assert!(new_contents.contains("my custom tweak"));
+        assert!(
+            !new_contents.contains(r#""chat.message""#),
+            "no capture injected into a user-edited file"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
