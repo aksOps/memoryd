@@ -24,6 +24,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Cap on provider response text echoed into error messages.
 const ERROR_BODY_SNIPPET_CHARS: usize = 200;
+/// Transient-failure retry budget for provider HTTP calls (rate limits, 5xx,
+/// transport blips). Total attempts = 1 + this. Bounded so a dream pass cannot
+/// stall: worst-case added wait is the backoff sum, well under the wall-clock cap.
+const MAX_PROVIDER_RETRIES: u32 = 2;
+/// Base for exponential backoff between retries (500ms, then 1s).
+const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(500);
+/// Cap on an honored `Retry-After` header so a confused/hostile value cannot
+/// park a dream pass for minutes.
+const RETRY_AFTER_CAP: Duration = Duration::from_secs(5);
 /// Deterministic, model-agnostic instruction for dream consolidation.
 const SUMMARIZE_SYSTEM_PROMPT: &str = "You consolidate raw engineering notes into one durable \
      memory. Reply with a single concise sentence that preserves every concrete fact (names, \
@@ -97,30 +106,60 @@ impl OpenAiCompatAdapter {
     }
 
     fn post_json(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
+        self.post_json_with_sleep(path, body, &|delay| std::thread::sleep(delay))
+    }
+
+    /// `post_json` with an injectable sleep so retry timing is testable without
+    /// real waits. Retries rate limits (429), transient 5xx, and transport blips
+    /// up to [`MAX_PROVIDER_RETRIES`]; client errors and malformed bodies are fatal.
+    fn post_json_with_sleep(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+        sleep: &dyn Fn(Duration),
+    ) -> Result<serde_json::Value, String> {
         let url = format!("{}{path}", self.base_url);
-        let mut request = self
-            .agent
-            .post(&url)
-            .set("Content-Type", "application/json");
-        if let Some(key) = self.api_key.as_deref() {
-            request = request.set("Authorization", &format!("Bearer {key}"));
-        }
-        let response = match request.send_string(&body.to_string()) {
-            Ok(response) => response,
-            Err(ureq::Error::Status(status, response)) => {
-                let snippet = snippet(&response.into_string().unwrap_or_default());
-                return Err(format!("provider returned HTTP {status}: {snippet}"));
+        let body_str = body.to_string();
+        with_retries(MAX_PROVIDER_RETRIES, sleep, || {
+            let mut request = self
+                .agent
+                .post(&url)
+                .set("Content-Type", "application/json");
+            if let Some(key) = self.api_key.as_deref() {
+                request = request.set("Authorization", &format!("Bearer {key}"));
             }
-            Err(ureq::Error::Transport(transport)) => {
+            match request.send_string(&body_str) {
+                Ok(response) => match response.into_string() {
+                    Ok(text) => match serde_json::from_str(&text) {
+                        Ok(json) => AttemptOutcome::Done(json),
+                        Err(_) => AttemptOutcome::Fatal(format!(
+                            "provider returned non-JSON body: {}",
+                            snippet(&text)
+                        )),
+                    },
+                    Err(err) => AttemptOutcome::Retry {
+                        after: None,
+                        err: format!("provider response read failed: {err}"),
+                    },
+                },
+                Err(ureq::Error::Status(status, response)) => {
+                    // Read Retry-After before consuming the body for the snippet.
+                    let after = parse_retry_after(response.header("retry-after"));
+                    let snippet = snippet(&response.into_string().unwrap_or_default());
+                    let err = format!("provider returned HTTP {status}: {snippet}");
+                    if is_retryable_status(status) {
+                        AttemptOutcome::Retry { after, err }
+                    } else {
+                        AttemptOutcome::Fatal(err)
+                    }
+                }
                 // Transport errors carry the URL but never request bodies/keys.
-                return Err(format!("provider transport error: {transport}"));
+                Err(ureq::Error::Transport(transport)) => AttemptOutcome::Retry {
+                    after: None,
+                    err: format!("provider transport error: {transport}"),
+                },
             }
-        };
-        let text = response
-            .into_string()
-            .map_err(|err| format!("provider response read failed: {err}"))?;
-        serde_json::from_str(&text)
-            .map_err(|_| format!("provider returned non-JSON body: {}", snippet(&text)))
+        })
     }
 }
 
@@ -281,6 +320,65 @@ fn snippet(text: &str) -> String {
     format!("{cut}…")
 }
 
+/// Transient HTTP statuses worth retrying: rate limiting and the standard
+/// transient server errors. Other 4xx (400/401/403/404/422) are fatal —
+/// retrying them only wastes the budget and the wall-clock.
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+/// Parse a numeric `Retry-After` (delta-seconds) into a capped delay. The
+/// HTTP-date form is ignored (`None`) — providers send delta-seconds for rate
+/// limits, and honoring an arbitrary date risks a long stall.
+fn parse_retry_after(header: Option<&str>) -> Option<Duration> {
+    let secs = header?.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(secs).min(RETRY_AFTER_CAP))
+}
+
+/// Delay before the next attempt: an honored `Retry-After` if present, else
+/// exponential backoff (`RETRY_BACKOFF_BASE * 2^attempt`).
+fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+    if let Some(after) = retry_after {
+        return after;
+    }
+    RETRY_BACKOFF_BASE.saturating_mul(1u32 << attempt.min(16))
+}
+
+/// Outcome of one provider HTTP attempt.
+enum AttemptOutcome<T> {
+    Done(T),
+    Retry {
+        after: Option<Duration>,
+        err: String,
+    },
+    Fatal(String),
+}
+
+/// Run `attempt` up to `1 + max_retries` times, sleeping between retries via the
+/// injected `sleep` (injectable so tests need not actually wait). Returns the
+/// first success, a fatal error immediately, or the last transient error once
+/// the budget is spent.
+fn with_retries<T>(
+    max_retries: u32,
+    sleep: &dyn Fn(Duration),
+    mut attempt: impl FnMut() -> AttemptOutcome<T>,
+) -> Result<T, String> {
+    let mut last_err = "provider request failed".to_string();
+    for n in 0..=max_retries {
+        match attempt() {
+            AttemptOutcome::Done(value) => return Ok(value),
+            AttemptOutcome::Fatal(err) => return Err(err),
+            AttemptOutcome::Retry { after, err } => {
+                last_err = err;
+                if n < max_retries {
+                    sleep(retry_delay(n, after));
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,15 +471,17 @@ mod tests {
 
     #[test]
     fn embed_surfaces_status_errors_with_truncated_body() {
+        // 400 is a fatal client error (not retried), so one canned response is
+        // enough — the assertion is about body truncation, not retry behavior.
         let huge = "x".repeat(1000);
-        let (base, _seen) = spawn_mock(vec![(429, format!("{{\"error\":\"{huge}\"}}"))]);
+        let (base, _seen) = spawn_mock(vec![(400, format!("{{\"error\":\"{huge}\"}}"))]);
         let adapter = adapter_for(&base, None);
 
         let err = adapter
             .embed(&["text".to_string()])
             .expect_err("status error surfaces");
         let message = err.to_string();
-        assert!(message.contains("HTTP 429"), "status visible: {message}");
+        assert!(message.contains("HTTP 400"), "status visible: {message}");
         assert!(
             message.chars().count() < 300,
             "provider body truncated: {} chars",
@@ -478,6 +578,155 @@ mod tests {
                 .expect("empty input is a no-op")
                 .is_empty(),
             "no network call for empty input"
+        );
+    }
+
+    #[test]
+    fn is_retryable_status_separates_transient_from_client_errors() {
+        for transient in [429, 500, 502, 503, 504] {
+            assert!(is_retryable_status(transient), "{transient} is transient");
+        }
+        for fatal in [400, 401, 403, 404, 422, 200] {
+            assert!(!is_retryable_status(fatal), "{fatal} is fatal");
+        }
+    }
+
+    #[test]
+    fn parse_retry_after_reads_seconds_and_caps_and_ignores_garbage() {
+        assert_eq!(parse_retry_after(Some("3")), Some(Duration::from_secs(3)));
+        assert_eq!(
+            parse_retry_after(Some("  2 ")),
+            Some(Duration::from_secs(2))
+        );
+        // Beyond the cap is clamped so a hostile header cannot stall a pass.
+        assert_eq!(parse_retry_after(Some("9999")), Some(RETRY_AFTER_CAP));
+        // HTTP-date form and non-numeric values are not honored.
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 2015 07:28:00 GMT")),
+            None
+        );
+        assert_eq!(parse_retry_after(None), None);
+    }
+
+    #[test]
+    fn retry_delay_backs_off_exponentially_then_honors_retry_after() {
+        assert_eq!(retry_delay(0, None), RETRY_BACKOFF_BASE);
+        assert_eq!(retry_delay(1, None), RETRY_BACKOFF_BASE * 2);
+        // An explicit Retry-After overrides the exponential schedule.
+        let after = Duration::from_secs(4);
+        assert_eq!(retry_delay(0, Some(after)), after);
+    }
+
+    #[test]
+    fn with_retries_returns_first_success_without_sleeping() {
+        let sleeps = std::cell::Cell::new(0u32);
+        let calls = std::cell::Cell::new(0u32);
+        let out: Result<u8, String> = with_retries(2, &|_| sleeps.set(sleeps.get() + 1), || {
+            calls.set(calls.get() + 1);
+            AttemptOutcome::Done(7)
+        });
+        assert_eq!(out, Ok(7));
+        assert_eq!(calls.get(), 1, "no retries on first success");
+        assert_eq!(sleeps.get(), 0, "no sleep when first attempt succeeds");
+    }
+
+    #[test]
+    fn with_retries_retries_transient_then_succeeds() {
+        let sleeps = std::cell::Cell::new(0u32);
+        let calls = std::cell::Cell::new(0u32);
+        let out: Result<u8, String> = with_retries(2, &|_| sleeps.set(sleeps.get() + 1), || {
+            calls.set(calls.get() + 1);
+            if calls.get() < 2 {
+                AttemptOutcome::Retry {
+                    after: None,
+                    err: "rate limited".to_string(),
+                }
+            } else {
+                AttemptOutcome::Done(9)
+            }
+        });
+        assert_eq!(out, Ok(9));
+        assert_eq!(calls.get(), 2);
+        assert_eq!(sleeps.get(), 1, "slept once before the successful retry");
+    }
+
+    #[test]
+    fn with_retries_stops_immediately_on_fatal() {
+        let calls = std::cell::Cell::new(0u32);
+        let out: Result<u8, String> = with_retries(5, &|_| {}, || {
+            calls.set(calls.get() + 1);
+            AttemptOutcome::Fatal("bad request".to_string())
+        });
+        assert_eq!(out, Err("bad request".to_string()));
+        assert_eq!(calls.get(), 1, "fatal is not retried");
+    }
+
+    #[test]
+    fn with_retries_exhausts_budget_and_returns_last_error() {
+        let calls = std::cell::Cell::new(0u32);
+        let out: Result<u8, String> = with_retries(2, &|_| {}, || {
+            calls.set(calls.get() + 1);
+            AttemptOutcome::Retry {
+                after: None,
+                err: format!("attempt {}", calls.get()),
+            }
+        });
+        assert_eq!(out, Err("attempt 3".to_string()));
+        assert_eq!(calls.get(), 3, "1 initial + 2 retries");
+    }
+
+    #[test]
+    fn post_json_retries_rate_limit_then_succeeds() {
+        // First connection 429, second 200 — the adapter must retry and return
+        // the successful body. No-op sleep keeps the test instant.
+        let (base, seen) = spawn_mock(vec![
+            (429, "{\"error\":\"slow down\"}".to_string()),
+            (200, "{\"ok\":true}".to_string()),
+        ]);
+        let adapter = adapter_for(&base, None);
+        let value = adapter
+            .post_json_with_sleep("/chat/completions", &serde_json::json!({"q": 1}), &|_| {})
+            .expect("retry then success");
+        assert_eq!(value, serde_json::json!({"ok": true}));
+        seen.recv().expect("first (429) request");
+        seen.recv().expect("second (retried) request");
+    }
+
+    #[test]
+    fn post_json_exhausts_retries_on_persistent_rate_limit() {
+        // 1 initial + 2 retries = 3 attempts, all 429 → the last error surfaces.
+        let (base, seen) = spawn_mock(vec![
+            (429, "{}".to_string()),
+            (429, "{}".to_string()),
+            (429, "{}".to_string()),
+        ]);
+        let adapter = adapter_for(&base, None);
+        let err = adapter
+            .post_json_with_sleep("/chat/completions", &serde_json::json!({}), &|_| {})
+            .expect_err("persistent 429 fails");
+        assert!(err.contains("HTTP 429"), "rate limit surfaced: {err}");
+        for _ in 0..3 {
+            seen.recv().expect("each attempt hit the server");
+        }
+    }
+
+    #[test]
+    fn post_json_does_not_retry_client_errors() {
+        // 400 is fatal; the second canned response must never be requested.
+        let (base, seen) = spawn_mock(vec![
+            (400, "{\"error\":\"bad\"}".to_string()),
+            (200, "{\"ok\":true}".to_string()),
+        ]);
+        let adapter = adapter_for(&base, None);
+        let err = adapter
+            .post_json_with_sleep("/chat/completions", &serde_json::json!({}), &|_| {})
+            .expect_err("client error is fatal");
+        assert!(err.contains("HTTP 400"), "client error surfaced: {err}");
+        seen.recv().expect("first request");
+        assert!(
+            seen.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "no retry after a fatal client error"
         );
     }
 }

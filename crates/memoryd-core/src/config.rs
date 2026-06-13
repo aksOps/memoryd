@@ -37,9 +37,11 @@ impl Config {
     }
 
     /// Apply provider settings from process environment variables:
-    /// `MEMORYD_ADAPTER` (null|local|openai_compat), `MEMORYD_SPEND_CAP_USD`,
-    /// and the `MEMORYD_OPENAI_*` family (BASE_URL, API_KEY, API_KEY_FILE,
-    /// EMBED_MODEL, CHAT_MODEL, USD_PER_1K). Call before [`Config::validate`].
+    /// `MEMORYD_ADAPTER` (null|local|openai_compat), `MEMORYD_EMBED_ADAPTER`
+    /// (same set; embed-only override), `MEMORYD_AUTO_APPROVE` (auto-accept
+    /// dream-proposed profile facts), `MEMORYD_SPEND_CAP_USD`, and the
+    /// `MEMORYD_OPENAI_*` family (BASE_URL, API_KEY, API_KEY_FILE, EMBED_MODEL,
+    /// CHAT_MODEL, USD_PER_1K). Call before [`Config::validate`].
     pub fn apply_env(&mut self) -> Result<(), ConfigError> {
         self.apply_env_from(&|name| std::env::var(name).ok())
     }
@@ -52,6 +54,12 @@ impl Config {
     ) -> Result<(), ConfigError> {
         if let Some(adapter) = get("MEMORYD_ADAPTER") {
             self.providers.default_adapter = adapter;
+        }
+        if let Some(embed_adapter) = get("MEMORYD_EMBED_ADAPTER") {
+            self.providers.embed_adapter = Some(embed_adapter);
+        }
+        if let Some(value) = get("MEMORYD_AUTO_APPROVE") {
+            self.caps.auto_approve_profile_facts = parse_bool_env(&value);
         }
         if let Some(cap) = get("MEMORYD_SPEND_CAP_USD") {
             let cap = cap
@@ -147,6 +155,15 @@ impl Config {
             });
         }
 
+        // The embed-only override draws from the same adapter set.
+        if let Some(embed_adapter) = self.providers.embed_adapter.as_deref()
+            && !matches!(embed_adapter, "null" | "local" | "openai_compat")
+        {
+            return Err(ConfigError::UnknownAdapter {
+                adapter: embed_adapter.to_string(),
+            });
+        }
+
         if self.providers.default_adapter == "openai_compat" {
             let base = self.providers.openai_compat.base_url.as_str();
             if !(base.starts_with("http://") || base.starts_with("https://")) {
@@ -218,6 +235,12 @@ pub struct Caps {
     /// Which `VectorIndex` implementation recall uses: "brute-force" (default, oracle)
     /// or "hnsw" (ARCHITECTURE-PLAN §21.12).
     pub vector_index_kind: String,
+    /// Auto-accept dream-proposed profile facts without manual `approve`. Off by
+    /// default: profile facts are durable owner knowledge, so the human gate (H6)
+    /// stays the default. Owner opt-in via `MEMORYD_AUTO_APPROVE` for a fully
+    /// hands-off profile. Scoped to `profile_fact` approvals only — deletions
+    /// (`memory_cleanup`/`memory_purge`) are never auto-approved.
+    pub auto_approve_profile_facts: bool,
 }
 
 impl Caps {
@@ -234,6 +257,7 @@ impl Caps {
             retain_raw_days: 0,
             retain_raw_embeddings_days: 0,
             vector_index_kind: "brute-force".to_string(),
+            auto_approve_profile_facts: false,
         }
     }
 }
@@ -241,14 +265,33 @@ impl Caps {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderConfig {
     pub default_adapter: String,
+    /// Optional override for embedding operations only (recall query embeds,
+    /// the serve embed worker, and the dream associate phase). When `None`,
+    /// embeds use `default_adapter`. Set to `local` to keep embeddings on the
+    /// in-process bge-small vectors while `default_adapter` drives the LLM/chat
+    /// phases via a remote provider — the embed/chat split that lets a paid
+    /// chat model fill the profile without re-embedding the corpus or routing
+    /// recall through a remote endpoint.
+    pub embed_adapter: Option<String>,
     pub paid_spend_cap_usd: f64,
     pub openai_compat: OpenAiCompatConfig,
+}
+
+impl ProviderConfig {
+    /// The adapter name governing embedding operations: the `embed_adapter`
+    /// override if set, else `default_adapter`.
+    pub fn effective_embed_adapter(&self) -> &str {
+        self.embed_adapter
+            .as_deref()
+            .unwrap_or(&self.default_adapter)
+    }
 }
 
 impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
             default_adapter: "local".to_string(),
+            embed_adapter: None,
             paid_spend_cap_usd: 0.0,
             openai_compat: OpenAiCompatConfig::default(),
         }
@@ -386,6 +429,15 @@ fn is_loopback(ip: IpAddr) -> bool {
     }
 }
 
+/// Lenient truthy parse for boolean env vars: `1`/`true`/`yes`/`on`
+/// (case-insensitive) enable; anything else (including unset upstream) is false.
+fn parse_bool_env(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,6 +564,62 @@ mod tests {
                 matches!(cfg.validate(), Err(ConfigError::UnknownAdapter { .. })),
                 "provider-specific adapter names are gone; use openai_compat + base_url"
             );
+        }
+    }
+
+    #[test]
+    fn embed_adapter_override_resolves_and_validates() {
+        let mut cfg = Config::with_db_path(PathBuf::from("memoryd.db"));
+        // Unset: embeds follow the default adapter.
+        assert_eq!(cfg.providers.effective_embed_adapter(), "local");
+
+        // The user's split: remote chat provider, local embeddings.
+        cfg.providers.default_adapter = "openai_compat".to_string();
+        cfg.providers.paid_spend_cap_usd = 1.0;
+        cfg.providers.openai_compat.base_url = "http://127.0.0.1:11434/v1".to_string();
+        cfg.providers.embed_adapter = Some("local".to_string());
+        assert_eq!(cfg.providers.effective_embed_adapter(), "local");
+        assert!(
+            cfg.validate().is_ok(),
+            "openai_compat chat + local embed override validates"
+        );
+
+        // An unknown embed adapter is rejected like any unknown adapter.
+        cfg.providers.embed_adapter = Some("bogus".to_string());
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::UnknownAdapter { adapter }) if adapter == "bogus"
+        ));
+    }
+
+    #[test]
+    fn apply_env_reads_embed_adapter_override() {
+        let mut cfg = Config::with_db_path(PathBuf::from("memoryd.db"));
+        cfg.apply_env_from(&|name| (name == "MEMORYD_EMBED_ADAPTER").then(|| "local".to_string()))
+            .expect("env applies");
+        assert_eq!(cfg.providers.embed_adapter.as_deref(), Some("local"));
+        assert_eq!(cfg.providers.effective_embed_adapter(), "local");
+    }
+
+    #[test]
+    fn auto_approve_defaults_off_and_reads_env() {
+        let mut cfg = Config::with_db_path(PathBuf::from("memoryd.db"));
+        assert!(
+            !cfg.caps.auto_approve_profile_facts,
+            "manual approval is the default"
+        );
+        cfg.apply_env_from(&|name| (name == "MEMORYD_AUTO_APPROVE").then(|| "true".to_string()))
+            .expect("env applies");
+        assert!(cfg.caps.auto_approve_profile_facts);
+    }
+
+    #[test]
+    fn parse_bool_env_is_lenient_and_defaults_false() {
+        for truthy in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(parse_bool_env(truthy), "{truthy:?} should be truthy");
+        }
+        for falsy in ["0", "false", "no", "", "off", "maybe"] {
+            assert!(!parse_bool_env(falsy), "{falsy:?} should be falsy");
         }
     }
 
