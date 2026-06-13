@@ -25,6 +25,16 @@ mod logging;
 mod mcp;
 mod tui;
 
+/// memoryd version string. Release builds bake the git tag in via
+/// `MEMORYD_RELEASE_VERSION` (set by the release workflow); local and dev
+/// builds fall back to the static Cargo version (`0.0.0`), which is
+/// intentionally never bumped on `main` — tags are the single source of
+/// version truth.
+pub const VERSION: &str = match option_env!("MEMORYD_RELEASE_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 const MAX_HTTP_LINE_BYTES: usize = 8 * 1024;
 const MAX_HTTP_HEADERS: usize = 64;
 const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
@@ -106,7 +116,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
         Command::Mcp => mcp::serve_stdio(cli),
         Command::Tui => tui::run(cli),
         Command::Version => {
-            outln!("memoryd {}", env!("CARGO_PKG_VERSION"));
+            outln!("memoryd {}", VERSION);
             Ok(())
         }
         Command::Help => {

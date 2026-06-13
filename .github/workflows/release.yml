@@ -26,28 +26,29 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
 
-      - name: Resolve tag
+      - name: Resolve tag and version
         id: tag
         env:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           TAG="${INPUT_TAG:-$GITHUB_REF_NAME}"
+          case "$TAG" in
+            v*) ;;
+            *) echo "::error::release tag '$TAG' must start with 'v' (e.g. v0.1.0-pre.2)"; exit 1 ;;
+          esac
+          # The tag is the single source of version truth. The version is
+          # derived here and injected into package.json at publish time, so
+          # no version bump is ever committed to main (npm/package.json stays
+          # 0.0.0 on the branch; only tags carry the real version).
+          VERSION="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "resolved tag: $TAG"
-
-      - name: Verify package version matches tag
-        env:
-          TAG: ${{ steps.tag.outputs.tag }}
-        run: |
-          PKG_VERSION="$(node -p "require('./npm/package.json').version")"
-          if [ "v$PKG_VERSION" != "$TAG" ]; then
-            echo "::error::npm/package.json version v$PKG_VERSION does not match tag $TAG"
-            exit 1
-          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "resolved tag: $TAG -> version: $VERSION"
 
       - name: Create prerelease if missing
         env:
@@ -111,6 +112,9 @@ jobs:
       - name: Build release binary
         env:
           TARGET: ${{ matrix.target }}
+          # Bake the tag-derived version into the binary (memoryd --version and
+          # the MCP serverInfo); Cargo.toml itself stays 0.0.0 on every branch.
+          MEMORYD_RELEASE_VERSION: ${{ needs.create-release.outputs.version }}
         run: cargo build --release --locked -p memoryd --target "$TARGET"
 
       - name: Smoke-test binary
@@ -121,6 +125,11 @@ jobs:
           "target/$TARGET/release/memoryd" --version
           "target/$TARGET/release/memoryd" doctor --db /tmp/release-smoke.db
           rm -f /tmp/release-smoke.db*
+
+      - name: Set package version from tag
+        env:
+          VERSION: ${{ needs.create-release.outputs.version }}
+        run: (cd npm && npm pkg set version="$VERSION")
 
       - name: Publish platform npm package (idempotent)
         env:
@@ -169,6 +178,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+
+      - name: Set package version from tag
+        env:
+          VERSION: ${{ needs.create-release.outputs.version }}
+        run: (cd npm && npm pkg set version="$VERSION")
 
       - name: Inject platform optionalDependencies and publish main package
         env:
