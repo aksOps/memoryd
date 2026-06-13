@@ -25,7 +25,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Rows fetched per `list_*_page` call; scrolling past the end appends a page.
 const PAGE: usize = 50;
@@ -37,6 +37,8 @@ const NEIGHBOR_LIMIT: usize = 20;
 const PROFILE_LIMIT: usize = 200;
 /// Event-poll tick so the loop wakes up regularly without busy-spinning.
 const TICK: Duration = Duration::from_millis(250);
+/// How often auto-refresh re-reads the live stats panels while it is enabled.
+const AUTO_REFRESH: Duration = Duration::from_secs(2);
 
 /// Run the interactive viewer. Refuses to start when stdout is not a
 /// terminal — the TUI is useless in a pipe and would emit control bytes.
@@ -82,6 +84,9 @@ fn event_loop(
             && handle_key(app, key, store) == Action::Quit
         {
             return Ok(());
+        }
+        if app.auto_refresh && app.last_refresh.elapsed() >= AUTO_REFRESH {
+            app.refresh_stats(store);
         }
     }
 }
@@ -197,6 +202,11 @@ struct App {
     session_detail: Option<SessionDetail>,
     /// One-line error/status surfaced in the footer instead of crashing the UI.
     status: Option<String>,
+    /// When true, the live stats panels re-read on the [`AUTO_REFRESH`] tick.
+    auto_refresh: bool,
+    /// When the stats panels were last re-read; drives auto-refresh and the
+    /// "updated Ns ago" age shown on the Stats tab.
+    last_refresh: Instant,
 }
 
 impl App {
@@ -220,6 +230,8 @@ impl App {
             detail: Vec::new(),
             session_detail: None,
             status: None,
+            auto_refresh: true,
+            last_refresh: Instant::now(),
         }
     }
 
@@ -239,6 +251,69 @@ impl App {
             Ok(stats) => self.stats = stats,
             Err(err) => self.status = Some(format!("stats: {err}")),
         }
+    }
+
+    /// Re-read the lightweight global panels that change as the daemon works —
+    /// table stats, import batches, and on-disk db size — without disturbing
+    /// the browsing lists or their selection. Cheap enough for the auto-refresh
+    /// tick.
+    fn refresh_stats(&mut self, store: &Store) {
+        match store.table_stats() {
+            Ok(stats) => self.stats = stats,
+            Err(err) => self.status = Some(format!("stats: {err}")),
+        }
+        match store.list_import_batches() {
+            Ok(batches) => self.imports = batches,
+            Err(err) => self.status = Some(format!("imports: {err}")),
+        }
+        self.imports_selected = self
+            .imports_selected
+            .min(self.imports.len().saturating_sub(1));
+        self.db_size_bytes = std::fs::metadata(&self.db_path)
+            .map(|meta| meta.len())
+            .unwrap_or(self.db_size_bytes);
+        self.last_refresh = Instant::now();
+    }
+
+    /// Manual full refresh (`r`): reload the browsing lists from the top —
+    /// keeping how far the user had paged and clamping the selection — plus the
+    /// profile, then the global stats panels. Any open memory/session detail is
+    /// closed first: its cached neighborhood/narrative could be stale (or the
+    /// row gone) after a refresh, so we drop back to the list and re-fetch on
+    /// the next open rather than render outdated data.
+    fn refresh(&mut self, store: &Store) {
+        self.detail.clear();
+        self.session_detail = None;
+        let mem_limit = self.memories.len().max(PAGE);
+        match store.list_memories_page(0, mem_limit) {
+            Ok(batch) => {
+                self.memories_end = batch.len() < mem_limit;
+                self.memories = batch;
+            }
+            Err(err) => self.status = Some(format!("memories: {err}")),
+        }
+        self.memories_selected = self
+            .memories_selected
+            .min(self.memories.len().saturating_sub(1));
+        let sess_limit = self.sessions.len().max(PAGE);
+        match store.list_sessions_page(0, sess_limit) {
+            Ok(batch) => {
+                self.sessions_end = batch.len() < sess_limit;
+                self.sessions = batch;
+            }
+            Err(err) => self.status = Some(format!("sessions: {err}")),
+        }
+        self.sessions_selected = self
+            .sessions_selected
+            .min(self.sessions.len().saturating_sub(1));
+        match store.active_profile_facts(PROFILE_LIMIT) {
+            Ok(facts) => self.profile = facts,
+            Err(err) => self.status = Some(format!("profile: {err}")),
+        }
+        self.profile_selected = self
+            .profile_selected
+            .min(self.profile.len().saturating_sub(1));
+        self.refresh_stats(store);
     }
 
     fn extend_memories(&mut self, store: &Store) {
@@ -524,6 +599,17 @@ fn handle_key(app: &mut App, key: KeyEvent, store: &Store) -> Action {
             app.recenter_detail(store);
             Action::None
         }
+        KeyCode::Char('r') => {
+            app.refresh(store);
+            Action::None
+        }
+        KeyCode::Char('a') => {
+            app.auto_refresh = !app.auto_refresh;
+            if app.auto_refresh {
+                app.refresh_stats(store);
+            }
+            Action::None
+        }
         _ => Action::None,
     }
 }
@@ -559,7 +645,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else if !app.detail.is_empty() {
         "j/k select neighbor  g recenter  Esc back  q quit".to_string()
     } else {
-        "Tab/1-5 tabs  j/k move  Enter open  Esc back  / search  q quit".to_string()
+        format!(
+            "Tab/1-5 tabs  j/k  Enter open  Esc back  / search  \
+             r refresh  a auto:{}  q quit",
+            if app.auto_refresh { "on" } else { "off" }
+        )
     };
     let line = match &app.status {
         Some(status) => format!("{keys}  |  {status}"),
@@ -799,6 +889,11 @@ fn draw_stats(frame: &mut Frame, area: Rect, app: &App) {
             "db_size: {} ({} bytes)",
             human_size(app.db_size_bytes),
             app.db_size_bytes
+        )),
+        Line::from(format!(
+            "auto-refresh: {}   ·   r refresh now, a toggle   ·   updated {}s ago",
+            if app.auto_refresh { "on (2s)" } else { "off" },
+            app.last_refresh.elapsed().as_secs()
         )),
         Line::from(""),
     ];
@@ -1044,6 +1139,57 @@ mod tests {
         assert!(text.contains("4.0 KiB"), "db size: {text}");
         assert!(text.contains("memories: 3"), "table count: {text}");
         assert!(text.contains("raw_events: 7"), "table count: {text}");
+        assert!(
+            text.contains("auto-refresh: on"),
+            "auto-refresh line: {text}"
+        );
+    }
+
+    #[test]
+    fn auto_refresh_defaults_on_toggle_and_manual_refresh_reloads() {
+        let path = temp_db_path("tui-refresh");
+        let mut store = Store::open(&path).expect("store opens");
+        capture(&mut store, "s1", 1_700_000_000_000, "first remembered note");
+        dream(&mut store, &path);
+
+        let mut app = App::new(path.clone(), 0);
+        assert!(app.auto_refresh, "auto-refresh defaults on");
+        assert!(app.stats.is_empty(), "stats are unread before any refresh");
+
+        // Manual refresh ('r') reads the lists and the stats panels.
+        handle_key(&mut app, key(KeyCode::Char('r')), &store);
+        assert!(!app.stats.is_empty(), "manual refresh reads stats");
+        let memories_after_refresh = app.memories.len();
+        assert!(memories_after_refresh > 0, "manual refresh loads memories");
+
+        // 'a' toggles auto-refresh off, then back on.
+        handle_key(&mut app, key(KeyCode::Char('a')), &store);
+        assert!(!app.auto_refresh, "a toggles auto-refresh off");
+        handle_key(&mut app, key(KeyCode::Char('a')), &store);
+        assert!(app.auto_refresh, "a toggles auto-refresh back on");
+
+        // New data lands on the next refresh without dropping existing rows.
+        capture(
+            &mut store,
+            "s1",
+            1_700_000_100_000,
+            "second remembered note",
+        );
+        dream(&mut store, &path);
+        handle_key(&mut app, key(KeyCode::Char('r')), &store);
+        assert!(
+            app.memories.len() >= memories_after_refresh,
+            "refresh reflects newly consolidated memories"
+        );
+
+        // Opening a memory detail then refreshing drops back to the list, since
+        // a cached detail can go stale (or its row vanish) after a refresh.
+        handle_key(&mut app, key(KeyCode::Enter), &store);
+        assert!(!app.detail.is_empty(), "Enter opens a memory detail");
+        handle_key(&mut app, key(KeyCode::Char('r')), &store);
+        assert!(app.detail.is_empty(), "refresh closes stale detail views");
+
+        cleanup_db_files(&path);
     }
 
     #[test]
