@@ -1278,7 +1278,7 @@ impl Store {
                         &tx,
                         "memory",
                         &c.id,
-                        adapter.model_id(),
+                        adapter.embed_model_id(),
                         vector,
                         now_ms,
                     )?;
@@ -1877,6 +1877,31 @@ impl Store {
             committed_fact,
             already_decided: false,
         })
+    }
+
+    /// Accept every pending `profile_fact` approval, committing each to
+    /// `profile_facts` via [`Self::decide_approval`]. The owner opt-in behind
+    /// the dream auto-approve switch (`caps.auto_approve_profile_facts`); returns
+    /// the number of facts committed. Scoped to `profile_fact` only — deletion
+    /// approvals are never swept. Each decision is its own short transaction, so
+    /// a concurrent manual decision simply makes the corresponding sweep a no-op.
+    pub(crate) fn auto_approve_profile_facts(&mut self, now_ms: i64) -> Result<usize, StoreError> {
+        let ids: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM approvals
+                 WHERE state = 'pending' AND target_type = 'profile_fact'
+                 ORDER BY requested_at, id",
+            )?;
+            let mapped = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut committed = 0usize;
+        for id in ids {
+            if self.decide_approval(&id, true, now_ms)?.committed_fact {
+                committed += 1;
+            }
+        }
+        Ok(committed)
     }
 
     pub fn doctor_report(&self) -> Result<DoctorReport, StoreError> {
@@ -7877,6 +7902,147 @@ mod tests {
     }
 
     #[test]
+    fn auto_approve_profile_facts_commits_all_pending_and_is_idempotent() {
+        let path = temp_db_path("auto-approve");
+        let mut store = Store::open(&path).expect("store opens");
+        let now = 1_000_000_000_000i64;
+        seed_mem(
+            &store,
+            "p1",
+            "preference",
+            "prefers tabs over spaces",
+            None,
+            "active",
+            now,
+        );
+        seed_mem(
+            &store,
+            "d1",
+            "decision",
+            "use sqlite for the store",
+            None,
+            "active",
+            now,
+        );
+        let mut spend = 0.0;
+        store
+            .extract_profile_pending(&NullAdapter::new(), 0.0, &mut spend, 500, now)
+            .unwrap();
+        let pending: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM approvals WHERE state='pending' AND target_type='profile_fact'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 2, "two profile-fact proposals are pending");
+
+        let committed = store
+            .auto_approve_profile_facts(now + 100)
+            .expect("auto-approve sweeps pending facts");
+        assert_eq!(committed, 2);
+
+        let facts: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_facts WHERE state='active'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(facts, 2, "both facts committed");
+        let still_pending: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM approvals WHERE state='pending'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_pending, 0);
+        assert_eq!(
+            store.auto_approve_profile_facts(now + 200).unwrap(),
+            0,
+            "nothing left to approve on a second sweep"
+        );
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn dream_auto_approves_profile_facts_unless_gate_restored() {
+        use crate::dream::{DreamOptions, dream_once};
+        let now = 1_000_000_000_000i64;
+        let opts = DreamOptions {
+            trigger: "manual",
+            budget_usd: 0.0,
+            max_seconds: 60,
+        };
+
+        // Manual gate restored (auto_approve=false): the proposal stays pending.
+        let gated_path = temp_db_path("dream-gate-on");
+        let mut gated = Store::open(&gated_path).expect("store opens");
+        seed_mem(
+            &gated,
+            "p1",
+            "preference",
+            "prefers tabs",
+            None,
+            "active",
+            now,
+        );
+        let mut gated_caps = crate::config::Caps::small();
+        gated_caps.auto_approve_profile_facts = false;
+        let gated_out = dream_once(&mut gated, &NullAdapter::new(), &gated_caps, &opts, &|| now)
+            .expect("dream runs");
+        assert_eq!(
+            gated_out.auto_approved, 0,
+            "auto_approve=false keeps the manual gate"
+        );
+        let gated_facts: i64 = gated
+            .conn
+            .query_row("SELECT COUNT(*) FROM profile_facts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(gated_facts, 0);
+        cleanup_db_files(&gated_path);
+
+        // Default caps (auto-approve on): the proposed fact is committed in-pass.
+        let auto_path = temp_db_path("dream-auto-on");
+        let mut auto = Store::open(&auto_path).expect("store opens");
+        seed_mem(
+            &auto,
+            "p1",
+            "preference",
+            "prefers tabs",
+            None,
+            "active",
+            now,
+        );
+        let auto_out = dream_once(
+            &mut auto,
+            &NullAdapter::new(),
+            &crate::config::Caps::small(),
+            &opts,
+            &|| now,
+        )
+        .expect("dream runs");
+        assert_eq!(
+            auto_out.auto_approved, 1,
+            "default commits the proposed fact"
+        );
+        let auto_facts: i64 = auto
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_facts WHERE state='active'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(auto_facts, 1);
+        cleanup_db_files(&auto_path);
+    }
+
+    #[test]
     fn approve_reject_writes_no_fact() {
         let path = temp_db_path("m8-reject");
         let mut store = Store::open(&path).expect("store opens");
@@ -8203,14 +8369,12 @@ mod tests {
             budget_usd: 0.0,
             max_seconds: 60,
         };
-        let outcome = dream_once(
-            &mut store,
-            &NullAdapter::new(),
-            &crate::config::Caps::small(),
-            &opts,
-            &|| now,
-        )
-        .expect("dream runs");
+        // Restore the manual gate so this test exercises propose-only (the
+        // auto-approve path has its own dedicated test).
+        let mut caps = crate::config::Caps::small();
+        caps.auto_approve_profile_facts = false;
+        let outcome =
+            dream_once(&mut store, &NullAdapter::new(), &caps, &opts, &|| now).expect("dream runs");
         assert_eq!(outcome.consolidated, 1);
         assert_eq!(outcome.proposed, 1, "extract phase proposed the preference");
         assert_eq!(

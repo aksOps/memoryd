@@ -298,6 +298,7 @@ pub struct DreamOutcome {
     pub distilled: usize,
     pub associated: usize,
     pub proposed: usize,
+    pub auto_approved: usize,
     pub decayed: usize,
     pub retained: usize,
     pub tokens_used: i64,
@@ -332,6 +333,7 @@ pub fn dream_once<A: ProviderAdapter>(
     let mut distilled = 0_usize;
     let mut associated = 0_usize;
     let mut proposed = 0_usize;
+    let mut auto_approved = 0_usize;
     let mut decayed = 0_usize;
     let mut tokens = 0_i64;
     let mut budget_hit = false;
@@ -450,6 +452,14 @@ pub fn dream_once<A: ProviderAdapter>(
         }
     }
 
+    // Auto-approve phase (owner opt-in, off by default): commit the profile
+    // facts proposed above without manual review. The human gate (H6) stays the
+    // default; this only fires when `auto_approve_profile_facts` is set, and is
+    // scoped to profile_fact approvals — deletions are never auto-approved.
+    if caps.auto_approve_profile_facts && !partial && clock() - start < max_ms {
+        auto_approved = store.auto_approve_profile_facts(clock())?;
+    }
+
     // Decay phase: a fixed `now` for the whole phase so a row recomputed this run is
     // not re-selected (its decay_at advances past `now`).
     if !partial {
@@ -515,6 +525,7 @@ pub fn dream_once<A: ProviderAdapter>(
         distilled,
         associated,
         proposed,
+        auto_approved,
         decayed,
         retained,
         tokens_used: tokens,

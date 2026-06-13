@@ -155,6 +155,11 @@ fn doctor(cli: Cli, args: DoctorArgs) -> Result<(), CliError> {
     }
     outln!("bind: {}", cfg.bind);
     outln!("provider: {}", cfg.providers.default_adapter);
+    outln!("embed_adapter: {}", cfg.providers.effective_embed_adapter());
+    outln!(
+        "auto_approve_profile_facts: {}",
+        cfg.caps.auto_approve_profile_facts
+    );
     outln!("paid_spend_cap_usd: {:.2}", cfg.caps.paid_spend_cap_usd);
 
     if report.is_ok() {
@@ -359,7 +364,9 @@ fn recall(cli: Cli, args: RecallArgs) -> Result<(), CliError> {
             memoryd_core::config::ConfigError::UnknownVectorIndex { kind: index_kind },
         ));
     }
-    let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(&cfg.providers);
+    // Recall embeds the query and reranks against stored vectors, so it must use
+    // the embed adapter (matching the model that produced the persisted embeddings).
+    let adapter = memoryd_core::adapters::AdapterKind::embed_from_provider_config(&cfg.providers);
     let result = recall_with_mode(&store, &args, &index_kind, &adapter)?;
     outln!("{}", recall_response_json(&result)?);
     Ok(())
@@ -506,11 +513,16 @@ fn dream(cli: Cli, args: DreamArgs) -> Result<(), CliError> {
     cfg.validate()?;
 
     let mut store = Store::open(&cfg.db_path)?;
-    let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(&cfg.providers);
-    let (adapter, degraded) = adapter.effective_for_pass();
+    // Chat drives the LLM phases; embeddings keep their own (typically local)
+    // adapter so a remote chat provider never re-routes recall or persisted
+    // vectors. Degrade the chat side only — local embeds are always reachable.
+    let chat = memoryd_core::adapters::AdapterKind::from_provider_config(&cfg.providers);
+    let (chat, degraded) = chat.effective_for_pass();
     if degraded {
         eprintln!("memoryd: provider unreachable; dream pass uses the local adapter");
     }
+    let embed = memoryd_core::adapters::AdapterKind::embed_from_provider_config(&cfg.providers);
+    let adapter = memoryd_core::adapters::AdapterKind::for_dream(embed, chat);
     let opts = memoryd_core::dream::DreamOptions {
         trigger: "manual",
         budget_usd: args.budget_usd.unwrap_or(cfg.caps.paid_spend_cap_usd),
@@ -648,7 +660,11 @@ fn serve(cli: Cli) -> Result<(), CliError> {
     // the embedding compute runs on this thread. It drains its in-flight tick
     // and exits on shutdown.
     let worker = std::thread::spawn(move || {
-        let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(&worker_providers);
+        // The embed worker only embeds, so it uses the embed adapter — which may
+        // differ from the chat provider (MEMORYD_EMBED_ADAPTER), keeping the
+        // persisted vectors on one consistent model.
+        let adapter =
+            memoryd_core::adapters::AdapterKind::embed_from_provider_config(&worker_providers);
         // Failover circuit breaker (roadmap C1): after a failed tick against an
         // unreachable remote endpoint, embed with the in-process local adapter
         // for a cooldown instead of burning job retries; then re-try primary.
@@ -701,7 +717,11 @@ fn serve(cli: Cli) -> Result<(), CliError> {
     // The interval sleep is sliced so shutdown is observed within ~500ms; an
     // in-flight dream pass finishes before the thread exits.
     let dream_worker = std::thread::spawn(move || {
-        let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(&dream_providers);
+        // Chat drives the LLM phases; embed (typically local) drives associate —
+        // so a remote chat provider never overwrites the local embedding model.
+        let chat = memoryd_core::adapters::AdapterKind::from_provider_config(&dream_providers);
+        let embed =
+            memoryd_core::adapters::AdapterKind::embed_from_provider_config(&dream_providers);
         let mut dream_store = match Store::open(&dream_db) {
             Ok(store) => store,
             Err(err) => {
@@ -725,13 +745,15 @@ fn serve(cli: Cli) -> Result<(), CliError> {
                 std::thread::sleep(slice);
                 slept += slice;
             }
-            // One reachability probe per pass (roadmap C1): a dead remote
-            // endpoint degrades this pass to the local adapter instead of
-            // failing every LLM phase.
-            let (pass_adapter, degraded) = adapter.effective_for_pass();
+            // One reachability probe per pass (roadmap C1): a dead remote chat
+            // endpoint degrades this pass's LLM phases to the local adapter
+            // instead of failing every one. The embed side stays put.
+            let (pass_chat, degraded) = chat.effective_for_pass();
             if degraded {
                 logging::log_warn!("provider unreachable; dream pass uses the local adapter");
             }
+            let pass_adapter =
+                memoryd_core::adapters::AdapterKind::for_dream(embed.clone(), pass_chat);
             if let Err(err) = memoryd_core::dream::dream_once(
                 &mut dream_store,
                 &pass_adapter,
@@ -748,7 +770,10 @@ fn serve(cli: Cli) -> Result<(), CliError> {
     logging::log_info!("serve starting");
     logging::log_info!("bind: {}", cfg.bind);
     logging::log_info!("db_path: {}", cfg.db_path.display());
-    logging::log_info!("worker: embed ({} adapter)", cfg.providers.default_adapter);
+    logging::log_info!(
+        "worker: embed ({} adapter)",
+        cfg.providers.effective_embed_adapter()
+    );
     logging::log_info!("dream: scheduled every {DREAM_INTERVAL_SECS}s");
 
     let result = serve_loop(
@@ -1673,6 +1698,7 @@ fn dream_response_json(outcome: &memoryd_core::dream::DreamOutcome) -> Result<St
         "distilled": outcome.distilled,
         "associated": outcome.associated,
         "proposed": outcome.proposed,
+        "auto_approved": outcome.auto_approved,
         "decayed": outcome.decayed,
         "retained": outcome.retained,
         "tokens_used": outcome.tokens_used,
@@ -1941,7 +1967,8 @@ fn handle_http_recall(
     // CLI-only override, and HNSW is not yet a latency win (it builds per call over the
     // shortlist — see vectorindex.rs / ARCHITECTURE-PLAN §21.12). Revisit when the
     // persistent full-corpus index lands.
-    let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(providers);
+    // Recall reranks against persisted vectors, so it embeds with the embed adapter.
+    let adapter = memoryd_core::adapters::AdapterKind::embed_from_provider_config(providers);
     match recall_with_mode(store, &args, "brute-force", &adapter) {
         Ok(result) => HttpResponse::json(200, "OK", recall_response_value(&result)),
         Err(StoreError::InvalidRecallQuery) => {
@@ -4421,15 +4448,27 @@ mod tests {
                 })
                 .expect("capture");
         }
-        // dream: consolidate -> ... -> extract proposes a pending approval.
-        let cli = Cli::parse(
-            ["memoryd", "dream", "--now", "--db", path.to_str().unwrap()].map(OsString::from),
-        )
-        .expect("parses");
-        let Command::Dream(dargs) = cli.command.clone() else {
-            panic!("expected dream")
-        };
-        dream(cli, dargs).expect("dream");
+        // Propose a pending approval with auto-approve disabled, so the manual
+        // `approve` CLI below has something to commit. (The dream CLI auto-
+        // approves by default now; that path is covered in memoryd-core.)
+        {
+            let mut store = Store::open(&path).expect("store opens");
+            let mut caps = memoryd_core::config::Caps::small();
+            caps.auto_approve_profile_facts = false;
+            let opts = memoryd_core::dream::DreamOptions {
+                trigger: "manual",
+                budget_usd: 0.0,
+                max_seconds: 60,
+            };
+            memoryd_core::dream::dream_once(
+                &mut store,
+                &memoryd_core::adapters::AdapterKind::from_default_adapter("null"),
+                &caps,
+                &opts,
+                &|| 2_000_000_000_000i64,
+            )
+            .expect("dream");
+        }
 
         let id = {
             let store = Store::open(&path).expect("store opens");

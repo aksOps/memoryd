@@ -385,7 +385,8 @@ fn call_memory_recall(
     arguments: serde_json::Value,
 ) -> Result<ToolOutcome, ToolError> {
     let args = crate::recall_request_from_json(arguments).map_err(ToolError::InvalidArguments)?;
-    let adapter = memoryd_core::adapters::AdapterKind::from_provider_config(&cfg.providers);
+    // Recall reranks against persisted vectors, so it embeds with the embed adapter.
+    let adapter = memoryd_core::adapters::AdapterKind::embed_from_provider_config(&cfg.providers);
     match crate::recall_with_mode(store, &args, "brute-force", &adapter) {
         Ok(result) => Ok(ToolOutcome::Success(crate::recall_response_value(&result))),
         Err(StoreError::InvalidRecallQuery) => {
