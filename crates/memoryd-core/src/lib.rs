@@ -7,6 +7,7 @@ pub mod import;
 pub mod importers;
 pub mod localembed;
 pub mod openaicompat;
+pub mod serve_client;
 pub mod store;
 pub mod vectorindex;
 pub mod worker;

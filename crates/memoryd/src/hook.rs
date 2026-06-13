@@ -8,8 +8,12 @@
 //! - NEVER fail the agent: every error path exits 0 with empty stdout (detail
 //!   to stderr). A broken memory daemon must not block coding sessions —
 //!   in Claude Code/Codex a nonzero exit can block the hooked action.
-//! - Fast and local: capture is the µs append path; context is indexed local
-//!   recall. No provider calls, no network, ever (dreaming stays in `dream`).
+//! - Fast: capture is the µs SQLite append path. Prompt recall prefers the
+//!   running `serve` (localhost, warm embed model = semantic recall in ~tens of
+//!   ms) and falls back to local lexical recall when serve is unreachable — so
+//!   relevance is semantic when possible and never blocks the prompt. The only
+//!   network is that loopback call to the owner's own serve; no public internet,
+//!   and dreaming stays in `dream`.
 //! - Payload-tolerant: field names cover Claude Code and Codex (`session_id`,
 //!   `prompt`, `tool_name`, `tool_input`, `tool_response`, `hook_event_name`)
 //!   and Hermes (`extra` envelope); missing fields degrade to placeholders.
@@ -181,7 +185,48 @@ fn emit_prompt_context(
     let Some(prompt) = payload.get("prompt").and_then(serde_json::Value::as_str) else {
         return Ok(());
     };
-    let store = Store::open(&cfg.db_path)?;
+    let lines = recall_lines(cfg, prompt);
+    if lines.is_empty() {
+        return Ok(()); // silent no-op: nothing relevant remembered
+    }
+    let context = truncate(
+        &format!("Relevant memoryd memories:\n{}", lines.join("\n")),
+        CONTEXT_CHAR_CAP,
+    );
+    print_context(payload, "UserPromptSubmit", &context)
+}
+
+/// Recall the prompt and format the top hits as `- [kind] content` lines.
+///
+/// Prefers the running serve's **semantic** recall (warm embed model, ~tens of
+/// ms). When serve answers, its result is authoritative — even an empty result
+/// means "nothing semantically relevant", so we do NOT fall back and inject
+/// lexical noise. Only when serve is unreachable/unauthorized do we degrade to
+/// the local **lexical** recall (fast, no model load) to preserve the offline
+/// path. Either way this never fails the hook.
+fn recall_lines(cfg: &memoryd_core::config::Config, prompt: &str) -> Vec<String> {
+    let base_url = format!("http://{}", cfg.bind);
+    match memoryd_core::serve_client::recall_via_serve(
+        &base_url,
+        cfg.bearer_token.as_deref(),
+        prompt,
+        PROMPT_RECALL_K,
+    ) {
+        Ok(hits) => hits
+            .iter()
+            .map(|hit| format!("- [{}] {}", hit.kind, hit.content))
+            .collect(),
+        // serve down/unauthorized/timed out → degrade to local lexical recall.
+        Err(_) => recall_local_lexical(cfg, prompt),
+    }
+}
+
+/// Fallback recall: lexical (FTS) recall straight from SQLite, no model load.
+/// Used only when serve is unavailable; mirrors the pre-serve behavior.
+fn recall_local_lexical(cfg: &memoryd_core::config::Config, prompt: &str) -> Vec<String> {
+    let Ok(store) = Store::open(&cfg.db_path) else {
+        return Vec::new();
+    };
     let adapter = memoryd_core::adapters::AdapterKind::from_default_adapter("local");
     let args = crate::RecallArgs {
         query: prompt.to_string(),
@@ -205,14 +250,7 @@ fn emit_prompt_context(
             }
         }
     }
-    if lines.is_empty() {
-        return Ok(()); // silent no-op: nothing relevant remembered
-    }
-    let context = truncate(
-        &format!("Relevant memoryd memories:\n{}", lines.join("\n")),
-        CONTEXT_CHAR_CAP,
-    );
-    print_context(payload, "UserPromptSubmit", &context)
+    lines
 }
 
 /// SessionStart stdout: load the owner persona kernel (approved profile facts
@@ -375,6 +413,72 @@ mod tests {
             .map(|s| s.rows)
             .unwrap_or(0);
         assert_eq!(rows, 1, "only the real prompt captured");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn recall_lines_falls_back_to_local_lexical_when_serve_unreachable() {
+        let path = temp_db("recall-fallback");
+        let mut cfg = cfg_for(&path);
+        // Point serve at a guaranteed-refused port so the serve call errors and
+        // recall degrades to local lexical recall.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        cfg.bind = dead.local_addr().expect("addr");
+        drop(dead);
+        capture_tool(
+            &cfg,
+            &serde_json::json!({
+                "session_id": "s",
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": { "command": "fix the WAL busy_timeout contention" },
+            }),
+            "claude",
+        )
+        .expect("capture succeeds");
+
+        let lines = recall_lines(&cfg, "WAL busy_timeout");
+        assert!(
+            !lines.is_empty(),
+            "fell back to local lexical recall when serve was down"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("busy_timeout") || l.contains("Bash")),
+            "surfaced the captured event: {lines:?}"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn recall_lines_uses_serve_semantic_results_when_reachable() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let bind = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut scratch = [0u8; 4096];
+                let _ = stream.read(&mut scratch);
+                let payload = "{\"results\":[{\"kind\":\"preference\",\"content\":\"prefers concise answers\"}]}";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        let path = temp_db("recall-serve");
+        let mut cfg = cfg_for(&path);
+        cfg.bind = bind;
+
+        let lines = recall_lines(&cfg, "how do you like answers");
+        server.join().ok();
+        assert_eq!(
+            lines,
+            vec!["- [preference] prefers concise answers".to_string()],
+            "used serve's semantic hits verbatim"
+        );
         cleanup(&path);
     }
 
